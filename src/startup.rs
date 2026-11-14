@@ -1,0 +1,321 @@
+use crate::app::{App, ToastKind};
+use crate::theme::*;
+use crate::util;
+use crate::widgets::{self, ic};
+use eframe::egui::{Align, Label, Layout, RichText, ScrollArea, Ui};
+use std::fs;
+use std::path::PathBuf;
+use winreg::enums::{RegType, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+use winreg::{RegKey, RegValue};
+
+const RUN: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+const RUN32: &str = r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run";
+const APPROVED_RUN: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
+const APPROVED_RUN32: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32";
+const APPROVED_FOLDER: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Loc {
+    UserRun,
+    MachineRun,
+    MachineRun32,
+    UserFolder,
+    CommonFolder,
+}
+
+impl Loc {
+    pub fn label(self) -> &'static str {
+        match self {
+            Loc::UserRun => "Your account",
+            Loc::MachineRun | Loc::MachineRun32 => "All users",
+            Loc::UserFolder => "Startup folder",
+            Loc::CommonFolder => "Startup folder, all users",
+        }
+    }
+    pub fn machine(self) -> bool {
+        matches!(self, Loc::MachineRun | Loc::MachineRun32 | Loc::CommonFolder)
+    }
+    fn approved_key(self) -> &'static str {
+        match self {
+            Loc::UserRun | Loc::MachineRun => APPROVED_RUN,
+            Loc::MachineRun32 => APPROVED_RUN32,
+            Loc::UserFolder | Loc::CommonFolder => APPROVED_FOLDER,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct StartupItem {
+    /// Registry value name or startup-folder file name.
+    pub key: String,
+    pub display: String,
+    pub command: String,
+    pub loc: Loc,
+    pub enabled: bool,
+    pub file: Option<PathBuf>,
+}
+
+fn root(machine: bool) -> RegKey {
+    RegKey::predef(if machine { HKEY_LOCAL_MACHINE } else { HKEY_CURRENT_USER })
+}
+
+/// Task Manager's convention: an odd first byte means "disabled".
+fn approved(machine: bool, sub: &str, name: &str) -> bool {
+    let Ok(key) = root(machine).open_subkey(sub) else { return true };
+    match key.get_raw_value(name) {
+        Ok(v) => v.bytes.first().map_or(true, |b| b & 1 == 0),
+        Err(_) => true,
+    }
+}
+
+pub fn list() -> Vec<StartupItem> {
+    let mut out = Vec::new();
+    for (loc, path) in [(Loc::UserRun, RUN), (Loc::MachineRun, RUN), (Loc::MachineRun32, RUN32)] {
+        let machine = loc.machine();
+        let Ok(k) = root(machine).open_subkey(path) else { continue };
+        for (name, _) in k.enum_values().flatten() {
+            if name.is_empty() {
+                continue;
+            }
+            let command: String = k.get_value(&name).unwrap_or_default();
+            if command.trim().is_empty() {
+                continue;
+            }
+            out.push(StartupItem {
+                enabled: approved(machine, loc.approved_key(), &name),
+                display: name.clone(),
+                key: name,
+                command,
+                loc,
+                file: None,
+            });
+        }
+    }
+    let folders = [
+        (
+            Loc::UserFolder,
+            util::env("APPDATA").map(|p| p.join(r"Microsoft\Windows\Start Menu\Programs\Startup")),
+        ),
+        (
+            Loc::CommonFolder,
+            util::env("ProgramData").map(|p| p.join(r"Microsoft\Windows\Start Menu\Programs\StartUp")),
+        ),
+    ];
+    for (loc, dir) in folders {
+        let Some(dir) = dir else { continue };
+        let Ok(rd) = fs::read_dir(&dir) else { continue };
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.eq_ignore_ascii_case("desktop.ini") {
+                continue;
+            }
+            let display = name
+                .strip_suffix(".lnk")
+                .or_else(|| name.strip_suffix(".LNK"))
+                .unwrap_or(&name)
+                .to_string();
+            out.push(StartupItem {
+                enabled: approved(loc.machine(), APPROVED_FOLDER, &name),
+                display,
+                command: e.path().display().to_string(),
+                key: name,
+                loc,
+                file: Some(e.path()),
+            });
+        }
+    }
+    out.sort_by(|a, b| a.display.to_lowercase().cmp(&b.display.to_lowercase()));
+    out
+}
+
+fn filetime_now() -> u64 {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    (secs + 11_644_473_600) * 10_000_000
+}
+
+/// Enables or disables an item exactly like Task Manager does. Nothing is deleted.
+pub fn set_enabled(item: &StartupItem, enabled: bool) -> Result<(), String> {
+    let (key, _) = root(item.loc.machine())
+        .create_subkey(item.loc.approved_key())
+        .map_err(|e| e.to_string())?;
+    let mut bytes = vec![0u8; 12];
+    if enabled {
+        bytes[0] = 2;
+    } else {
+        bytes[0] = 3;
+        bytes[4..12].copy_from_slice(&filetime_now().to_le_bytes());
+    }
+    key.set_raw_value(
+        &item.key,
+        &RegValue {
+            bytes,
+            vtype: RegType::REG_BINARY,
+        },
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Best-effort: the program a startup command launches.
+pub fn exe_from_command(cmd: &str) -> Option<PathBuf> {
+    let cmd = util::expand_env(cmd.trim());
+    let path = if let Some(rest) = cmd.strip_prefix('"') {
+        rest.split('"').next()?.to_string()
+    } else {
+        let lower = cmd.to_lowercase();
+        match lower.find(".exe") {
+            Some(i) => cmd[..i + 4].to_string(),
+            None => cmd.split_whitespace().next()?.to_string(),
+        }
+    };
+    let p = PathBuf::from(path);
+    if p.exists() {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+#[derive(Default)]
+pub struct StartupState {
+    pub items: Vec<StartupItem>,
+    pub filter: String,
+}
+
+impl StartupState {
+    pub fn reload(&mut self) {
+        self.items = list();
+    }
+    pub fn enabled_count(&self) -> usize {
+        self.items.iter().filter(|i| i.enabled).count()
+    }
+}
+
+enum SAct {
+    Set(usize, bool),
+    Show(PathBuf),
+    Reload,
+    Relaunch,
+    Settings,
+    Filter(String),
+}
+
+impl App {
+    pub fn page_startup(&mut self, ui: &mut Ui) {
+        let ctx = ui.ctx().clone();
+        let mut acts = Vec::new();
+        self.render_startup(ui, &mut acts);
+        for a in acts {
+            match a {
+                SAct::Set(i, on) => {
+                    let Some(item) = self.startup.items.get(i).cloned() else { continue };
+                    match set_enabled(&item, on) {
+                        Ok(()) => {
+                            self.startup.items[i].enabled = on;
+                            util::log(format!("{} startup item: {}", if on { "Enabled" } else { "Disabled" }, item.display));
+                            self.toast(
+                                ToastKind::Success,
+                                format!("{} will {}start with Windows", item.display, if on { "" } else { "no longer " }),
+                            );
+                        }
+                        Err(e) => self.toast(ToastKind::Error, format!("Couldn't change {}: {e}", item.display)),
+                    }
+                }
+                SAct::Show(p) => util::show_in_explorer(&p),
+                SAct::Reload => self.startup.reload(),
+                SAct::Relaunch => self.relaunch_admin(&ctx),
+                SAct::Settings => util::open_uri("ms-settings:startupapps"),
+                SAct::Filter(f) => self.startup.filter = f,
+            }
+        }
+    }
+
+    fn render_startup(&self, ui: &mut Ui, acts: &mut Vec<SAct>) {
+        let s = &self.startup;
+        widgets::page_header(
+            ui,
+            "Startup apps",
+            "Apps that launch every time you sign in. Fewer of them means a faster boot and more free memory.",
+        );
+        widgets::banner(ui, ACCENT, ic::INFO, |ui| {
+            ui.label("Turning an app off only stops it launching at sign-in. It stays installed, and you can turn it back on any time. This is the same switch Task Manager uses.");
+        });
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("{}", s.enabled_count())).font(widgets::light(30.0)).color(TEXT));
+            ui.label(widgets::dim(format!("of {} start automatically", s.items.len())));
+            ui.add_space(16.0);
+            let mut f = s.filter.clone();
+            if widgets::search_box(ui, &mut f, "Search", 200.0).changed() {
+                acts.push(SAct::Filter(f));
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.add(widgets::small(widgets::icon_text(ic::REFRESH, "Refresh", 13.0, TEXT))).clicked() {
+                    acts.push(SAct::Reload);
+                }
+                if ui.add(widgets::small("Windows startup settings")).clicked() {
+                    acts.push(SAct::Settings);
+                }
+                if !self.is_admin && s.items.iter().any(|i| i.loc.machine()) {
+                    if ui.add(widgets::small(widgets::icon_text(ic::SHIELD, "Restart as admin", 13.0, WARN))).clicked() {
+                        acts.push(SAct::Relaunch);
+                    }
+                }
+            });
+        });
+        ui.add_space(4.0);
+        let filter = s.filter.to_lowercase();
+        ScrollArea::vertical()
+            .id_source("startup_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if s.items.is_empty() {
+                    ui.label(widgets::dim("No startup apps found."));
+                }
+                for (i, item) in s.items.iter().enumerate() {
+                    if !filter.is_empty()
+                        && !item.display.to_lowercase().contains(&filter)
+                        && !item.command.to_lowercase().contains(&filter)
+                    {
+                        continue;
+                    }
+                    let can_change = !item.loc.machine() || self.is_admin;
+                    widgets::row(ui, 52.0, |ui| {
+                        ui.add_space(4.0);
+                        let resp = widgets::toggle(ui, item.enabled, can_change);
+                        if !can_change {
+                            resp.on_hover_text("Restart PCSweep as administrator to change apps that start for all users.");
+                        } else if resp.clicked() {
+                            acts.push(SAct::Set(i, !item.enabled));
+                        }
+                        ui.add_space(8.0);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.add_space(6.0);
+                            let target = item.file.clone().or_else(|| exe_from_command(&item.command));
+                            if let Some(t) = target {
+                                if ui.add(widgets::small(widgets::icon(ic::OPEN, 13.0, TEXT_DIM))).on_hover_text("Show in Explorer").clicked() {
+                                    acts.push(SAct::Show(t));
+                                }
+                            }
+                            widgets::badge(ui, item.loc.label(), TEXT_DIM);
+                            ui.label(if item.enabled {
+                                RichText::new("On").color(GOOD)
+                            } else {
+                                RichText::new("Off").color(TEXT_FAINT)
+                            });
+                            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                ui.vertical(|ui| {
+                                    ui.spacing_mut().item_spacing.y = 1.0;
+                                    ui.add(Label::new(widgets::strong(&item.display, 14.5)).truncate());
+                                    ui.add(Label::new(widgets::faint(&item.command)).truncate());
+                                });
+                            });
+                        });
+                    });
+                }
+                ui.add_space(20.0);
+            });
+    }
+}

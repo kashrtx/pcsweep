@@ -1,0 +1,475 @@
+use crate::analyzer::AnalyzerState;
+use crate::apps::AppsState;
+use crate::cleaner::CleanerState;
+use crate::duplicates::DupState;
+use crate::processes::MemState;
+use crate::startup::StartupState;
+use crate::system::{self, SysMon};
+use crate::task::Task;
+use crate::theme::{self, *};
+use crate::tools::ToolsState;
+use crate::util::{self, fmt_bytes};
+use crate::widgets::{self, ic};
+use eframe::egui::{
+    self, vec2, Align, Align2, Color32, Frame, Id, Key, Label, LayerId, Layout, Margin, Order,
+    RichText, Rounding, ScrollArea, Stroke, Ui,
+};
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Page {
+    Dashboard,
+    Cleaner,
+    Analyzer,
+    Duplicates,
+    Apps,
+    Startup,
+    Memory,
+    Tools,
+    Activity,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ToastKind {
+    Info,
+    Success,
+    Error,
+}
+
+pub struct Toast {
+    pub text: String,
+    pub kind: ToastKind,
+    pub born: Instant,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    Analyzer,
+    Duplicates,
+}
+
+/// Everything that changes the system goes through a confirmation dialog first.
+pub enum Action {
+    CleanJunk,
+    Recycle { items: Vec<(PathBuf, u64)>, origin: Origin },
+    Kill { pids: Vec<u32>, name: String },
+    RunTool(usize),
+    Uninstall(usize),
+}
+
+pub struct Modal {
+    pub title: String,
+    pub body: String,
+    pub details: Vec<String>,
+    pub note: Option<String>,
+    pub confirm: String,
+    pub danger: bool,
+    pub action: Action,
+}
+
+pub struct App {
+    pub page: Page,
+    pub is_admin: bool,
+    pub sys: SysMon,
+    pub cleaner: CleanerState,
+    pub analyzer: AnalyzerState,
+    pub dups: DupState,
+    pub startup: StartupState,
+    pub apps: AppsState,
+    pub tools: ToolsState,
+    pub mem: MemState,
+    pub modal: Option<Modal>,
+    pub toasts: Vec<Toast>,
+    pub relaunch: Task<bool>,
+}
+
+impl App {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        theme::setup_fonts(&cc.egui_ctx);
+        theme::apply(&cc.egui_ctx);
+        let is_admin = system::is_admin();
+        let mut app = Self {
+            page: Page::Dashboard,
+            is_admin,
+            sys: SysMon::new(),
+            cleaner: CleanerState::new(),
+            analyzer: AnalyzerState::default(),
+            dups: DupState::default(),
+            startup: StartupState::default(),
+            apps: AppsState::default(),
+            tools: ToolsState::default(),
+            mem: MemState::default(),
+            modal: None,
+            toasts: Vec::new(),
+            relaunch: Task::default(),
+        };
+        util::log(format!(
+            "PCSweep {} started{}",
+            env!("CARGO_PKG_VERSION"),
+            if is_admin { " as administrator" } else { "" }
+        ));
+        app.startup.reload();
+        app.start_junk_scan(&cc.egui_ctx);
+        app.start_apps_load(&cc.egui_ctx);
+        app
+    }
+
+    pub fn toast(&mut self, kind: ToastKind, text: impl Into<String>) {
+        self.toasts.push(Toast {
+            text: text.into(),
+            kind,
+            born: Instant::now(),
+        });
+        if self.toasts.len() > 4 {
+            self.toasts.remove(0);
+        }
+    }
+
+    pub fn relaunch_admin(&mut self, ctx: &egui::Context) {
+        if !self.relaunch.running() {
+            self.relaunch = Task::spawn(ctx, system::relaunch_as_admin);
+        }
+    }
+
+    fn start_recycle(&mut self, items: Vec<(PathBuf, u64)>, origin: Origin, ctx: &egui::Context) {
+        let task = Task::spawn(ctx, move || util::recycle(items));
+        match origin {
+            Origin::Analyzer => self.analyzer.recycle = task,
+            Origin::Duplicates => self.dups.recycle = task,
+        }
+    }
+
+    fn execute(&mut self, action: Action, ctx: &egui::Context) {
+        match action {
+            Action::CleanJunk => self.start_clean(ctx),
+            Action::Recycle { items, origin } => self.start_recycle(items, origin, ctx),
+            Action::Kill { pids, name } => {
+                let n = self.sys.kill(&pids);
+                util::log(format!("Ended {name} ({n} process(es))"));
+                if n > 0 {
+                    self.toast(ToastKind::Success, format!("Ended {name}"));
+                } else {
+                    self.toast(ToastKind::Error, format!("{name} could not be ended. It may need administrator rights."));
+                }
+            }
+            Action::RunTool(i) => self.start_tool(i, ctx),
+            Action::Uninstall(i) => self.launch_uninstall(i),
+        }
+    }
+
+    fn poll(&mut self, ctx: &egui::Context) {
+        self.poll_cleaner(ctx);
+        self.poll_analyzer();
+        self.poll_duplicates();
+        self.poll_apps();
+        self.poll_tools();
+        if let Some(r) = self.relaunch.poll() {
+            match r {
+                Ok(true) => {
+                    util::log("Restarting as administrator");
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                _ => self.toast(ToastKind::Info, "Restart as administrator was cancelled."),
+            }
+        }
+    }
+
+    fn any_running(&self) -> bool {
+        self.cleaner.scan.running()
+            || self.cleaner.clean.running()
+            || self.analyzer.scan.running()
+            || self.analyzer.recycle.running()
+            || self.dups.scan.running()
+            || self.dups.recycle.running()
+            || self.apps.load.running()
+            || self.relaunch.running()
+            || self.tools.run.as_ref().map_or(false, |r| !r.is_done())
+            || !self.toasts.is_empty()
+    }
+
+    // ------------------------------------------------------------ sidebar
+
+    fn sidebar(&mut self, ui: &mut Ui) {
+        let ctx = ui.ctx().clone();
+        ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(vec2(36.0, 36.0), egui::Sense::hover());
+            ui.painter().rect_filled(rect, Rounding::same(10.0), ACCENT_STRONG);
+            ui.painter().circle_stroke(rect.center(), 9.0, Stroke::new(2.5, Color32::WHITE));
+            ui.painter().circle_filled(rect.center(), 3.0, Color32::WHITE);
+            ui.add_space(4.0);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.label(RichText::new("PCSweep").font(widgets::semibold(19.0)).color(TEXT));
+                ui.label(RichText::new("Keep your PC clean and quick").size(11.5).color(TEXT_FAINT));
+            });
+        });
+        ui.add_space(22.0);
+
+        let junk_badge = if self.cleaner.scanned_once {
+            let b = self.cleaner.recommended_total();
+            if b > 0 {
+                Some(fmt_bytes(b))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let startup_badge = if self.startup.items.is_empty() {
+            None
+        } else {
+            Some(format!("{} on", self.startup.enabled_count()))
+        };
+
+        let nav: [&[(Page, char, &str)]; 4] = [
+            &[(Page::Dashboard, ic::HOME, "Overview")],
+            &[
+                (Page::Cleaner, ic::CLEAN, "Junk cleaner"),
+                (Page::Analyzer, ic::PIE, "Space analyzer"),
+                (Page::Duplicates, ic::COPY, "Duplicates"),
+                (Page::Apps, ic::APPS, "Installed apps"),
+            ],
+            &[
+                (Page::Startup, ic::POWER, "Startup apps"),
+                (Page::Memory, ic::SPEED, "Memory and apps"),
+            ],
+            &[
+                (Page::Tools, ic::TOOLS, "Tools"),
+                (Page::Activity, ic::HISTORY, "Activity log"),
+            ],
+        ];
+        for group in nav {
+            for &(page, icon_char, label) in group {
+                let badge = match page {
+                    Page::Cleaner => junk_badge.as_deref(),
+                    Page::Startup => startup_badge.as_deref(),
+                    _ => None,
+                };
+                if widgets::nav_item(ui, icon_char, label, self.page == page, badge).clicked() {
+                    if page == Page::Startup {
+                        self.startup.reload();
+                    }
+                    self.page = page;
+                }
+                ui.add_space(1.0);
+            }
+            ui.add_space(14.0);
+        }
+
+        let mut want_relaunch = false;
+        let busy = self.relaunch.running();
+        let is_admin = self.is_admin;
+        ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+            ui.label(widgets::faint(format!("Version {}", env!("CARGO_PKG_VERSION"))));
+            ui.add_space(6.0);
+            if is_admin {
+                ui.horizontal(|ui| {
+                    ui.label(widgets::icon(ic::SHIELD, 13.0, GOOD));
+                    ui.label(RichText::new("Running as administrator").color(GOOD).size(12.5));
+                });
+            } else {
+                ui.label(widgets::faint("Unlocks system-level cleanup"));
+                let w = ui.available_width();
+                let btn = widgets::ghost(widgets::icon_text(ic::SHIELD, "Restart as admin", 13.5, WARN)).min_size(vec2(w, 34.0));
+                if ui.add_enabled(!busy, btn).clicked() {
+                    want_relaunch = true;
+                }
+            }
+        });
+        if want_relaunch {
+            self.relaunch_admin(&ctx);
+        }
+    }
+
+    // ------------------------------------------------------------ activity
+
+    fn page_activity(&mut self, ui: &mut Ui) {
+        widgets::page_header(
+            ui,
+            "Activity log",
+            "Everything PCSweep has cleaned, moved or changed. It's also saved on disk.",
+        );
+        let path = util::log_path();
+        ui.horizontal(|ui| {
+            if ui.add(widgets::small("Open log file")).clicked() {
+                util::open_path(&path);
+            }
+            if ui.add(widgets::small("Show in Explorer")).clicked() {
+                util::show_in_explorer(&path);
+            }
+            ui.label(widgets::faint(path.display().to_string()));
+        });
+        ui.add_space(4.0);
+        let lines = util::log_lines();
+        widgets::card(ui, |ui| {
+            ScrollArea::vertical()
+                .id_source("activity_scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    if lines.is_empty() {
+                        ui.label(widgets::dim("Nothing yet this session."));
+                    }
+                    for l in lines.iter().rev() {
+                        ui.label(RichText::new(l).monospace().size(12.5).color(TEXT_DIM));
+                    }
+                });
+        });
+    }
+
+    // ------------------------------------------------------------ overlays
+
+    fn modal_ui(&mut self, ctx: &egui::Context) {
+        let Some(modal) = &self.modal else { return };
+        ctx.layer_painter(LayerId::new(Order::PanelResizeLine, Id::new("modal_dim")))
+            .rect_filled(ctx.screen_rect(), Rounding::ZERO, Color32::from_black_alpha(160));
+
+        let mut decision: Option<bool> = None;
+        egui::Window::new("pcsweep_confirm")
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .frame(
+                Frame::window(&ctx.style())
+                    .fill(CARD)
+                    .stroke(Stroke::new(1.0, BORDER))
+                    .rounding(Rounding::same(16.0))
+                    .inner_margin(Margin::same(24.0)),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(470.0);
+                ui.horizontal(|ui| {
+                    let (c, col) = if modal.danger { (ic::WARN, BAD) } else { (ic::INFO, ACCENT) };
+                    ui.label(widgets::icon(c, 20.0, col));
+                    ui.add(Label::new(widgets::strong(&modal.title, 19.0)).wrap());
+                });
+                ui.add_space(4.0);
+                ui.label(RichText::new(&modal.body).color(TEXT_DIM));
+                if !modal.details.is_empty() {
+                    ui.add_space(4.0);
+                    Frame::none()
+                        .fill(BG)
+                        .rounding(Rounding::same(8.0))
+                        .inner_margin(Margin::same(10.0))
+                        .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ScrollArea::vertical()
+                                .id_source("modal_details")
+                                .max_height(180.0)
+                                .show(ui, |ui| {
+                                    for d in &modal.details {
+                                        ui.add(Label::new(widgets::faint(d)).truncate());
+                                    }
+                                });
+                        });
+                }
+                if let Some(n) = &modal.note {
+                    ui.add_space(2.0);
+                    ui.label(RichText::new(n).color(WARN).size(13.0));
+                }
+                ui.add_space(12.0);
+                let w = ui.available_width();
+                ui.allocate_ui_with_layout(vec2(w, 36.0), Layout::right_to_left(Align::Center), |ui| {
+                    let btn = if modal.danger {
+                        widgets::danger(modal.confirm.clone())
+                    } else {
+                        widgets::primary(modal.confirm.clone())
+                    };
+                    if ui.add(btn).clicked() {
+                        decision = Some(true);
+                    }
+                    if ui.add(widgets::ghost("Cancel")).clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            decision = Some(false);
+        }
+        if let Some(confirmed) = decision {
+            if let Some(m) = self.modal.take() {
+                if confirmed {
+                    self.execute(m.action, ctx);
+                }
+            }
+        }
+    }
+
+    fn toasts_ui(&mut self, ctx: &egui::Context) {
+        self.toasts.retain(|t| t.born.elapsed() < Duration::from_secs(6));
+        if self.toasts.is_empty() {
+            return;
+        }
+        egui::Area::new(Id::new("pcsweep_toasts"))
+            .anchor(Align2::RIGHT_BOTTOM, vec2(-20.0, -20.0))
+            .order(Order::Foreground)
+            .interactable(false)
+            .show(ctx, |ui| {
+                ui.set_max_width(380.0);
+                for t in &self.toasts {
+                    let (c, col) = match t.kind {
+                        ToastKind::Info => (ic::INFO, ACCENT),
+                        ToastKind::Success => (ic::CHECK, GOOD),
+                        ToastKind::Error => (ic::WARN, BAD),
+                    };
+                    Frame::none()
+                        .fill(CARD_HI)
+                        .stroke(Stroke::new(1.0, mix(CARD_HI, col, 0.5)))
+                        .rounding(Rounding::same(12.0))
+                        .inner_margin(Margin::symmetric(14.0, 10.0))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(widgets::icon(c, 15.0, col));
+                                ui.add(Label::new(RichText::new(&t.text).color(TEXT)).wrap());
+                            });
+                        });
+                    ui.add_space(6.0);
+                }
+            });
+    }
+}
+
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Re-apply the theme if Windows switches light/dark mode underneath us.
+        if ctx.style().visuals.panel_fill != theme::BG {
+            theme::apply(ctx);
+        }
+        let want_procs = matches!(self.page, Page::Dashboard | Page::Memory);
+        self.sys.tick(want_procs);
+        self.poll(ctx);
+
+        let enabled = self.modal.is_none();
+        egui::SidePanel::left("nav")
+            .exact_width(236.0)
+            .resizable(false)
+            .show_separator_line(false)
+            .frame(Frame::none().fill(SIDEBAR).inner_margin(Margin::symmetric(14.0, 20.0)))
+            .show(ctx, |ui| {
+                ui.add_enabled_ui(enabled, |ui| self.sidebar(ui));
+            });
+
+        egui::CentralPanel::default()
+            .frame(Frame::none().fill(BG).inner_margin(Margin::symmetric(30.0, 22.0)))
+            .show(ctx, |ui| {
+                ui.add_enabled_ui(enabled, |ui| match self.page {
+                    Page::Dashboard => self.page_dashboard(ui),
+                    Page::Cleaner => self.page_cleaner(ui),
+                    Page::Analyzer => self.page_analyzer(ui),
+                    Page::Duplicates => self.page_duplicates(ui),
+                    Page::Apps => self.page_apps(ui),
+                    Page::Startup => self.page_startup(ui),
+                    Page::Memory => self.page_memory(ui),
+                    Page::Tools => self.page_tools(ui),
+                    Page::Activity => self.page_activity(ui),
+                });
+            });
+
+        self.modal_ui(ctx);
+        self.toasts_ui(ctx);
+
+        let ms = if self.any_running() { 120 } else { 1000 };
+        ctx.request_repaint_after(Duration::from_millis(ms));
+    }
+}
