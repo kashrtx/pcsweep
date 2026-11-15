@@ -168,6 +168,7 @@ pub struct AdsState {
     error: Option<String>,
     message: Option<String>,
     poll_time: Option<Instant>,
+    reveal_trial_frames: u8,
 }
 impl Default for AdsState {
     fn default() -> Self {
@@ -186,6 +187,7 @@ impl Default for AdsState {
             error: None,
             message: None,
             poll_time: None,
+            reveal_trial_frames: 0,
         }
     }
 }
@@ -195,6 +197,10 @@ impl AdsState {
     }
     pub fn trial_pending(&self) -> bool {
         self.trial.as_ref().is_some_and(Trial::pending)
+    }
+    pub fn reveal_trial(&mut self) {
+        // Keep the decision visible while egui settles the newly added card.
+        self.reveal_trial_frames = 3;
     }
 }
 fn config_label(config: &Config) -> String {
@@ -210,7 +216,6 @@ fn config_label(config: &Config) -> String {
 impl App {
     fn refresh_ads(&mut self, ctx: &egui::Context) {
         if !self.ads.load.running() && !self.ads.change.running() {
-            self.ads.error = None;
             self.ads.load = Task::spawn(ctx, inventory);
         }
     }
@@ -238,6 +243,14 @@ impl App {
                     util::log(&message);
                     self.ads.message = Some(message);
                     self.ads.trial = dns::read_trial().ok().flatten();
+                    if self
+                        .ads
+                        .trial
+                        .as_ref()
+                        .is_some_and(|t| t.phase == "Applied")
+                    {
+                        self.ads.reveal_trial();
+                    }
                 }
                 Err(e) => {
                     util::log(format!("DNS trial: {e}"));
@@ -322,259 +335,292 @@ impl App {
 
         let busy = self.ads.change.running();
 
-        ScrollArea::vertical().id_salt("ads_page").auto_shrink([false,
-false]).show(ui,
-|ui|{
+        let mut scroll = ScrollArea::vertical()
+            .id_salt("ads_page")
+            .auto_shrink([false, false]);
+        if self.ads.reveal_trial_frames > 0 {
+            self.ads.reveal_trial_frames -= 1;
+            scroll = scroll.vertical_scroll_offset(0.0);
+            ctx.request_repaint();
+        }
+        scroll.show(ui, |ui| {
+            widgets::page_header(ui, "Ads and tracking", "Combine browser blocking with optional DNS filtering. Your choices stay explicit and reversible.");
 
-            widgets::page_header(ui,
-"Ads and tracking",
-"Combine browser blocking with optional DNS filtering. Your choices stay explicit and reversible.");
+            if let Some(e) = &self.ads.error {
+                ui.colored_label(WARN, e);
+            }
+            if let Some(m) = &self.ads.message {
+                ui.label(widgets::dim(m));
+            }
 
-            widgets::banner(ui,
-ACCENT,
-ic::INFO,
-|ui|{
-ui.vertical(|ui|{
-ui.label("DNS blocks many ad/tracker domains across apps. A browser blocker handles page-level filtering.");
-ui.label(widgets::faint("Neither layer blocks every ad. Same-domain YouTube/Twitch ads, sponsored posts and apps using their own DNS can remain."));
-}
-);
-}
-);
+            if let Some(t) = &self.ads.trial {
+                if t.pending() {
+                    widgets::card(ui, |ui| {
+                        ui.label(widgets::strong(
+                            format!(
+                                "DNS trial · {} · {} seconds remaining",
+                                t.adapter.name,
+                                t.deadline.saturating_sub(dns::now())
+                            ),
+                            18.0,
+                        ));
+                        ui.label(widgets::dim("The separate recovery process restores the previous settings unless you keep this trial. Closing PCSweep does not keep it."));
 
-            widgets::section(ui,
-"Browser blocking");
+                        if self.ads.checks.running() {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("Checking the selected resolver and Windows lookup…");
+                            });
+                        }
+                        if let Some(p) = &self.ads.probe {
+                            ui.label(widgets::dim(&p.message));
+                            ui.label(widgets::faint(&p.filter));
+                        }
 
-            let fallback=browsers();
-let browsers=self.ads.inventory.as_ref().map(|i|&i.browsers).unwrap_or(&fallback);
+                        ui.horizontal_wrapped(|ui| {
+                            if ui
+                                .add_enabled(
+                                    !busy
+                                        && t.phase == "Applied"
+                                        && self.ads.probe.as_ref().is_some_and(|p| p.usable),
+                                    widgets::primary("Keep these DNS settings"),
+                                )
+                                .clicked()
+                            {
+                                action = Some(AdsAction::Keep(t.token.clone()));
+                            }
+                            if ui
+                                .add_enabled(!busy, widgets::ghost("Restore now"))
+                                .clicked()
+                            {
+                                action = Some(AdsAction::Undo(t.token.clone()));
+                            }
+                        });
+                    });
+                } else if t.phase == "Kept"
+                    || t.phase == "Failed"
+                    || t.phase == "Conflict"
+                    || t.phase == "Restoring"
+                {
+                    widgets::card(ui, |ui| {
+                        ui.label(widgets::strong(
+                            format!("Last DNS change · {}", t.adapter.name),
+                            15.0,
+                        ));
+                        ui.label(widgets::dim(&t.result));
+                        if ui
+                            .add_enabled(!busy, widgets::small("Undo last DNS change"))
+                            .clicked()
+                        {
+                            action = Some(AdsAction::Undo(t.token.clone()));
+                        }
+                        if matches!(t.phase.as_str(), "Failed" | "Conflict")
+                            && ui
+                                .add_enabled(
+                                    !busy,
+                                    widgets::small("Keep current DNS and dismiss recovery…"),
+                                )
+                                .clicked()
+                        {
+                            dismiss = Some(t.token.clone());
+                        }
+                    });
+                } else if !t.result.is_empty() {
+                    ui.label(widgets::dim(&t.result));
+                }
+            }
 
-            for browser in browsers{
-widgets::card(ui,
-|ui|{
-ui.horizontal_wrapped(|ui|{
-ui.label(widgets::strong(format!("{} · {}",
-browser.name,
-browser.blocker),
-16.0));
-widgets::badge(ui,
-if browser.path.is_some(){
-"Browser found"}
-else{
-"Not detected"}
-,
-TEXT_DIM);
-}
-);
+            widgets::banner(ui, ACCENT, ic::INFO, |ui| {
+                ui.vertical(|ui| {
+                    ui.label("DNS blocks many ad/tracker domains across apps. A browser blocker handles page-level filtering.");
+                    ui.label(widgets::faint("Neither layer blocks every ad. Same-domain YouTube/Twitch ads, sponsored posts and apps using their own DNS can remain."));
+                });
+            });
 
-                ui.label(widgets::dim(if browser.name=="Firefox"{
-"Full uBlock Origin is supported on Firefox. Install from the official Mozilla listing."}
-else{
-"uBlock Origin Lite supports current Manifest V3 browsers. The browser explains site permissions and filtering modes."}
-));
+            widgets::section(ui, "Browser blocking");
 
-                ui.horizontal_wrapped(|ui|{
-if ui.add(widgets::small("Open official listing")).clicked(){
-if !self.is_admin{
-if let Some(path)=&browser.path{
-let _=std::process::Command::new(path).arg(&browser.url).spawn();
-}
-else{
-util::open_uri(&browser.url);
-}
-}
-else{
-util::open_uri(&browser.url);
-}
-}
+            let fallback = browsers();
+            let browsers = self
+                .ads
+                .inventory
+                .as_ref()
+                .map(|i| &i.browsers)
+                .unwrap_or(&fallback);
 
-                    if ui.add(widgets::small("Copy store link")).clicked(){
-ui.output_mut(|o|o.copied_text=browser.url.clone());
-}
-}
-);
+            for browser in browsers {
+                widgets::card(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(widgets::strong(
+                            format!("{} · {}", browser.name, browser.blocker),
+                            16.0,
+                        ));
+                        widgets::badge(
+                            ui,
+                            if browser.path.is_some() {
+                                "Browser found"
+                            } else {
+                                "Not detected"
+                            },
+                            TEXT_DIM,
+                        );
+                    });
 
-                ui.label(widgets::faint("Install and confirm permissions in that browser. PCSweep does not force extensions, edit profiles or claim they are active without browser verification."));
-}
-);
-}
+                    ui.label(widgets::dim(if browser.name == "Firefox" {
+                        "Full uBlock Origin is supported on Firefox. Install from the official Mozilla listing."
+                    } else {
+                        "uBlock Origin Lite supports current Manifest V3 browsers. The browser explains site permissions and filtering modes."
+                    }));
 
-            widgets::section(ui,
-"Optional DNS filtering");
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.add(widgets::small("Open official listing")).clicked() {
+                            if !self.is_admin {
+                                if let Some(path) = &browser.path {
+                                    let _ =
+                                        std::process::Command::new(path).arg(&browser.url).spawn();
+                                } else {
+                                    util::open_uri(&browser.url);
+                                }
+                            } else {
+                                util::open_uri(&browser.url);
+                            }
+                        }
 
-            ui.horizontal_wrapped(|ui|{
-if ui.add_enabled(!self.ads.load.running()&&!busy,
-widgets::small("Refresh adapters")).clicked(){
-refresh=true;
-}
-if self.ads.load.running(){
-ui.spinner();
-ui.label(widgets::dim("Reading adapters and DNS safeguards…"));
-}
-if ui.add(widgets::small("Windows DNS settings")).clicked(){
-util::open_uri("ms-settings:network-status");
-}
-}
-);
+                        if ui.add(widgets::small("Copy store link")).clicked() {
+                            ui.output_mut(|o| o.copied_text = browser.url.clone());
+                        }
+                    });
 
-            if let Some(e)=&self.ads.error{
-ui.colored_label(WARN,
-e);
-}
-if let Some(m)=&self.ads.message{
-ui.label(widgets::dim(m));
-}
+                    ui.label(widgets::faint("Install and confirm permissions in that browser. PCSweep does not force extensions, edit profiles or claim they are active without browser verification."));
+                });
+            }
 
-            if let Some(t)=&self.ads.trial{
-if t.pending(){
-widgets::card(ui,
-|ui|{
-ui.label(widgets::strong(format!("DNS trial · {} · {} seconds remaining",
-t.adapter.name,
-t.deadline.saturating_sub(dns::now())),
-18.0));
-ui.label(widgets::dim("The separate recovery process restores the previous settings unless you keep this trial. Closing PCSweep does not keep it."));
+            widgets::section(ui, "Optional DNS filtering");
 
-                if self.ads.checks.running(){
-ui.horizontal(|ui|{
-ui.spinner();
-ui.label("Checking the selected resolver and Windows lookup…");
-}
-);
-}
-if let Some(p)=&self.ads.probe{
-ui.label(widgets::dim(&p.message));
-ui.label(widgets::faint(&p.filter));
-}
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(
+                        !self.ads.load.running() && !busy,
+                        widgets::small("Refresh adapters"),
+                    )
+                    .clicked()
+                {
+                    refresh = true;
+                }
+                if self.ads.load.running() {
+                    ui.spinner();
+                    ui.label(widgets::dim("Reading adapters and DNS safeguards…"));
+                }
+                if ui.add(widgets::small("Windows DNS settings")).clicked() {
+                    util::open_uri("ms-settings:network-status");
+                }
+            });
 
-                ui.horizontal_wrapped(|ui|{
-if ui.add_enabled(!busy&&t.phase=="Applied"&&self.ads.probe.as_ref().is_some_and(|p|p.usable),
-widgets::primary("Keep these DNS settings")).clicked(){
-action=Some(AdsAction::Keep(t.token.clone()));
-}
-if ui.add_enabled(!busy,
-widgets::ghost("Restore now")).clicked(){
-action=Some(AdsAction::Undo(t.token.clone()));
-}
-}
-);
-}
-);
-}
-else if t.phase=="Kept"||t.phase=="Failed"||t.phase=="Conflict"||t.phase=="Restoring"{
-widgets::card(ui,
-|ui|{
-ui.label(widgets::strong(format!("Last DNS change · {}",
-t.adapter.name),
-15.0));
-ui.label(widgets::dim(&t.result));
-if ui.add_enabled(!busy,
-widgets::small("Undo last DNS change")).clicked(){
-action=Some(AdsAction::Undo(t.token.clone()));
-}
-if matches!(t.phase.as_str(), "Failed" | "Conflict") && ui.add_enabled(!busy, widgets::small("Keep current DNS and dismiss recovery…")).clicked() { dismiss = Some(t.token.clone()); }
-}
-);
-}
-else if !t.result.is_empty(){
-ui.label(widgets::dim(&t.result));
-}
-}
+            if let Some(inventory) = &self.ads.inventory {
+                for view in &inventory.adapters {
+                    if ui
+                        .selectable_label(
+                            self.ads.selected.as_ref() == Some(&view.adapter.guid),
+                            format!("{} · {}", view.adapter.name, view.adapter.description),
+                        )
+                        .clicked()
+                    {
+                        self.ads.selected = Some(view.adapter.guid.clone());
+                    }
+                }
 
-            if let Some(inventory)=&self.ads.inventory{
-for view in &inventory.adapters{
-if ui.selectable_label(self.ads.selected.as_ref()==Some(&view.adapter.guid),
-format!("{} · {}",
-view.adapter.name,
-view.adapter.description)).clicked(){
-self.ads.selected=Some(view.adapter.guid.clone());
-}
-}
+                if let Some(view) = inventory
+                    .adapters
+                    .iter()
+                    .find(|v| Some(&v.adapter.guid) == self.ads.selected.as_ref())
+                {
+                    widgets::card(ui, |ui| {
+                        ui.label(widgets::strong(
+                            format!("DNS for {}", view.adapter.name),
+                            17.0,
+                        ));
+                        match &view.config {
+                            Ok(c) => {
+                                ui.label(widgets::dim(config_label(c)));
+                            }
+                            Err(e) => {
+                                ui.colored_label(WARN, e);
+                            }
+                        }
 
-                if let Some(view)=inventory.adapters.iter().find(|v|Some(&v.adapter.guid)==self.ads.selected.as_ref()){
+                        if let Some(g) = &view.guard {
+                            ui.colored_label(WARN, g);
+                        }
+                        ui.add_space(4.0);
 
-                    widgets::card(ui,
-|ui|{
-ui.label(widgets::strong(format!("DNS for {}",
-view.adapter.name),
-17.0));
-match &view.config{
-Ok(c)=>{
-ui.label(widgets::dim(config_label(c)));
-}
-,
-Err(e)=>{
-ui.colored_label(WARN,
-e);
-}
-}
+                        ui.radio_value(&mut self.ads.custom, false, "AdGuard public DNS · ad/tracker domain filtering");
+                        ui.radio_value(
+                            &mut self.ads.custom,
+                            true,
+                            "Use my existing local or custom resolver",
+                        );
 
-                        if let Some(g)=&view.guard{
-ui.colored_label(WARN,
-g);
-}
-ui.add_space(4.0);
-
-                        ui.radio_value(&mut self.ads.custom,
-false,
-"AdGuard public DNS · ad/tracker domain filtering");
-ui.radio_value(&mut self.ads.custom,
-true,
-"Use my existing local or custom resolver");
-
-                        if self.ads.custom{
-ui.add(egui::TextEdit::singleline(&mut self.ads.custom_text).hint_text("IP addresses separated by commas").desired_width(ui.available_width().min(520.0)));
-ui.label(widgets::faint("A family without a custom address keeps its current configuration and may use a different resolver."));
-}
+                        if self.ads.custom {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.ads.custom_text)
+                                    .hint_text("IP addresses separated by commas")
+                                    .desired_width(ui.available_width().min(520.0)),
+                            );
+                            ui.label(widgets::faint("A family without a custom address keeps its current configuration and may use a different resolver."));
+                        }
 
                         ui.label(widgets::faint("This trial configures classic DNS only. Existing encrypted/managed DNS is protected. A public provider receives DNS requests under its own privacy policy; this is not anonymous browsing."));
 
-                        ui.horizontal_wrapped(|ui|{
-if ui.add(widgets::small("Provider and privacy details")).clicked(){
-util::open_uri("https://adguard-dns.io/en/privacy.html");
-}
-if ui.add(widgets::small("AdGuard Home / Pi-hole guidance")).clicked(){
-util::open_uri("https://github.com/AdguardTeam/AdGuardHome");
-}
-}
-);
+                        ui.horizontal_wrapped(|ui| {
+                            if ui
+                                .add(widgets::small("Provider and privacy details"))
+                                .clicked()
+                            {
+                                util::open_uri("https://adguard-dns.io/en/privacy.html");
+                            }
+                            if ui
+                                .add(widgets::small("AdGuard Home / Pi-hole guidance"))
+                                .clicked()
+                            {
+                                util::open_uri("https://github.com/AdguardTeam/AdGuardHome");
+                            }
+                        });
 
-                        if !self.is_admin{
-ui.label(widgets::dim("Restart as administrator to start a DNS trial. No router settings, VPNs or IP addresses are changed."));
-}
+                        if !self.is_admin {
+                            ui.label(widgets::dim("Restart as administrator to start a DNS trial. No router settings, VPNs or IP addresses are changed."));
+                        }
 
-                        let enabled=self.is_admin&&!globally_busy&&view.guard.is_none()&&view.config.is_ok();
+                        let enabled = self.is_admin
+                            && !globally_busy
+                            && view.guard.is_none()
+                            && view.config.is_ok();
 
-                        if ui.add_enabled(enabled,
-widgets::primary("Review 90-second DNS trial…")).clicked(){
-if let Ok(before)=&view.config{
-let desired=if self.ads.custom{
-dns::custom(&self.ads.custom_text,
-before)}
-else{
-Ok(dns::adguard())}
-;
-match desired{
-Ok(desired)=>ask=Some((view.adapter.clone(),
-before.clone(),
-desired)),
-Err(e)=>self.ads.error=Some(e)}
-}
-}
-
-                    }
-);
-
+                        if ui
+                            .add_enabled(enabled, widgets::primary("Review 90-second DNS trial…"))
+                            .clicked()
+                        {
+                            if let Ok(before) = &view.config {
+                                let desired = if self.ads.custom {
+                                    dns::custom(&self.ads.custom_text, before)
+                                } else {
+                                    Ok(dns::adguard())
+                                };
+                                match desired {
+                                    Ok(desired) => {
+                                        ask = Some((view.adapter.clone(), before.clone(), desired))
+                                    }
+                                    Err(e) => self.ads.error = Some(e),
+                                }
+                            }
+                        }
+                    });
+                } else {
+                    ui.label(widgets::dim("No physical Wi-Fi or Ethernet adapter was found. Browser blocking is still available."));
                 }
-else{
-ui.label(widgets::dim("No physical Wi-Fi or Ethernet adapter was found. Browser blocking is still available."));
-}
-
             }
-
-        }
-);
+        });
 
         if refresh {
+            self.ads.error = None;
             self.refresh_ads(&ctx);
         }
 
@@ -588,28 +634,28 @@ ui.label(widgets::dim("No physical Wi-Fi or Ethernet adapter was found. Browser 
                 body: "Your current DNS configuration will stay as it is. This releases a failed or conflicting recovery record so you can review a new trial.".into(),
                 details: Vec::new(),
                 note: Some("The previous DNS configuration will no longer be offered as Undo. No network setting is changed by dismissing this record.".into()),
-                confirm: "Keep current and dismiss".into(), danger: false,
+                confirm: "Keep current and dismiss".into(),
+                danger: false,
                 action: Action::Ads(AdsAction::Dismiss(token)),
             });
         }
         if let Some((adapter, before, desired)) = ask {
-            self.modal=Some(Modal{
-title:format!("Try filtering DNS on {}?",
-adapter.name),
-body:"Windows will use the reviewed DNS servers for this physical adapter. Some apps or networks may need a different resolver. The original automatic/manual configuration is saved before changing anything.".into(),
-details:vec![format!("Current:\n{}",
-config_label(&before)),
-format!("Trial:\n{}",
-config_label(&desired))],
-note:Some("A recovery process restores the original settings unless you Keep the trial within 90 seconds. DNS requests go to your chosen provider. Encrypted/managed DNS, VPNs and remote sessions are protected.".into()),
-confirm:"Start DNS trial".into(),
-danger:false,
-action:Action::Ads(AdsAction::Begin{
-adapter,
-before,
-desired}
-)}
-);
+            self.modal = Some(Modal {
+                title: format!("Try filtering DNS on {}?", adapter.name),
+                body: "Windows will use the reviewed DNS servers for this physical adapter. Some apps or networks may need a different resolver. The original automatic/manual configuration is saved before changing anything.".into(),
+                details: vec![
+                    format!("Current:\n{}", config_label(&before)),
+                    format!("Trial:\n{}", config_label(&desired)),
+                ],
+                note: Some("A recovery process restores the original settings unless you Keep the trial within 90 seconds. DNS requests go to your chosen provider. Encrypted/managed DNS, VPNs and remote sessions are protected.".into()),
+                confirm: "Start DNS trial".into(),
+                danger: false,
+                action: Action::Ads(AdsAction::Begin {
+                    adapter,
+                    before,
+                    desired,
+                }),
+            });
         }
     }
 }
@@ -650,6 +696,32 @@ pub(crate) fn preview_fixture() -> AdsState {
         }],
         trial: None,
     });
+    state
+}
+#[cfg(test)]
+pub(crate) fn trial_preview_fixture() -> AdsState {
+    let mut state = preview_fixture();
+    let trial = dns::preview_trial();
+    state.selected = Some(trial.adapter.guid.clone());
+    if let Some(inventory) = &mut state.inventory {
+        inventory.adapters = vec![AdapterView {
+            adapter: trial.adapter.clone(),
+            config: Ok(trial.applied.clone()),
+            guard: None,
+        }];
+        inventory.trial = Some(trial.clone());
+    }
+    state.probe = Some(Probe {
+        usable: true,
+        message: "The selected resolver and Windows resolved a normal website. This is not a complete internet or browser test.".into(),
+        filter: "Selected resolver returned blocked addresses for the ad-domain probe".into(),
+    });
+    state.probe_token = Some(trial.token.clone());
+    state.message = Some(
+        "DNS trial started. Check the results, then Keep or restore before the timer ends.".into(),
+    );
+    state.trial = Some(trial);
+    state.reveal_trial();
     state
 }
 #[cfg(test)]

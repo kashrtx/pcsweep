@@ -597,7 +597,6 @@ impl PowerState {
 impl App {
     fn refresh_power(&mut self, ctx: &egui::Context) {
         if !self.power.load.running() && !self.power.change.running() {
-            self.power.error = None;
             self.power.status = status();
             self.power.load = Task::spawn(ctx, query);
         }
@@ -916,6 +915,7 @@ impl App {
             });
 
         if refresh {
+            self.power.error = None;
             self.refresh_power(&ctx);
         }
 

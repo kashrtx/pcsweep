@@ -739,7 +739,10 @@ impl eframe::App for App {
                     widgets::banner(ui, WARN, ic::GLOBE, |ui| {
                         ui.vertical(|ui| {
                             ui.label("A DNS trial is waiting for your decision. It will restore the previous settings unless you keep it.");
-                            if ui.add(widgets::small("Review DNS trial")).clicked() { self.page = Page::Ads; }
+                            if ui.add_enabled(enabled, widgets::small("Review DNS trial")).clicked() {
+                                self.page = Page::Ads;
+                                self.ads.reveal_trial();
+                            }
                         });
                     });
                     ui.add_space(8.0);

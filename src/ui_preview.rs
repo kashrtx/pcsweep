@@ -221,7 +221,7 @@ fn sample(texture: &Texture, uv: [f32; 2]) -> [f32; 4] {
     output
 }
 
-fn render_page(page: Page, size: [u32; 2], path: &Path) {
+fn render_page(page: Page, size: [u32; 2], path: &Path, pending_dns: bool) {
     let ctx = egui::Context::default();
     theme::setup_fonts(&ctx);
     theme::apply(&ctx);
@@ -229,14 +229,17 @@ fn render_page(page: Page, size: [u32; 2], path: &Path) {
     // only, so rendering cannot start scans, execute commands or alter settings.
     let mut app = App::test_fixture();
     app.page = page;
+    if pending_dns {
+        app.ads = crate::ads::trial_preview_fixture();
+    }
     let mut painter = CpuPainter::default();
-    for frame in 0..3 {
+    for frame in 0..8 {
         let input = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(
                 Pos2::ZERO,
                 egui::vec2(size[0] as f32, size[1] as f32),
             )),
-            time: Some(frame as f64 / 60.0),
+            time: Some(frame as f64 * 0.1),
             ..egui::RawInput::default()
         };
         let output = ctx.run(input, |ctx| {
@@ -263,15 +266,46 @@ fn render_page(page: Page, size: [u32; 2], path: &Path) {
             "rendering a page must not open a confirmation without input"
         );
         assert!(
-            !app.mutations_running(),
-            "preview fixtures must never start a mutation"
+            app.mutations_running() == pending_dns,
+            "only the inert pending DNS fixture may reserve the operation guard"
         );
         assert!(!output.shapes.is_empty(), "page must draw content");
         for (id, delta) in &output.textures_delta.set {
             painter.set_texture(*id, delta);
         }
-        let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
-        if frame == 2 {
+        if frame == 7 {
+            if pending_dns {
+                for expected in ["Keep these DNS settings", "Restore now"] {
+                    let mut found = Vec::new();
+                    for shape in &output.shapes {
+                        matching_text_rects(&shape.shape, shape.clip_rect, expected, &mut found);
+                    }
+                    assert_eq!(found.len(), 1, "{expected} must appear in the trial card");
+                    let (text, clip) = found[0];
+                    assert!(
+                        clip.contains_rect(text),
+                        "{expected} must be visible without scrolling"
+                    );
+                }
+            }
+            if let Some(selected) = match page {
+                Page::Ads => Some("Ads and tracking"),
+                Page::Network => Some("Connection health"),
+                Page::Power => Some("Battery and power"),
+                _ => None,
+            } {
+                let mut found = Vec::new();
+                for shape in &output.shapes {
+                    matching_text_rects(&shape.shape, shape.clip_rect, selected, &mut found);
+                }
+                assert!(
+                    found
+                        .iter()
+                        .any(|(text, clip)| text.left() < 236.0 && clip.contains_rect(*text)),
+                    "selected navigation item {selected} must be visible"
+                );
+            }
+            let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
             let image = painter.render(size, &primitives);
             let background = theme::BG.to_array();
             let content_pixels = image.pixels().filter(|p| p.0 != background).count();
@@ -308,8 +342,12 @@ fn all_management_pages_render_at_minimum_and_default_window_sizes() {
     ] {
         for size in [[1040, 680], [1320, 860]] {
             let path = directory.join(format!("{name}-{}x{}.png", size[0], size[1]));
-            render_page(page, size, &path);
+            render_page(page, size, &path, false);
         }
+    }
+    for size in [[1040, 680], [1320, 860]] {
+        let path = directory.join(format!("dns-trial-{}x{}.png", size[0], size[1]));
+        render_page(Page::Ads, size, &path, true);
     }
 }
 
@@ -474,11 +512,6 @@ fn long_confirmation_content_keeps_both_actions_visible_at_supported_sizes() {
                         "{expected} action must not be hidden by the content scroll clip"
                     );
                 }
-                let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
-                let image = painter.render(size, &primitives);
-                image
-                    .save(directory.join(format!("confirmation-{}x{}.png", size[0], size[1])))
-                    .unwrap();
             }
             for id in output.textures_delta.free {
                 painter.textures.remove(&id);

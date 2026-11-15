@@ -788,6 +788,35 @@ pub fn run_helper_mode() -> Option<i32> {
 }
 
 #[cfg(test)]
+pub(crate) fn preview_trial() -> Trial {
+    Trial {
+        schema: 1,
+        token: "1234-5678".into(),
+        adapter: AdapterInfo {
+            guid: "11111111-2222-3333-4444-555555555555".into(),
+            index: 4,
+            name: "Wi-Fi".into(),
+            description: "Preview wireless adapter".into(),
+            physical: true,
+            hardware: true,
+            status: "Up".into(),
+            interface_type: 71,
+            pnp_device_id: "PCI\\Preview".into(),
+            domain_member: Some(false),
+            ..Default::default()
+        },
+        before: Config::default(),
+        applied: adguard(),
+        phase: "Applied".into(),
+        started: now(),
+        deadline: now() + TRIAL_SECONDS,
+        ready: true,
+        result: String::new(),
+        recovery_expected: None,
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     struct FakeRecovery {
