@@ -9,6 +9,7 @@ use crate::{
 };
 use eframe::egui::{self, ScrollArea, Ui};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -493,6 +494,31 @@ fn undo() -> Result<String, String> {
     let _lock = PreferenceLock::take()?;
     undo_transaction(&mut WindowsPreferences)
 }
+
+fn undo_fingerprint(entries: &[Entry]) -> Result<String, String> {
+    validate_entries(entries)?;
+    let bytes = serde_json::to_vec(entries).map_err(|e| e.to_string())?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn dismiss_undo_transaction(
+    backend: &mut impl Preferences,
+    expected: &str,
+) -> Result<String, String> {
+    let entries = backend.load()?;
+    if entries.is_empty() || undo_fingerprint(&entries)? != expected {
+        return Err(
+            "The saved power Undo changed after review. Refresh before dismissing it.".into(),
+        );
+    }
+    backend.save(&[])?;
+    Ok("Saved power Undo dismissed. Current Windows power preferences were kept.".into())
+}
+
+fn dismiss_undo(expected: &str) -> Result<String, String> {
+    let _lock = PreferenceLock::take()?;
+    dismiss_undo_transaction(&mut WindowsPreferences, expected)
+}
 #[derive(Clone, Copy, Debug)]
 pub enum ReportKind {
     Battery,
@@ -520,6 +546,9 @@ pub enum PowerAction {
         value: String,
     },
     Undo,
+    DismissUndo {
+        expected: String,
+    },
     Report(ReportKind),
 }
 enum Outcome {
@@ -648,6 +677,7 @@ impl App {
                 value,
             } => apply(&setting, &expected, &value).map(Outcome::Message),
             PowerAction::Undo => undo().map(Outcome::Message),
+            PowerAction::DismissUndo { expected } => dismiss_undo(&expected).map(Outcome::Message),
             PowerAction::Report(kind) => make_report(kind).map(Outcome::Report),
         });
     }
@@ -823,15 +853,28 @@ impl App {
 
                     match &snapshot.undo {
                         Ok(entries) if !entries.is_empty() => {
-                            if ui
-                                .add_enabled(
-                                    !self.mutations_running(),
-                                    widgets::ghost("Undo PCSweep power changes"),
-                                )
-                                .clicked()
-                            {
-                                chosen = Some(PowerAction::Undo);
-                            }
+                            ui.horizontal_wrapped(|ui| {
+                                if ui
+                                    .add_enabled(
+                                        !self.mutations_running(),
+                                        widgets::ghost("Undo PCSweep power changes"),
+                                    )
+                                    .clicked()
+                                {
+                                    chosen = Some(PowerAction::Undo);
+                                }
+                                if let Ok(expected) = undo_fingerprint(entries) {
+                                    if ui
+                                        .add_enabled(
+                                            !self.mutations_running(),
+                                            widgets::small("Dismiss saved power Undo…"),
+                                        )
+                                        .clicked()
+                                    {
+                                        chosen = Some(PowerAction::DismissUndo { expected });
+                                    }
+                                }
+                            });
                         }
                         Err(e) => {
                             ui.colored_label(WARN, e);
@@ -939,6 +982,11 @@ impl App {
                     "Restore only the preferences PCSweep changed. Values changed outside PCSweep are preserved for review.".into(),
                     "Restore preferences",
                 ),
+                PowerAction::DismissUndo { .. } => (
+                    "Dismiss saved power Undo?".into(),
+                    "Keep the current Windows power preferences and remove PCSweep's saved Undo targets. The original preferences will no longer be offered for restoration. Future changes will save a new baseline.".into(),
+                    "Keep current and dismiss Undo",
+                ),
                 PowerAction::Report(kind) => (
                     format!("Create {}?", kind.label()),
                     "Ask Windows to create a local diagnostic report in PCSweep's reports folder. The report can contain device and usage information; nothing is uploaded or changed in the power configuration.".into(),
@@ -950,9 +998,13 @@ impl App {
                 title,
                 body,
                 details: Vec::new(),
-                note: Some("Windows may refuse organization-managed or unsupported settings. PCSweep verifies applied values and reports failures.".into()),
+                note: Some(if matches!(&action, PowerAction::DismissUndo { .. }) {
+                    "This only removes the reviewed Undo record. No Windows power setting is changed.".into()
+                } else {
+                    "Windows may refuse organization-managed or unsupported settings. PCSweep verifies applied values and reports failures.".into()
+                }),
                 confirm: confirm.into(),
-                danger: false,
+                danger: matches!(&action, PowerAction::DismissUndo { .. }),
                 action: Action::Power(action),
             });
         }
@@ -1059,6 +1111,34 @@ mod tests {
         assert_eq!(backend.current, EFFICIENCY);
         assert_eq!(backend.sets, 1);
         assert_eq!(backend.entries.len(), 1);
+    }
+    #[test]
+    fn dismissing_reviewed_undo_never_changes_power_and_rejects_a_changed_record() {
+        let mut backend = FakePreferences::new();
+        prepare_entry(&mut backend.entries, "ac", BALANCED, PERFORMANCE).unwrap();
+        let reviewed = undo_fingerprint(&backend.entries).unwrap();
+        backend.entries[0].applied = EFFICIENCY.into();
+        let changed = backend.entries.clone();
+        assert!(dismiss_undo_transaction(&mut backend, &reviewed).is_err());
+        assert_eq!(backend.entries, changed);
+        assert_eq!(backend.sets, 0);
+
+        let reviewed = undo_fingerprint(&backend.entries).unwrap();
+        backend.fail_save = true;
+        assert!(dismiss_undo_transaction(&mut backend, &reviewed).is_err());
+        assert_eq!(backend.entries, changed);
+        backend.fail_save = false;
+        dismiss_undo_transaction(&mut backend, &reviewed).unwrap();
+        assert!(backend.entries.is_empty());
+        assert_eq!(backend.current, BALANCED);
+        assert_eq!(backend.sets, 0);
+
+        backend.entries = changed;
+        backend.entries[0].setting = "corrupt".into();
+        let invalid = backend.entries.clone();
+        assert!(dismiss_undo_transaction(&mut backend, &reviewed).is_err());
+        assert_eq!(backend.entries, invalid);
+        assert_eq!(backend.sets, 0);
     }
     #[test]
     fn original_mode_survives_repeated_changes() {
