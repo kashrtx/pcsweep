@@ -442,7 +442,12 @@ impl App {
                         let response =
                             widgets::nav_item(ui, icon_char, label, self.page == page, badge);
                         if reveal_selected && self.page == page {
-                            response.scroll_to_me(Some(Align::Center));
+                            if !ui.clip_rect().contains_rect(response.rect) {
+                                ui.scroll_with_delta_animation(
+                                    vec2(0.0, ui.clip_rect().center().y - response.rect.center().y),
+                                    egui::style::ScrollAnimation::none(),
+                                );
+                            }
                         }
                         if response.clicked() {
                             if page == Page::Startup {

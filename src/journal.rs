@@ -1107,17 +1107,21 @@ mod tests {
         drop(session);
         fs::remove_dir_all(dir).unwrap();
     }
+    fn grow_fixture_journal(session: &mut Session) {
+        // The production append-only handle deliberately lacks SetEndOfFile
+        // permission. Grow this disposable fixture through a temporary handle.
+        session.writer.take();
+        let file = OpenOptions::new().write(true).open(&session.file).unwrap();
+        file.set_len(MAX_FILE_BYTES).unwrap();
+        drop(file);
+        session.writer = Some(open_journal(&session.file).unwrap());
+    }
     #[test]
     fn rotation_replaces_the_older_generation_without_growing_forever() {
         let dir = temp_dir("rotation");
         let mut session = Session::begin_in(&dir, "Test").unwrap();
         for name in ["first.tmp", "second.tmp"] {
-            session
-                .writer
-                .as_ref()
-                .unwrap()
-                .set_len(MAX_FILE_BYTES)
-                .unwrap();
+            grow_fixture_journal(&mut session);
             let ids = session
                 .intend("Temp", Act::Delete, &[(PathBuf::from(name), 4)])
                 .unwrap();
@@ -1140,12 +1144,7 @@ mod tests {
         let dir = temp_dir("rotation-blocked");
         let mut session = Session::begin_in(&dir, "Test").unwrap();
         fs::create_dir(dir.join(OLD_FILE_NAME)).unwrap();
-        session
-            .writer
-            .as_ref()
-            .unwrap()
-            .set_len(MAX_FILE_BYTES)
-            .unwrap();
+        grow_fixture_journal(&mut session);
         assert!(session
             .intend("Temp", Act::Delete, &[(PathBuf::from("blocked.tmp"), 4)])
             .is_err());

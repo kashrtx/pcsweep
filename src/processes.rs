@@ -489,7 +489,13 @@ impl App {
                 }
                 MAct::Filter(value) => self.mem.filter = value,
                 MAct::Sort(value) => self.mem.sort = value,
-                MAct::Select(name) => self.mem.selected = Some(name),
+                MAct::Select(name) => {
+                    self.mem.selected = if self.mem.selected.as_ref() == Some(&name) {
+                        None
+                    } else {
+                        Some(name)
+                    };
+                }
                 MAct::Advanced(value) => self.mem.advanced = value,
                 MAct::Go(page) => self.page = page,
                 MAct::PageFile => {
@@ -893,8 +899,14 @@ impl App {
         let has_undo = self.sys.procs.iter().any(|p| {
             group.pids.contains(&p.pid) && self.mem.efficiency.contains_key(&(p.pid, p.start_time))
         });
+        let expanded = ui.available_height() > 560.0;
+        egui::CollapsingHeader::new(format!("App actions · {}",group.name))
+            .id_salt(("selected_app_controls",group.name.to_lowercase()))
+            .default_open(expanded)
+            .show(ui, |ui| {
         widgets::card(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
+                if ui.add(widgets::small("Hide app details")).clicked() { acts.push(MAct::Select(group.name.clone())); }
                 ui.label(widgets::icon(
                     if protected { ic::LOCK } else { ic::APPS },
                     18.0,
@@ -965,6 +977,7 @@ impl App {
                     ui.label(widgets::faint("Temporary only. Reloading pages can cause stutter; private commit is unchanged."));
                 });
             }
+        });
         });
     }
 }

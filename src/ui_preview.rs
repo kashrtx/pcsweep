@@ -432,6 +432,21 @@ fn render_page(page: Page, size: [u32; 2], path: &Path, pending_dns: bool) {
                     "selected navigation item {selected} must be visible"
                 );
             }
+            if page == Page::Storage {
+                let mut found = Vec::new();
+                for shape in &output.shapes {
+                    matching_text_rects(
+                        &shape.shape,
+                        shape.clip_rect,
+                        "Refresh storage reports",
+                        &mut found,
+                    );
+                }
+                assert!(
+                    found.iter().any(|(text, clip)| clip.contains_rect(*text)),
+                    "storage toolbar must not be horizontally clipped"
+                );
+            }
             let mut primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
             scale_primitives(&mut primitives, output.pixels_per_point);
             let image = painter.render(size, &primitives);
@@ -1079,7 +1094,7 @@ fn full_page_file_review_fills_the_window_and_filters_without_rebuilding_rows() 
                     found.iter().any(|(text, clip)| clip.contains_rect(*text))
                 };
                 assert!(
-                    visible("All categories"),
+                    visible(&format!("{}All categories", crate::widgets::ic::BACK)),
                     "the Back control must stay visible"
                 );
                 if pass == 0 {
