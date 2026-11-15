@@ -154,6 +154,13 @@ impl App {
     }
 
     pub fn relaunch_admin(&mut self, ctx: &egui::Context) {
+        if self.mutations_running() {
+            self.toast(
+                ToastKind::Info,
+                "Wait for the current operation to finish before restarting PCSweep.",
+            );
+            return;
+        }
         if !self.relaunch.running() {
             self.relaunch = Task::spawn(ctx, system::relaunch_as_admin);
         }
@@ -684,5 +691,28 @@ impl eframe::App for App {
 
         let ms = if self.any_running() { 120 } else { 1000 };
         ctx.request_repaint_after(Duration::from_millis(ms));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn elevation_cannot_interrupt_an_active_operation() {
+        let ctx = egui::Context::default();
+        let mut app = App::test_fixture();
+        let (release, wait) = std::sync::mpsc::channel();
+        app.cleaner.clean = Task::spawn(&ctx, move || {
+            let _ = wait.recv();
+            crate::cleaner::CleanReport::default()
+        });
+        app.relaunch_admin(&ctx);
+        assert!(!app.relaunch.running());
+        assert!(app
+            .toasts
+            .iter()
+            .any(|t| t.text.contains("current operation")));
+        release.send(()).unwrap();
     }
 }
