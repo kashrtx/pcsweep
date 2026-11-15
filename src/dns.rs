@@ -453,6 +453,7 @@ pub fn eligibility(adapter: &AdapterInfo, all: &[AdapterInfo]) -> Result<(), Str
             Err(e) => return Err(format!("Windows encrypted-DNS configuration could not be verified: {e}")),
         }
     }
+    ensure_no_profile_dns(adapter)?;
     capture(adapter)?;
     load_setter()?;
     Ok(())
@@ -474,6 +475,53 @@ fn load_setter() -> Result<Setter, String> {
         .ok_or("This Windows build does not support the DNS trial API. Use Windows Settings.")?;
     Ok(unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, Setter>(f) })
 }
+
+fn ensure_no_profile_dns(adapter: &AdapterInfo) -> Result<(), String> {
+    use windows_sys::Win32::{
+        NetworkManagement::IpHelper::DNS_INTERFACE_SETTINGS,
+        System::LibraryLoader::{GetModuleHandleW, GetProcAddress},
+    };
+    type Query = unsafe extern "system" fn(GUID, *mut DNS_INTERFACE_SETTINGS) -> u32;
+    // The current SDK documents a void return. Resolve dynamically rather than
+    // using the older windows-sys declaration with its obsolete return type.
+    type Free = unsafe extern "system" fn(*mut DNS_INTERFACE_SETTINGS);
+
+    load_setter()?; // Loads only the system DLL if it is not loaded already.
+    let name: Vec<u16> = "iphlpapi.dll".encode_utf16().chain(Some(0)).collect();
+    let module = unsafe { GetModuleHandleW(name.as_ptr()) };
+    if module == 0 {
+        return Err(
+            "Windows DNS configuration could not be inspected. No DNS change is allowed.".into(),
+        );
+    }
+    let query = unsafe { GetProcAddress(module, b"GetInterfaceDnsSettings\0".as_ptr()) }
+        .ok_or("This Windows build cannot verify profile DNS. Use Windows Settings.")?;
+    let free = unsafe { GetProcAddress(module, b"FreeInterfaceDnsSettings\0".as_ptr()) }
+        .ok_or("This Windows build cannot safely inspect profile DNS. Use Windows Settings.")?;
+    let query =
+        unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, Query>(query) };
+    let free = unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, Free>(free) };
+    // GetInterfaceDnsSettings requires all input fields except Version to be
+    // empty, including Flags. Version 1 returns the documented V1 structure.
+    let mut settings: DNS_INTERFACE_SETTINGS = unsafe { std::mem::zeroed() };
+    settings.Version = 1;
+    let result = unsafe { query(parse_guid(&adapter.guid)?, &mut settings) };
+    if result != 0 {
+        return Err(format!(
+            "Windows could not verify profile DNS (code {result}). No DNS change is allowed."
+        ));
+    }
+    // No string scan is needed: only inspect whether the API-owned string is
+    // nonempty, then release every successful query through its paired API.
+    let configured =
+        !settings.ProfileNameServer.is_null() && unsafe { *settings.ProfileNameServer != 0 };
+    unsafe { free(&mut settings) };
+    if configured {
+        return Err("Windows reports profile-specific DNS. Keep this configuration and review DNS in Windows Settings.".into());
+    }
+    Ok(())
+}
+
 fn set_family(adapter: &AdapterInfo, family: &Family, v6: bool) -> Result<(), String> {
     if family.automatic() {
         return Err(
@@ -542,6 +590,7 @@ trait Recovery {
 struct WindowsRecovery(AdapterInfo);
 impl Recovery for WindowsRecovery {
     fn capture(&mut self) -> Result<Config, String> {
+        ensure_no_profile_dns(&self.0)?;
         capture(&self.0)
     }
     fn reset(&mut self) -> Result<(), String> {
@@ -1013,6 +1062,7 @@ mod tests {
             serde_json::from_str(&platform::powershell(&script, Duration::from_secs(15)).unwrap())
                 .unwrap();
         for a in adapters.iter().filter(|a| a.is_physical()).take(2) {
+            let _ = ensure_no_profile_dns(a);
             let _ = capture(a);
         }
     }

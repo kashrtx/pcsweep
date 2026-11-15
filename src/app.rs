@@ -626,7 +626,7 @@ impl App {
                                         .max_height(180.0)
                                         .show(ui, |ui| {
                                             for d in &modal.details {
-                                                ui.add(Label::new(widgets::faint(d)).truncate())
+                                                ui.add(Label::new(widgets::faint(d)).wrap())
                                                     .on_hover_text(d);
                                             }
                                         });
