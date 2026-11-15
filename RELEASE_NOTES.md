@@ -1,71 +1,70 @@
-PCSweep is a free cleanup and PC health tool for Windows 11 and 10. It shows exactly where your disk space goes, finds junk that is safe to remove, and never deletes anything until you've reviewed it and confirmed.
+# PCSweep 1.2.0
 
-## Download and run
+This release adds privacy reviews, Defender integration, reviewed debloating, background-task controls, deeper memory diagnostics and verified in-app updates to the cleaner and space analyzer.
 
-1. Download **PCSweep.exe** from the assets at the bottom of this page. It's a single file with no installer and nothing else to set up.
-2. Double-click it. Windows SmartScreen may say it "protected your PC" because the app isn't code-signed yet. Click **More info**, then **Run anyway**.
-3. Optional: click **Restart as admin** in the sidebar to also clean protected Windows folders such as Windows Temp, update caches and crash dumps.
+## Download
 
-To remove PCSweep, delete the .exe. Its log and settings live in `%LOCALAPPDATA%\PCSweep` if you want to delete those too.
+Download **PCSweep.exe** for a single portable app, or **windows-x64.zip** with the README and license. Requires 64-bit Windows 10 or 11 and an OpenGL-capable graphics driver. Releases are currently unsigned, so Windows may show an unrecognized-app warning. Administrator rights are optional; protected system actions explain when elevation is needed.
 
-**Requirements:** 64-bit Windows 10 or 11, and a graphics driver with OpenGL support, which almost every PC has.
+## Privacy and fewer distractions
 
-## What's new in 1.1.0
+- Review recognized account preferences for advertising ID, Windows tips, welcome suggestions, lock-screen facts and supported Start suggestions.
+- Confirm each change and restore its exact original state with persistent Undo. The journal is written before changes and refuses to overwrite outside changes.
+- Managed, unrecognized and build-specific controls lead to Windows Settings instead of reporting a registry write as successful enforcement.
+- Review personalized offers, optional diagnostics, app permissions, Recall snapshots and clipboard history/cloud sync in Windows. Windows Hello remains responsible for protected Recall changes.
+- Clear the current clipboard after a separate confirmation. Clipboard history and cloud items remain available for review in Windows.
 
-- **Safer cleanup:** files changed since review are skipped; protection is checked again before deletion, including junctions and redirected paths. Driver installer leftovers are now optional and must be at least a week old.
-- **Verified duplicates:** final byte comparisons, another check before recycling, and a locked retained copy help keep the last copy safe. Overlapping scan folders no longer create false duplicates, and reclaimable totals update after removal.
-- **Searchable activity history:** filter previous activity and copy matching entries for troubleshooting.
-- **More reliable app controls:** uninstallers handle paths with spaces correctly; process confirmations check that a PID still belongs to the same process. The memory page shows all matching apps.
-- **Smoother background work:** task failures appear as errors, cancelled scans are identified, and system-tool output handles split Unicode characters.
-- **Automatic releases:** each push to `main` runs Windows tests and publishes verified EXE, ZIP and checksum assets. No manual tagging or workflow dispatch is needed.
-- **Fixed:** category names in the Junk cleaner showed one letter per line on some screens.
-- **Fixed:** badges and buttons on Startup apps and Installed apps were misaligned when an item had no file location or no uninstaller.
-- **Fixed:** folders inside the Startup folder (such as Autoruns' `AutorunsDisabled`) were listed as startup apps.
-- **New cleanup categories:** driver installer leftovers (AMD and NVIDIA), Microsoft Store app temp files, Steam shader cache across all your Steam libraries, and caches from other Chromium and Electron apps.
-- **More developer caches:** uv, Gradle, Cargo and Electron.
-- **No double counting:** a file that matches two categories is counted and cleaned only once.
-- **Your choices are remembered:** Junk cleaner selections are saved between runs. New one-click "Recommended", "Everything found" and "None" selections.
-- **Overview:** "Junk found" now shows recommended categories separately from optional ones.
-- **Safer Recycle Bin moves:** you get a warning when files are on a USB or network drive, where Windows has no Recycle Bin and deletes permanently.
-- **Activity log:** now includes history from earlier sessions.
-- **App icon and version info** are now built into the .exe.
+Advertising-ID controls limit personalization; they do not remove every advertisement or stop website cookies. PCSweep does not promise zero Windows diagnostic traffic.
 
-## Features
+## Defender security check
 
-- **Overview:** a health score based on things that genuinely affect speed (free space, junk, memory pressure, startup apps and uptime), with one-click fixes.
-- **Junk cleaner:** about 25 categories. Expand any category to see every file and untick what you want to keep.
-  - Windows: temp files, Store app temp, thumbnails, crash dumps, Delivery Optimization, update downloads, old logs, shader caches and driver installer leftovers.
-  - Apps: browser caches (Chrome, Edge, Firefox, Brave, Opera, Vivaldi), Discord, Teams, Slack, VS Code and Steam.
-  - Developer package caches.
-- **Space analyzer:** maps folders and drives as a clickable picture you can drill into. Tabs for the largest files, old and unused files, and space by file type.
-- **Duplicate finder:** byte-for-byte comparison. One copy of every file is always kept.
-- **Installed apps:** sorted by size or install date. Uninstall runs each app's own uninstaller.
-- **Startup apps:** turn apps on or off at sign-in, using the same switch as Task Manager.
-- **Memory and apps:** what is using your RAM and processor right now, grouped by app.
-- **Tools:**
-  - Create a restore point.
-  - Clean up the component store (WinSxS).
-  - Turn hibernation off or on.
-  - Repair system files (SFC) and the Windows image (DISM).
-  - Check the drive for errors and optimize/TRIM it.
-  - Switch power plans and flush DNS.
-  - Every tool shows its output live.
-- **Activity log:** a record of everything PCSweep changed.
+- Read actual provider mode, real-time protection, signature dates and recent detections.
+- Request signature updates, quick scans or full scans with confirmation. Defender retains its existing quarantine/remediation settings.
+- Enable potentially unwanted app blocking through the supported API, verify the result and retain the original setting for Undo. Organization policies and Windows refusals are respected.
+- Match fresh scan timestamps before reporting completion. A successful command never means “no threats.” Missing/cancelled results have bounded monitoring and a stop-monitoring control.
+- Open offline scan options with a restart explanation; PCSweep does not silently reboot the computer.
 
-## Built to be safe
+## Reviewed app removal and updates
 
-- **Your Downloads folder is never deleted from**, wherever it is, even if you moved it to another drive.
-- The Junk cleaner can't touch Documents, Desktop, Pictures, Videos, Music or OneDrive.
-- Your own files, from the analyzer and duplicate finder, go to the **Recycle Bin**, so you can restore them. Only junk caches are deleted permanently, and only after you confirm.
-- System folders, program folders, the page file and the hibernation file can't be removed.
-- Scans never follow junctions or shortcut folders.
-- Files that are in use, or changed in the last 24 hours in temp folders, are skipped.
-- Browser cleaning removes caches only. Passwords, history, cookies and tabs stay.
+- Browse desktop programs and current-user Store/MSIX apps with type filters, publisher and available running/startup context.
+- Review selected Store removals. Exact package versions and identities are rechecked before removal; shared frameworks, dependencies and Windows/security components remain protected.
+- See per-app results and Store reinstall links where available. Reinstalling does not restore deleted app data.
+- Preview installed-app updates and select which to install using Microsoft's official WinGet module. Optional setup is explicit, installs for the current account, checks Microsoft signatures and leaves execution policy and repository trust unchanged.
 
-## Verify your download (optional)
+## Background activity
 
-`SHA256SUMS.txt` lists checksums. In PowerShell, run `Get-FileHash .\PCSweep.exe` and compare the result with the line for `PCSweep.exe`.
+- Review scheduled-task actions, publishers, triggers and states with search and a third-party filter.
+- Enable or disable supported third-party tasks with persistent Undo and a fresh task-definition identity check.
+- Protect Windows, Microsoft, security and unverified task actions; task registrations are never deleted.
+- Open browser background/Startup boost and extension settings without editing browser profiles or cookies.
 
-## Source and license
+## Better memory tools
 
-The source code is open in this repository under the MIT license. PCSweep is built automatically by GitHub Actions from the exact code you see here.
+- Separate available RAM, resident usage, private committed memory, commit limit/peak and cache context.
+- Track private-memory growth over a bounded window. Growth is a useful symptom, not proof of a leak.
+- Ask selected apps to close gracefully so save prompts can appear. Force-end remains a separate reviewed action.
+- Offer efficiency mode for eligible background processes and restore the previous policy during the current PCSweep session.
+- Offer an explicit Advanced working-set trim. It is temporary, may cause pages to reload, and does not fix high committed memory or a leak. No scheduled global RAM purge is added.
+- Check exact process identity, own PID, critical-process state and foreground eligibility before process operations.
+
+## Verified PCSweep updates
+
+- Check manually or opt into a daily check while PCSweep is open. No service, device ID, inventory or activity upload is required.
+- Compare explicit build revisions as well as versions, so same-version +build releases are detected.
+- Restrict downloads to official releases, validate metadata, size and SHA-256, and show progress/cancellation and clear offline/error states.
+- Normal user sessions in writable portable folders support update-and-restart with a backup, process-identity checks and startup acknowledgement. Restore the previous EXE when replacement or startup fails.
+- Administrator sessions and protected folders get a verified portable copy with replacement guidance instead of an elevated helper.
+- Publish update.json with the EXE, ZIP and checksums. Hash verification trusts the official GitHub release; independent code-signing verification is not claimed.
+
+## Reliability and validation
+
+- Serialize confirmed system changes and update installation, retain existing Downloads/personal-folder protection, and keep long operations off the UI thread.
+- Use bounded PowerShell output and execution deadlines, exact identities, readback verification and truthful partial-failure messages.
+- Validate on native Windows with regression tests, read-only Defender/Store/Task Scheduler checks, PowerShell parser tests and UI rendering at 1040×680 and 1320×860.
+- Tests mutate only fake state or disposable files/registry keys. They do not remove real apps, run malware scans, install modules or change real security/privacy settings.
+
+Releases publish automatically only after Windows tests, the optimized build and packaging checks pass. SHA256SUMS.txt covers the EXE, portable ZIP and update manifest.
+
+## Local data and license
+
+Settings, logs, staged updates and task/security undo records live in `%LOCALAPPDATA%\PCSweep`. Privacy Undo lives in `HKEY_CURRENT_USER\Software\PCSweep\PrivacyUndo`. Source is available under the MIT license.

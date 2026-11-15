@@ -345,6 +345,7 @@ impl App {
         ];
         ScrollArea::vertical()
             .id_salt("navigation_scroll")
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
             .max_height((ui.available_height() - 100.0).max(100.0))
             .auto_shrink([false, true])
             .show(ui, |ui| {

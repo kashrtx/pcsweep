@@ -223,7 +223,12 @@ impl App {
     }
     pub fn page_memory(&mut self, ui: &mut Ui) {
         let mut acts = Vec::new();
-        self.render_memory(ui, &mut acts);
+        ScrollArea::vertical()
+            .id_salt("memory_page")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                self.render_memory(ui, &mut acts);
+            });
         for act in acts {
             match act {
                 MAct::Filter(value) => self.mem.filter = value,
@@ -346,11 +351,17 @@ impl App {
                 MemoryPressure::Critical if seconds >= 10 => "Memory pressure has stayed high. Save your work and close a heavy app. Near the commit limit, apps can fail to allocate memory.".to_string(),
                 MemoryPressure::Critical => "Memory is very tight right now. Watch for sustained pressure rather than clearing cache on a timer.".to_string(),
             };
-                ui.label(message);
-                ui.horizontal_wrapped(|ui| {
-                if ui.add(widgets::small("Manage startup apps")).clicked() { acts.push(MAct::Go(Page::Startup)); }
-                ui.label(widgets::faint("Private commit can grow without resident RAM growing. It is not the same as page-file usage."));
-            });
+                ui.vertical(|ui| {
+                    ui.label(message);
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.add(widgets::small("Manage startup apps")).clicked() {
+                            acts.push(MAct::Go(Page::Startup));
+                        }
+                        ui.label(widgets::faint(
+                            "Private commit is different from resident RAM and page-file usage.",
+                        ));
+                    });
+                });
             },
         );
         ui.add_space(6.0);
@@ -414,7 +425,7 @@ impl App {
                 }
             });
         });
-        ScrollArea::vertical().id_salt("procs_scroll").auto_shrink([false, false]).show_rows(ui, 42.0, groups.len(), |ui, range| {
+        ScrollArea::vertical().id_salt("procs_scroll").max_height(420.0).min_scrolled_height(126.0).auto_shrink([false, true]).show_rows(ui, 42.0, groups.len(), |ui, range| {
             for group in &groups[range] {
                 widgets::row(ui, 42.0, |ui| {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {

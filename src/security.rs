@@ -1,7 +1,7 @@
 //! Windows Defender status and explicit, reversible security actions.
 //! All PowerShell runs off the UI thread. Successful command execution is never
 //! treated as proof that a scan finished or that the computer is threat-free.
-use crate::app::{Action, App, Modal, ToastKind};
+use crate::app::{Action, App, Modal, Page, ToastKind};
 use crate::task::Task;
 use crate::theme::*;
 use crate::util;
@@ -448,10 +448,11 @@ impl App {
             self.stop_security_monitoring();
         }
         let interval = if self.security.busy() { 5 } else { 60 };
-        if self
-            .security
-            .refreshed
-            .is_none_or(|t| t.elapsed() >= Duration::from_secs(interval))
+        if (self.page == Page::Security || self.security.busy())
+            && self
+                .security
+                .refreshed
+                .is_none_or(|t| t.elapsed() >= Duration::from_secs(interval))
         {
             self.refresh_security(ctx);
         }
