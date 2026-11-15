@@ -233,6 +233,10 @@ impl App {
         for a in acts {
             match a {
                 SAct::Set(i, on) => {
+                    if self.mutations_running() {
+                        self.toast(ToastKind::Info, "Wait for the current operation to finish before changing startup apps.");
+                        continue;
+                    }
                     let Some(item) = self.startup.items.get(i).cloned() else {
                         continue;
                     };

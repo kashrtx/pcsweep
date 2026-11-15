@@ -2,6 +2,13 @@
 // and the file's Properties dialog show them. Windows release builds require
 // resources; a cross-platform type check can proceed without a resource compiler.
 fn main() {
+    for key in ["GITHUB_RUN_NUMBER", "GITHUB_SHA"] {
+        println!("cargo:rerun-if-env-changed={key}");
+    }
+    let revision = std::env::var("GITHUB_RUN_NUMBER").unwrap_or_else(|_| "0".into());
+    let commit = std::env::var("GITHUB_SHA").unwrap_or_else(|_| "local".into());
+    println!("cargo:rustc-env=PCSWEEP_BUILD_REVISION={revision}");
+    println!("cargo:rustc-env=PCSWEEP_BUILD_COMMIT={commit}");
     println!("cargo:rerun-if-changed=assets/icon.ico");
     println!("cargo:rerun-if-changed=build.rs");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {

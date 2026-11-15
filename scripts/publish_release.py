@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -78,12 +79,21 @@ def validate_package(dist, version):
             raise RuntimeError("The ZIP executable differs from the tested executable")
 
 
-def release_assets(dist, version, tag):
+def release_assets(dist, version, tag, commit, run_number):
     original = dist / f"PCSweep-{version}-windows-x64.zip"
     archive = dist / f"PCSweep-{tag.removeprefix('v')}-windows-x64.zip"
     if original != archive:
         original.rename(archive)
-    assets = [dist / "PCSweep.exe", archive]
+    executable = dist / "PCSweep.exe"
+    if not re.fullmatch(r"[0-9a-f]{40}", commit) or not str(run_number).isdigit() or not 0 < int(run_number) < 2**64:
+        raise RuntimeError("Invalid updater build identity")
+    manifest = dist / "update.json"
+    manifest.write_text(json.dumps({
+        "schema": 1, "version": version, "revision": int(run_number),
+        "commit": commit, "arch": "windows-x64", "asset": "PCSweep.exe",
+        "size": executable.stat().st_size, "sha256": digest(executable),
+    }, indent=2) + "\n", encoding="utf-8")
+    assets = [executable, archive, manifest]
     checksums = dist / "SHA256SUMS.txt"
     checksums.write_text(
         "".join(f"{digest(path)}  {path.name}\n" for path in assets), encoding="ascii"
@@ -109,7 +119,7 @@ def verify_published(repo, release):
     # Rebuilding the same commit may change ZIP timestamps. Verify the existing
     # published downloads against their own checksums instead of replacing them.
     archive = f"PCSweep-{release['tag_name'].removeprefix('v')}-windows-x64.zip"
-    names = ["PCSweep.exe", archive, "SHA256SUMS.txt"]
+    names = ["PCSweep.exe", archive, "update.json", "SHA256SUMS.txt"]
     with tempfile.TemporaryDirectory(prefix="pcsweep-release-") as folder:
         args = ["release", "download", release["tag_name"], "--repo", repo, "--dir", folder]
         for name in names:
@@ -117,8 +127,8 @@ def verify_published(repo, release):
         gh(*args)
         paths = [Path(folder) / name for name in names]
         verify_assets(repo, release, paths)
-        expected = "".join(f"{digest(path)}  {path.name}\n" for path in paths[:2])
-        if paths[2].read_text(encoding="ascii") != expected:
+        expected = "".join(f"{digest(path)}  {path.name}\n" for path in paths[:3])
+        if paths[3].read_text(encoding="ascii") != expected:
             raise RuntimeError("Published SHA256SUMS.txt does not match release downloads")
 
 
@@ -154,7 +164,7 @@ def publish(version, dist, repo, commit, run_number, run_url, notes):
             release = api(f"repos/{repo}/releases", payload, "POST")
 
     tag = release["tag_name"]
-    assets = release_assets(dist, version, tag)
+    assets = release_assets(dist, version, tag, commit, run_number)
     if release["draft"]:
         # Only drafts may be overwritten. A retry after upload resumes safely;
         # already published downloads remain immutable.

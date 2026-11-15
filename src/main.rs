@@ -3,22 +3,33 @@
 
 mod analyzer;
 mod app;
+mod app_packages;
 mod apps;
+mod background;
 mod cleaner;
 mod dashboard;
 mod duplicates;
+mod platform;
+mod privacy;
 mod processes;
+mod security;
 mod startup;
 mod system;
 mod task;
 mod theme;
 mod tools;
+#[cfg(test)]
+mod ui_preview;
+mod updates;
 mod util;
 mod widgets;
 
 use eframe::egui;
 
 fn main() -> Result<(), eframe::Error> {
+    if let Some(code) = updates::run_helper_mode() {
+        std::process::exit(code);
+    }
     // Deep folder trees are scanned recursively in parallel; give worker threads
     // plenty of stack so nothing can overflow on unusual directory layouts.
     let _ = rayon::ThreadPoolBuilder::new()

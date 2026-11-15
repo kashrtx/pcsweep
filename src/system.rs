@@ -1,7 +1,7 @@
 use crate::util;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
-use sysinfo::{DiskKind, Disks, Pid, System};
+use sysinfo::{DiskKind, Disks, System};
 
 pub struct Drive {
     pub mount: String,
@@ -33,14 +33,22 @@ pub struct Proc {
     pub start_time: u64,
     pub name: String,
     pub mem: u64,
+    pub private_bytes: Option<u64>,
+    pub growth: i64,
+    pub observed_secs: u64,
     pub cpu: f32,
 }
 
+#[derive(Clone)]
 pub struct ProcGroup {
     pub name: String,
     pub count: usize,
     pub mem: u64,
     pub cpu: f32,
+    pub private_bytes: u64,
+    pub private_known: usize,
+    pub growth: i64,
+    pub observed_secs: u64,
     pub pids: Vec<u32>,
 }
 
@@ -61,6 +69,9 @@ pub const CRITICAL_PROCS: &[&str] = &[
     "fontdrvhost.exe",
     "memory compression",
     "msmpeng.exe",
+    "mssense.exe",
+    "mpdefendercoreservice.exe",
+    "securityhealthsystray.exe",
     "sihost.exe",
     "ctfmon.exe",
     "audiodg.exe",
@@ -86,7 +97,79 @@ pub fn is_critical(name: &str) -> bool {
 }
 
 fn safe_kill_target(pid: u32, expected_start: u64, actual_start: u64, name: &str) -> bool {
-    pid != std::process::id() && expected_start == actual_start && !is_critical(name)
+    pid != std::process::id()
+        && expected_start != 0
+        && expected_start == actual_start
+        && !is_critical(name)
+}
+
+const HISTORY_SECONDS: u64 = 600;
+const HISTORY_SAMPLES: usize = 201;
+const HISTORY_PROCESSES: usize = 2048;
+
+#[derive(Default)]
+struct MemoryHistory {
+    samples: HashMap<(u32, u64), VecDeque<(Instant, u64)>>,
+}
+
+impl MemoryHistory {
+    fn observe(&mut self, processes: &mut [Proc], now: Instant) {
+        let live: HashSet<_> = processes.iter().map(|p| (p.pid, p.start_time)).collect();
+        self.samples.retain(|key, _| live.contains(key));
+        for p in processes {
+            let Some(private) = p.private_bytes else {
+                continue;
+            };
+            let key = (p.pid, p.start_time);
+            if !self.samples.contains_key(&key) && self.samples.len() >= HISTORY_PROCESSES {
+                continue;
+            }
+            let samples = self.samples.entry(key).or_default();
+            while samples
+                .front()
+                .is_some_and(|(t, _)| now.duration_since(*t).as_secs() > HISTORY_SECONDS)
+            {
+                samples.pop_front();
+            }
+            samples.push_back((now, private));
+            while samples.len() > HISTORY_SAMPLES {
+                samples.pop_front();
+            }
+            if let Some((start, first)) = samples.front() {
+                p.growth = (private as i128 - *first as i128)
+                    .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+                p.observed_secs = now.duration_since(*start).as_secs();
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryPressure {
+    Normal,
+    Elevated,
+    Critical,
+}
+
+/// Cache is deliberately absent: standby cache is already available to Windows.
+pub fn memory_pressure(total: u64, available: u64, commit: u64, limit: u64) -> MemoryPressure {
+    let available_fraction = if total > 0 {
+        available as f64 / total as f64
+    } else {
+        1.0
+    };
+    let commit_fraction = if limit > 0 {
+        commit as f64 / limit as f64
+    } else {
+        0.0
+    };
+    if (total > 0 && available_fraction < 0.03) || commit_fraction >= 0.97 {
+        MemoryPressure::Critical
+    } else if (total > 0 && available_fraction < 0.10) || commit_fraction >= 0.85 {
+        MemoryPressure::Elevated
+    } else {
+        MemoryPressure::Normal
+    }
 }
 
 pub struct SysMon {
@@ -94,12 +177,19 @@ pub struct SysMon {
     last_fast: Option<Instant>,
     last_disks: Option<Instant>,
     last_procs: Option<Instant>,
+    memory_history: MemoryHistory,
+    proc_groups: Vec<ProcGroup>,
     pub drives: Vec<Drive>,
     pub mem_total: u64,
     pub mem_used: u64,
     pub mem_avail: u64,
     pub swap_total: u64,
     pub swap_used: u64,
+    pub commit_total: u64,
+    pub commit_limit: u64,
+    pub commit_peak: u64,
+    pub system_cache: u64,
+    pub memory_info_available: bool,
     pub cpu: f32,
     pub procs: Vec<Proc>,
     pub host: String,
@@ -128,12 +218,19 @@ impl SysMon {
             last_fast: None,
             last_disks: None,
             last_procs: None,
+            memory_history: MemoryHistory::default(),
+            proc_groups: Vec::new(),
             drives: Vec::new(),
             mem_total: 0,
             mem_used: 0,
             mem_avail: 0,
             swap_total: 0,
             swap_used: 0,
+            commit_total: 0,
+            commit_limit: 0,
+            commit_peak: 0,
+            system_cache: 0,
+            memory_info_available: false,
             cpu: 0.0,
             procs: Vec::new(),
             host: System::host_name().unwrap_or_else(|| "This PC".into()),
@@ -155,6 +252,7 @@ impl SysMon {
             self.mem_avail = self.sys.available_memory();
             self.swap_total = self.sys.total_swap();
             self.swap_used = self.sys.used_swap();
+            self.refresh_memory_counters();
             self.last_fast = Some(Instant::now());
         }
         if due(&self.last_disks, Duration::from_secs(5)) {
@@ -173,11 +271,120 @@ impl SysMon {
                     start_time: p.start_time(),
                     name: p.name().to_string(),
                     mem: p.memory(),
+                    // On Windows sysinfo's virtual_memory is PROCESS_MEMORY_COUNTERS_EX.PrivateUsage.
+                    private_bytes: (p.virtual_memory() > 0).then_some(p.virtual_memory()),
+                    growth: 0,
+                    observed_secs: 0,
                     cpu: p.cpu_usage() / cores,
                 })
                 .collect();
+            self.procs
+                .sort_unstable_by_key(|p| std::cmp::Reverse(p.mem));
+            self.memory_history.observe(&mut self.procs, Instant::now());
+            self.proc_groups = self.build_groups();
             self.last_procs = Some(Instant::now());
         }
+    }
+
+    fn refresh_memory_counters(&mut self) {
+        use windows_sys::Win32::System::ProcessStatus::{
+            GetPerformanceInfo, PERFORMANCE_INFORMATION,
+        };
+        let mut info: PERFORMANCE_INFORMATION = unsafe { std::mem::zeroed() };
+        info.cb = std::mem::size_of::<PERFORMANCE_INFORMATION>() as u32;
+        self.memory_info_available = unsafe { GetPerformanceInfo(&mut info, info.cb) } != 0;
+        if self.memory_info_available {
+            let page = info.PageSize as u64;
+            self.commit_total = (info.CommitTotal as u64).saturating_mul(page);
+            self.commit_limit = (info.CommitLimit as u64).saturating_mul(page);
+            self.commit_peak = (info.CommitPeak as u64).saturating_mul(page);
+            self.system_cache = (info.SystemCache as u64).saturating_mul(page);
+        }
+    }
+
+    pub fn refresh_processes_soon(&mut self) {
+        self.last_procs = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn preview_fixture() -> Self {
+        let gb = 1024u64.pow(3);
+        let mb = 1024u64.pow(2);
+        let mut monitor = Self {
+            sys: System::new(),
+            last_fast: Some(Instant::now()),
+            last_disks: Some(Instant::now()),
+            last_procs: Some(Instant::now()),
+            memory_history: MemoryHistory::default(),
+            proc_groups: Vec::new(),
+            drives: vec![Drive {
+                mount: r"C:\".into(),
+                label: "Windows".into(),
+                total: 512 * gb,
+                free: 140 * gb,
+                kind: "SSD",
+                removable: false,
+            }],
+            mem_total: 16 * gb,
+            mem_used: 11 * gb,
+            mem_avail: 5 * gb,
+            swap_total: 8 * gb,
+            swap_used: 2 * gb,
+            commit_total: 15 * gb,
+            commit_limit: 24 * gb,
+            commit_peak: 19 * gb,
+            system_cache: 4 * gb,
+            memory_info_available: true,
+            cpu: 18.0,
+            procs: vec![
+                Proc {
+                    pid: 7001,
+                    start_time: 10,
+                    name: "chrome.exe".into(),
+                    mem: 1800 * mb,
+                    private_bytes: Some(2400 * mb),
+                    growth: 300 * mb as i64,
+                    observed_secs: 300,
+                    cpu: 9.4,
+                },
+                Proc {
+                    pid: 7002,
+                    start_time: 20,
+                    name: "chrome.exe".into(),
+                    mem: 900 * mb,
+                    private_bytes: Some(1200 * mb),
+                    growth: 70 * mb as i64,
+                    observed_secs: 300,
+                    cpu: 2.1,
+                },
+                Proc {
+                    pid: 7003,
+                    start_time: 30,
+                    name: "Code.exe".into(),
+                    mem: 1200 * mb,
+                    private_bytes: Some(1600 * mb),
+                    growth: 64 * mb as i64,
+                    observed_secs: 240,
+                    cpu: 4.2,
+                },
+                Proc {
+                    pid: 7004,
+                    start_time: 40,
+                    name: "explorer.exe".into(),
+                    mem: 180 * mb,
+                    private_bytes: Some(120 * mb),
+                    growth: -8 * mb as i64,
+                    observed_secs: 300,
+                    cpu: 0.5,
+                },
+            ],
+            host: "Preview PC".into(),
+            os: "Windows 11".into(),
+            cpu_name: "8-core processor".into(),
+            cores: 8,
+        };
+        monitor.proc_groups = monitor.build_groups();
+        monitor
     }
 
     pub fn refresh_drives(&mut self) {
@@ -224,6 +431,10 @@ impl SysMon {
 
     /// Processes grouped by executable name, heaviest first.
     pub fn groups(&self) -> Vec<ProcGroup> {
+        self.proc_groups.clone()
+    }
+
+    fn build_groups(&self) -> Vec<ProcGroup> {
         let mut map: HashMap<String, ProcGroup> = HashMap::new();
         for p in &self.procs {
             let g = map
@@ -233,11 +444,21 @@ impl SysMon {
                     count: 0,
                     mem: 0,
                     cpu: 0.0,
+                    private_bytes: 0,
+                    private_known: 0,
+                    growth: 0,
+                    observed_secs: 0,
                     pids: Vec::new(),
                 });
             g.count += 1;
             g.mem += p.mem;
             g.cpu += p.cpu;
+            if let Some(private) = p.private_bytes {
+                g.private_bytes = g.private_bytes.saturating_add(private);
+                g.private_known += 1;
+                g.growth = g.growth.saturating_add(p.growth);
+                g.observed_secs = g.observed_secs.max(p.observed_secs);
+            }
             g.pids.push(p.pid);
         }
         let mut v: Vec<ProcGroup> = map.into_values().collect();
@@ -246,23 +467,13 @@ impl SysMon {
     }
 
     pub fn kill(&mut self, targets: &[(u32, u64)]) -> usize {
+        use windows_sys::Win32::System::Threading::{TerminateProcess, PROCESS_TERMINATE};
         let mut n = 0;
-        let mut current = System::new();
         for &(pid, expected_start) in targets {
-            // A process can exit while its confirmation is open, and Windows can
-            // reuse its PID for another app. Recheck its identity before killing.
-            if pid == std::process::id() {
-                continue;
-            }
-            let pid = Pid::from_u32(pid);
-            if !current.refresh_process(pid) {
-                continue;
-            }
-            if let Some(p) = current.process(pid) {
-                if !safe_kill_target(pid.as_u32(), expected_start, p.start_time(), p.name()) {
-                    continue;
-                }
-                if p.kill() {
+            // Keep the verified native handle through termination, including the
+            // Windows critical-process check used by the gentler app actions.
+            if let Ok(process) = checked_process(pid, expected_start, PROCESS_TERMINATE) {
+                if unsafe { TerminateProcess(process.0, 1) } != 0 {
                     n += 1;
                 }
             }
@@ -327,9 +538,241 @@ pub fn relaunch_as_admin() -> bool {
         .unwrap_or(false)
 }
 
+/// Original Windows policy, retained only for this exact process lifetime.
+#[derive(Clone, Copy)]
+pub struct PowerPolicy {
+    pub control: u32,
+    pub state: u32,
+}
+
+struct ProcessHandle(windows_sys::Win32::Foundation::HANDLE);
+impl Drop for ProcessHandle {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+fn checked_process(pid: u32, expected_start: u64, access: u32) -> Result<ProcessHandle, String> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, IsProcessCritical, OpenProcess, QueryFullProcessImageNameW,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    if pid == std::process::id() || expected_start == 0 {
+        return Err("This process is protected or its identity is unavailable.".into());
+    }
+    let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | access, 0, pid) };
+    if raw == 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let handle = ProcessHandle(raw);
+    let mut critical = 0;
+    if unsafe { IsProcessCritical(handle.0, &mut critical) } == 0 || critical != 0 {
+        return Err("Windows could not verify that this is a noncritical app process.".into());
+    }
+    let mut created: FILETIME = unsafe { std::mem::zeroed() };
+    let mut exited = created;
+    let mut kernel = created;
+    let mut user = created;
+    if unsafe { GetProcessTimes(handle.0, &mut created, &mut exited, &mut kernel, &mut user) } == 0
+    {
+        return Err("The process identity could not be checked.".into());
+    }
+    let ticks = ((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64;
+    let actual_start = (ticks / 10_000_000).saturating_sub(11_644_473_600);
+    let mut path = vec![0u16; 32768];
+    let mut length = path.len() as u32;
+    if unsafe { QueryFullProcessImageNameW(handle.0, 0, path.as_mut_ptr(), &mut length) } == 0 {
+        return Err("The executable could not be checked. System processes are protected.".into());
+    }
+    let path = String::from_utf16_lossy(&path[..length as usize]);
+    let name = path.rsplit('\\').next().unwrap_or(&path);
+    if !safe_kill_target(pid, expected_start, actual_start, name) {
+        return Err("The app changed or is protected. Refresh the process list.".into());
+    }
+    Ok(handle)
+}
+
+fn ensure_background(pid: u32) -> Result<(), String> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowThreadProcessId,
+    };
+    let mut foreground_pid = 0;
+    unsafe {
+        GetWindowThreadProcessId(GetForegroundWindow(), &mut foreground_pid);
+    }
+    if foreground_pid == pid {
+        Err("The app is in the foreground. Switch to PCSweep before changing it.".into())
+    } else {
+        Ok(())
+    }
+}
+
+/// Posts the normal close-window request; never terminates or waits on the UI.
+pub fn request_app_close(pid: u32, start: u64) -> Result<usize, String> {
+    use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows_sys::Win32::System::Threading::GetExitCodeProcess;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowThreadProcessId, IsWindowVisible, PostMessageW, WM_CLOSE,
+    };
+    struct Request {
+        pid: u32,
+        handle: windows_sys::Win32::Foundation::HANDLE,
+        sent: usize,
+    }
+    unsafe extern "system" fn visit(window: HWND, data: LPARAM) -> BOOL {
+        let request = &mut *(data as *mut Request);
+        let mut pid = 0;
+        GetWindowThreadProcessId(window, &mut pid);
+        if pid == request.pid && IsWindowVisible(window) != 0 {
+            let mut exit = 0;
+            // Holding the old handle and checking its lifetime avoids sending a
+            // close request to a window whose PID was reused after confirmation.
+            if GetExitCodeProcess(request.handle, &mut exit) != 0
+                && exit == 259
+                && PostMessageW(window, WM_CLOSE, 0, 0) != 0
+            {
+                request.sent += 1;
+            }
+        }
+        1
+    }
+    let handle = checked_process(pid, start, 0)?;
+    let mut request = Request {
+        pid,
+        handle: handle.0,
+        sent: 0,
+    };
+    if unsafe { EnumWindows(Some(visit), &mut request as *mut Request as isize) } == 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    if request.sent == 0 {
+        Err("No closeable app windows were found. Background services do not have a normal Close action.".into())
+    } else {
+        Ok(request.sent)
+    }
+}
+
+fn resident_memory(handle: &ProcessHandle) -> Option<u64> {
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    let mut memory: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    memory.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    (unsafe { GetProcessMemoryInfo(handle.0, &mut memory, memory.cb) } != 0)
+        .then_some(memory.WorkingSetSize as u64)
+}
+
+pub fn trim_app_memory(pid: u32, start: u64) -> Result<(u64, u64), String> {
+    use windows_sys::Win32::System::{
+        ProcessStatus::EmptyWorkingSet, Threading::PROCESS_SET_QUOTA,
+    };
+    let handle = checked_process(pid, start, PROCESS_SET_QUOTA)?;
+    ensure_background(pid)?;
+    let before =
+        resident_memory(&handle).ok_or("The app's resident memory could not be measured.")?;
+    if unsafe { EmptyWorkingSet(handle.0) } == 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let after = resident_memory(&handle).unwrap_or(before);
+    Ok((before, after))
+}
+
+pub fn enable_app_efficiency(pid: u32, start: u64) -> Result<PowerPolicy, String> {
+    use windows_sys::Win32::System::Threading::{
+        GetProcessInformation, ProcessPowerThrottling, SetProcessInformation,
+        PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        PROCESS_POWER_THROTTLING_STATE, PROCESS_SET_INFORMATION,
+    };
+    let handle = checked_process(pid, start, PROCESS_SET_INFORMATION)?;
+    ensure_background(pid)?;
+    let mut policy = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: 0,
+        StateMask: 0,
+    };
+    let bytes = std::mem::size_of_val(&policy) as u32;
+    if unsafe {
+        GetProcessInformation(
+            handle.0,
+            ProcessPowerThrottling,
+            &mut policy as *mut _ as _,
+            bytes,
+        )
+    } == 0
+    {
+        return Err("Windows could not read this app's efficiency policy. It may be protected or unsupported.".into());
+    }
+    let original = PowerPolicy {
+        control: policy.ControlMask,
+        state: policy.StateMask,
+    };
+    policy.ControlMask |= PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+    policy.StateMask |= PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+    if unsafe {
+        SetProcessInformation(
+            handle.0,
+            ProcessPowerThrottling,
+            &policy as *const _ as _,
+            bytes,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(original)
+}
+
+pub fn restore_app_efficiency(pid: u32, start: u64, original: PowerPolicy) -> Result<(), String> {
+    use windows_sys::Win32::System::Threading::{
+        GetProcessInformation, ProcessPowerThrottling, SetProcessInformation,
+        PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        PROCESS_POWER_THROTTLING_STATE, PROCESS_SET_INFORMATION,
+    };
+    let handle = checked_process(pid, start, PROCESS_SET_INFORMATION)?;
+    let mut policy = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: 0,
+        StateMask: 0,
+    };
+    let bytes = std::mem::size_of_val(&policy) as u32;
+    if unsafe {
+        GetProcessInformation(
+            handle.0,
+            ProcessPowerThrottling,
+            &mut policy as *mut _ as _,
+            bytes,
+        )
+    } == 0
+    {
+        return Err("Windows could not read this app's current efficiency policy.".into());
+    }
+    // Undo only the execution-speed bit that PCSweep changed. Preserve timer and
+    // any other policy flags changed by the application since it was enabled.
+    policy.ControlMask = (policy.ControlMask & !PROCESS_POWER_THROTTLING_EXECUTION_SPEED)
+        | (original.control & PROCESS_POWER_THROTTLING_EXECUTION_SPEED);
+    policy.StateMask = (policy.StateMask & !PROCESS_POWER_THROTTLING_EXECUTION_SPEED)
+        | (original.state & PROCESS_POWER_THROTTLING_EXECUTION_SPEED);
+    if unsafe {
+        SetProcessInformation(
+            handle.0,
+            ProcessPowerThrottling,
+            &policy as *const _ as _,
+            bytes,
+        )
+    } == 0
+    {
+        Err(std::io::Error::last_os_error().to_string())
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::safe_kill_target;
+    use super::*;
 
     #[test]
     fn ending_apps_rejects_reused_pids_and_protected_processes() {
@@ -338,5 +781,92 @@ mod tests {
         assert!(!safe_kill_target(unrelated_pid, 10, 11, "ordinary-app.exe"));
         assert!(!safe_kill_target(unrelated_pid, 10, 10, "LSASS.EXE"));
         assert!(!safe_kill_target(std::process::id(), 10, 10, "renamed.exe"));
+        assert!(!safe_kill_target(unrelated_pid, 0, 0, "ordinary-app.exe"));
+        assert!(!safe_kill_target(
+            unrelated_pid,
+            10,
+            10,
+            "MpDefenderCoreService.exe"
+        ));
+    }
+
+    #[test]
+    fn pressure_uses_available_and_commit_instead_of_cache_totals() {
+        assert_eq!(
+            memory_pressure(1000, 400, 1000, 2000),
+            MemoryPressure::Normal
+        );
+        assert_eq!(
+            memory_pressure(1000, 80, 1000, 2000),
+            MemoryPressure::Elevated
+        );
+        assert_eq!(
+            memory_pressure(1000, 20, 1000, 2000),
+            MemoryPressure::Critical
+        );
+        assert_eq!(
+            memory_pressure(1000, 500, 1950, 2000),
+            MemoryPressure::Critical
+        );
+        assert_eq!(memory_pressure(0, 0, 0, 0), MemoryPressure::Normal);
+    }
+
+    fn sample_process(pid: u32, start: u64, private: u64) -> Proc {
+        Proc {
+            pid,
+            start_time: start,
+            name: "test.exe".into(),
+            mem: private,
+            private_bytes: Some(private),
+            growth: 0,
+            observed_secs: 0,
+            cpu: 0.0,
+        }
+    }
+
+    #[test]
+    fn history_tracks_private_growth_and_resets_for_reused_pid() {
+        let now = Instant::now();
+        let mut history = MemoryHistory::default();
+        let mut processes = vec![sample_process(9000, 10, 100)];
+        history.observe(&mut processes, now);
+        processes[0].private_bytes = Some(500);
+        history.observe(&mut processes, now + Duration::from_secs(3));
+        assert_eq!(processes[0].growth, 400);
+        assert_eq!(processes[0].observed_secs, 3);
+        processes[0].start_time = 11;
+        history.observe(&mut processes, now + Duration::from_secs(6));
+        assert_eq!(processes[0].growth, 0);
+        assert_eq!(history.samples.len(), 1);
+        assert!(!history.samples.contains_key(&(9000, 10)));
+    }
+
+    #[test]
+    fn history_bounds_samples_duration_and_processes() {
+        let now = Instant::now();
+        let mut history = MemoryHistory::default();
+        let mut processes: Vec<_> = (1..=HISTORY_PROCESSES as u32 + 2)
+            .map(|pid| sample_process(pid, 1, 100))
+            .collect();
+        history.observe(&mut processes, now);
+        assert_eq!(history.samples.len(), HISTORY_PROCESSES);
+        processes.truncate(1);
+        for tick in 1..=HISTORY_SAMPLES + 10 {
+            history.observe(&mut processes, now + Duration::from_secs(tick as u64 * 3));
+        }
+        assert_eq!(history.samples.len(), 1);
+        assert!(history.samples[&(1, 1)].len() <= HISTORY_SAMPLES);
+        assert!(processes[0].observed_secs <= HISTORY_SECONDS);
+        history.observe(&mut [], now + Duration::from_secs(1000));
+        assert!(history.samples.is_empty());
+    }
+
+    #[test]
+    fn unavailable_private_memory_is_not_reported_as_zero_growth_measurement() {
+        let mut process = sample_process(9000, 10, 100);
+        process.private_bytes = None;
+        let mut history = MemoryHistory::default();
+        history.observe(&mut [process], Instant::now());
+        assert!(history.samples.is_empty());
     }
 }

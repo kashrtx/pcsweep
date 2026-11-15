@@ -26,6 +26,10 @@ pub enum Page {
     Apps,
     Startup,
     Memory,
+    Privacy,
+    Security,
+    Background,
+    Updates,
     Tools,
     Activity,
 }
@@ -62,6 +66,12 @@ pub enum Action {
     },
     RunTool(usize),
     Uninstall(crate::apps::InstalledApp),
+    Privacy(crate::privacy::PrivacyAction),
+    Security(crate::security::SecurityAction),
+    Background(crate::background::BackgroundAction),
+    Update(crate::updates::UpdateAction),
+    Memory(crate::processes::MemoryAction),
+    AppPackage(crate::app_packages::PackageAction),
 }
 
 pub struct Modal {
@@ -85,6 +95,10 @@ pub struct App {
     pub apps: AppsState,
     pub tools: ToolsState,
     pub mem: MemState,
+    pub privacy: crate::privacy::PrivacyState,
+    pub security: crate::security::SecurityState,
+    pub background: crate::background::BackgroundState,
+    pub updates: crate::updates::UpdateState,
     pub modal: Option<Modal>,
     pub toasts: Vec<Toast>,
     pub relaunch: Task<bool>,
@@ -107,6 +121,10 @@ impl App {
             apps: AppsState::default(),
             tools: ToolsState::default(),
             mem: MemState::default(),
+            privacy: Default::default(),
+            security: Default::default(),
+            background: Default::default(),
+            updates: Default::default(),
             modal: None,
             toasts: Vec::new(),
             relaunch: Task::default(),
@@ -166,6 +184,10 @@ impl App {
     }
 
     fn execute(&mut self, action: Action, ctx: &egui::Context) {
+        if self.mutations_running() {
+            self.toast(ToastKind::Info, "An operation is already running. Wait for it to finish before starting another change.");
+            return;
+        }
         match action {
             Action::CleanJunk => self.start_clean(ctx),
             Action::Recycle { items, origin } => self.start_recycle(items, origin, ctx),
@@ -191,6 +213,12 @@ impl App {
             }
             Action::RunTool(i) => self.start_tool(i, ctx),
             Action::Uninstall(app) => self.launch_uninstall(&app),
+            Action::Privacy(action) => self.execute_privacy(action, ctx),
+            Action::Security(action) => self.execute_security(action, ctx),
+            Action::Background(action) => self.execute_background(action, ctx),
+            Action::Update(action) => self.execute_update(action, ctx),
+            Action::Memory(action) => self.execute_memory(action, ctx),
+            Action::AppPackage(action) => self.start_package_action(action, ctx),
         }
     }
 
@@ -198,8 +226,13 @@ impl App {
         self.poll_cleaner(ctx);
         self.poll_analyzer();
         self.poll_duplicates();
-        self.poll_apps();
+        self.poll_apps(ctx);
         self.poll_tools();
+        self.poll_memory();
+        self.poll_privacy(ctx);
+        self.poll_security(ctx);
+        self.poll_background(ctx);
+        self.poll_updates(ctx);
         if let Some(r) = self.relaunch.poll() {
             match r {
                 Ok(true) => {
@@ -211,8 +244,28 @@ impl App {
         }
     }
 
+    pub fn mutations_running(&self) -> bool {
+        self.cleaner.clean.running()
+            || self.analyzer.recycle.running()
+            || self.dups.recycle.running()
+            || self.apps.busy()
+            || self.mem.job.running()
+            || self.privacy.busy()
+            || self.security.busy()
+            || self.background.busy()
+            || self.updates.installing()
+            || self.relaunch.running()
+            || self.tools.run.as_ref().is_some_and(|run| !run.is_done())
+    }
+
     fn any_running(&self) -> bool {
-        self.cleaner.scan.running()
+        self.mutations_running()
+            || self.updates.running()
+            || self.mem.job.running()
+            || self.privacy.busy()
+            || self.security.busy()
+            || self.background.busy()
+            || self.cleaner.scan.running()
             || self.cleaner.clean.running()
             || self.analyzer.scan.running()
             || self.analyzer.recycle.running()
@@ -226,7 +279,7 @@ impl App {
 
     // ------------------------------------------------------------ sidebar
 
-    fn sidebar(&mut self, ui: &mut Ui) {
+    pub(crate) fn sidebar(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
         ui.horizontal(|ui| {
             let (rect, _) = ui.allocate_exact_size(vec2(36.0, 36.0), egui::Sense::hover());
@@ -278,31 +331,43 @@ impl App {
                 (Page::Apps, ic::APPS, "Installed apps"),
             ],
             &[
+                (Page::Privacy, ic::LOCK, "Privacy and ads"),
+                (Page::Security, ic::SHIELD, "Security check"),
                 (Page::Startup, ic::POWER, "Startup apps"),
+                (Page::Background, ic::BOLT, "Background activity"),
                 (Page::Memory, ic::SPEED, "Memory and apps"),
             ],
             &[
                 (Page::Tools, ic::TOOLS, "Tools"),
+                (Page::Updates, ic::UPDATE, "Updates"),
                 (Page::Activity, ic::HISTORY, "Activity log"),
             ],
         ];
-        for group in nav {
-            for &(page, icon_char, label) in group {
-                let badge = match page {
-                    Page::Cleaner => junk_badge.as_deref(),
-                    Page::Startup => startup_badge.as_deref(),
-                    _ => None,
-                };
-                if widgets::nav_item(ui, icon_char, label, self.page == page, badge).clicked() {
-                    if page == Page::Startup {
-                        self.startup.reload();
+        ScrollArea::vertical()
+            .id_salt("navigation_scroll")
+            .max_height((ui.available_height() - 100.0).max(100.0))
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for group in nav {
+                    for &(page, icon_char, label) in group {
+                        let badge = match page {
+                            Page::Cleaner => junk_badge.as_deref(),
+                            Page::Startup => startup_badge.as_deref(),
+                            _ => None,
+                        };
+                        if widgets::nav_item(ui, icon_char, label, self.page == page, badge)
+                            .clicked()
+                        {
+                            if page == Page::Startup {
+                                self.startup.reload();
+                            }
+                            self.page = page;
+                        }
+                        ui.add_space(1.0);
                     }
-                    self.page = page;
+                    ui.add_space(14.0);
                 }
-                ui.add_space(1.0);
-            }
-            ui.add_space(14.0);
-        }
+            });
 
         let mut want_relaunch = false;
         let busy = self.relaunch.running();
@@ -343,6 +408,48 @@ impl App {
     }
 
     // ------------------------------------------------------------ activity
+
+    pub(crate) fn render_page(&mut self, ui: &mut Ui) {
+        match self.page {
+            Page::Dashboard => self.page_dashboard(ui),
+            Page::Cleaner => self.page_cleaner(ui),
+            Page::Analyzer => self.page_analyzer(ui),
+            Page::Duplicates => self.page_duplicates(ui),
+            Page::Apps => self.page_apps(ui),
+            Page::Startup => self.page_startup(ui),
+            Page::Memory => self.page_memory(ui),
+            Page::Privacy => self.page_privacy(ui),
+            Page::Security => self.page_security(ui),
+            Page::Background => self.page_background(ui),
+            Page::Updates => self.page_updates(ui),
+            Page::Tools => self.page_tools(ui),
+            Page::Activity => self.page_activity(ui),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_fixture() -> Self {
+        Self {
+            page: Page::Dashboard,
+            is_admin: false,
+            sys: crate::system::SysMon::preview_fixture(),
+            cleaner: CleanerState::new(),
+            analyzer: Default::default(),
+            dups: Default::default(),
+            startup: Default::default(),
+            apps: crate::apps::preview_fixture(),
+            tools: Default::default(),
+            mem: crate::processes::preview_fixture(),
+            privacy: crate::privacy::preview_fixture(),
+            security: crate::security::preview_fixture(),
+            background: crate::background::preview_fixture(),
+            updates: crate::updates::preview_fixture(),
+            modal: None,
+            toasts: Vec::new(),
+            relaunch: Default::default(),
+            activity_filter: String::new(),
+        }
+    }
 
     fn page_activity(&mut self, ui: &mut Ui) {
         widgets::page_header(
@@ -567,21 +674,12 @@ impl eframe::App for App {
                     .inner_margin(Margin::symmetric(30.0, 22.0)),
             )
             .show(ctx, |ui| {
-                ui.add_enabled_ui(enabled, |ui| match self.page {
-                    Page::Dashboard => self.page_dashboard(ui),
-                    Page::Cleaner => self.page_cleaner(ui),
-                    Page::Analyzer => self.page_analyzer(ui),
-                    Page::Duplicates => self.page_duplicates(ui),
-                    Page::Apps => self.page_apps(ui),
-                    Page::Startup => self.page_startup(ui),
-                    Page::Memory => self.page_memory(ui),
-                    Page::Tools => self.page_tools(ui),
-                    Page::Activity => self.page_activity(ui),
-                });
+                ui.add_enabled_ui(enabled, |ui| self.render_page(ui));
             });
 
         self.modal_ui(ctx);
         self.toasts_ui(ctx);
+        crate::updates::confirm_update_startup();
 
         let ms = if self.any_running() { 120 } else { 1000 };
         ctx.request_repaint_after(Duration::from_millis(ms));

@@ -97,23 +97,30 @@ impl App {
             });
         }
 
-        let mf = self.sys.mem_frac();
-        if mf > 0.90 {
+        let pressure = system::memory_pressure(
+            self.sys.mem_total,
+            self.sys.mem_avail,
+            self.sys.commit_total,
+            self.sys.commit_limit,
+        );
+        if pressure == system::MemoryPressure::Critical {
             score -= 15;
             recs.push(Rec {
                 sev: Sev::High,
                 text: format!(
-                    "Memory is {:.0}% full. Close heavy apps to stop slowdowns.",
-                    mf * 100.0
+                    "Memory pressure is high ({} available). Review growing or unused apps.",
+                    fmt_bytes(self.sys.mem_avail)
                 ),
                 go: Some(Page::Memory),
                 action: "See apps",
             });
-        } else if mf > 0.80 {
+        } else if pressure == system::MemoryPressure::Elevated {
             score -= 7;
             recs.push(Rec {
                 sev: Sev::Medium,
-                text: format!("Memory is {:.0}% full.", mf * 100.0),
+                text:
+                    "Available RAM or committed memory is under pressure. Review the memory page."
+                        .into(),
                 go: Some(Page::Memory),
                 action: "See apps",
             });
@@ -207,9 +214,9 @@ impl App {
                             widgets::ring(ui, score as f32 / 100.0, 150.0, 12.0, col, &score.to_string(), word);
                             ui.add_space(14.0);
                             ui.vertical(|ui| {
-                                ui.label(widgets::strong("PC health", 18.0));
+                                ui.label(widgets::strong("Performance checks", 18.0));
                                 if recs.is_empty() && !scanning {
-                                    ui.label(RichText::new("Everything looks good. Nothing needs your attention.").color(GOOD));
+                                    ui.label(RichText::new("No issues found in these performance checks.").color(GOOD));
                                 }
                                 for r in recs.iter().take(4) {
                                     ui.add_space(2.0);
@@ -345,7 +352,10 @@ impl App {
                         ui.label(widgets::strong("Quick actions", 18.0));
                         ui.add_space(4.0);
                         let sys_drive = self.sys.system_drive().map(|d| d.mount.clone()).unwrap_or_else(|| "C:\\".into());
-                        let items: [(char, &str, &str, DActKind); 5] = [
+                        let items: [(char, &str, &str, DActKind); 8] = [
+                            (ic::LOCK, "Reduce Windows distractions", "Privacy, suggestions and undo", DActKind::Go(Page::Privacy)),
+                            (ic::SHIELD, "Check protection", "Defender status and unwanted apps", DActKind::Go(Page::Security)),
+                            (ic::UPDATE, "Update PCSweep", "Verified downloads with rollback", DActKind::Go(Page::Updates)),
                             (ic::PIE, "Map my system drive", "See which folders take the most space", DActKind::Analyze),
                             (ic::COPY, "Find duplicate files", "Keep one copy, free the rest", DActKind::Go(Page::Duplicates)),
                             (ic::APPS, "Review installed apps", "Uninstall big programs you no longer use", DActKind::Go(Page::Apps)),

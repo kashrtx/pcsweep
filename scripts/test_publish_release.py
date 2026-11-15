@@ -1,4 +1,5 @@
 import tempfile
+import json
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -61,7 +62,13 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(self.created[0]["target_commitish"], self.commit)
         checksums = (self.dist / "SHA256SUMS.txt").read_text()
         self.assertIn(f"{release.digest(self.exe)}  PCSweep.exe", checksums)
-        self.assertEqual(len(checksums.splitlines()), 2)
+        self.assertEqual(len(checksums.splitlines()), 3)
+        manifest = json.loads((self.dist / "update.json").read_text())
+        self.assertEqual(manifest, {
+            "schema": 1, "version": "1.1.0", "revision": 42,
+            "commit": self.commit, "arch": "windows-x64", "asset": "PCSweep.exe",
+            "size": self.exe.stat().st_size, "sha256": release.digest(self.exe),
+        })
 
     def test_unchanged_version_still_publishes_unique_build(self):
         self.tag_exists = True
@@ -106,6 +113,17 @@ class ReleaseTests(unittest.TestCase):
 
     def test_version_metadata_stays_valid(self):
         self.assertEqual(release.build_tag("1.1.0+custom", "42"), "v1.1.0+custom.build.42")
+
+    def test_updater_manifest_rejects_invalid_build_identity(self):
+        with self.assertRaisesRegex(RuntimeError, "build identity"):
+            release.release_assets(self.dist, "1.1.0", "v1.1.0", "bad", "42")
+
+    def test_manifest_keeps_base_version_when_release_has_build_suffix(self):
+        self.tag_exists = True
+        self.publish()
+        manifest = json.loads((self.dist / "update.json").read_text())
+        self.assertEqual(manifest["version"], "1.1.0")
+        self.assertEqual(manifest["revision"], 42)
 
 
 if __name__ == "__main__":

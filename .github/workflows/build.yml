@@ -2,7 +2,7 @@ name: Build and release PCSweep
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'codex/**']
   pull_request:
   workflow_dispatch:
 
@@ -24,7 +24,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - name: Check out code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -44,6 +44,15 @@ jobs:
 
       - name: Test application
         run: cargo test --locked
+
+      - name: Save UI previews
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: PCSweep-UI-previews
+          path: target/ui-previews/
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Build release
         run: cargo build --release --locked
@@ -74,7 +83,7 @@ jobs:
           } | Set-Content -Encoding ascii dist/SHA256SUMS.txt
 
       - name: Upload tested build
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: PCSweep-windows-x64
           path: dist/
@@ -91,12 +100,12 @@ jobs:
       contents: write
     steps:
       - name: Check out release automation
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
       - name: Download tested build
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: PCSweep-windows-x64
           path: dist

@@ -1,4 +1,5 @@
 use crate::app::{Action, App, Modal, ToastKind};
+use crate::app_packages::{self, AppUpgrade, PackageAction, PackageResult, StorePackage};
 use crate::task::Task;
 use crate::theme::*;
 use crate::util::{self, fmt_bytes, fmt_num};
@@ -12,6 +13,12 @@ use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
 use winreg::RegKey;
 
 #[derive(Clone)]
+pub enum AppKind {
+    Desktop,
+    Store(StorePackage),
+}
+
+#[derive(Clone)]
 pub struct InstalledApp {
     pub name: String,
     pub version: String,
@@ -20,6 +27,10 @@ pub struct InstalledApp {
     pub installed: Option<NaiveDate>,
     pub uninstall: String,
     pub scope: &'static str,
+    pub location: String,
+    pub kind: AppKind,
+    pub running: Option<bool>,
+    pub startup: Option<bool>,
 }
 
 pub fn list() -> Vec<InstalledApp> {
@@ -98,6 +109,14 @@ pub fn list() -> Vec<InstalledApp> {
                 installed,
                 uninstall,
                 scope,
+                location: k
+                    .get_value::<String, _>("InstallLocation")
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string(),
+                kind: AppKind::Desktop,
+                running: None,
+                startup: None,
             });
         }
     }
@@ -214,49 +233,239 @@ pub enum AppSort {
     Oldest,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AppFilter {
+    All,
+    Desktop,
+    Store,
+    Protected,
+    Updates,
+}
+
+pub struct AppInventory {
+    list: Vec<InstalledApp>,
+    store_error: Option<String>,
+}
+
+fn inventory() -> AppInventory {
+    let mut list = list();
+    let store_error = match app_packages::store_packages() {
+        Ok(packages) => {
+            list.extend(packages.into_iter().map(|p| InstalledApp {
+                name: p.name.clone(),
+                version: p.version.clone(),
+                publisher: p.publisher.clone(),
+                size: 0,
+                installed: None,
+                uninstall: String::new(),
+                scope: "Your account",
+                location: p.location.clone(),
+                kind: AppKind::Store(p),
+                running: None,
+                startup: None,
+            }));
+            None
+        }
+        Err(error) => Some(error),
+    };
+    // Executable-path matching gives useful context without claiming that a
+    // display-name guess proves which app owns a process or startup entry.
+    let mut system = sysinfo::System::new();
+    system.refresh_processes();
+    let processes: Vec<String> = system
+        .processes()
+        .values()
+        .filter_map(|p| p.exe())
+        .map(util::norm)
+        .collect();
+    let startup: Vec<String> = crate::startup::list()
+        .into_iter()
+        .filter(|s| s.enabled)
+        .filter_map(|s| crate::startup::exe_from_command(&s.command))
+        .map(|p| util::norm(&p))
+        .collect();
+    for app in &mut list {
+        if !app.location.trim().is_empty() {
+            let root = util::norm(std::path::Path::new(&app.location));
+            if root.len() > 3 {
+                app.running = Some(processes.iter().any(|p| util::is_within(p, &root)));
+                app.startup = Some(startup.iter().any(|p| util::is_within(p, &root)));
+            }
+        }
+    }
+    AppInventory { list, store_error }
+}
+
 pub struct AppsState {
     pub list: Vec<InstalledApp>,
-    pub load: Task<Vec<InstalledApp>>,
+    pub loaded: bool,
+    pub load: Task<AppInventory>,
     pub sort: AppSort,
     pub filter: String,
+    pub view: AppFilter,
+    pub action: Task<Vec<PackageResult>>,
+    pub update_scan: Task<Result<Vec<AppUpgrade>, String>>,
+    pub updates: Vec<AppUpgrade>,
+    pub selected_store: HashSet<String>,
+    pub selected_updates: HashSet<String>,
+    pub store_error: Option<String>,
+    pub updates_error: Option<String>,
+    pub updates_checked: bool,
+    pub results: Vec<PackageResult>,
+    action_text: String,
+    refresh_updates: bool,
 }
 
 impl Default for AppsState {
     fn default() -> Self {
         Self {
             list: Vec::new(),
+            loaded: false,
             load: Task::default(),
             sort: AppSort::Size,
             filter: String::new(),
+            view: AppFilter::All,
+            action: Task::default(),
+            update_scan: Task::default(),
+            updates: Vec::new(),
+            selected_store: HashSet::new(),
+            selected_updates: HashSet::new(),
+            store_error: None,
+            updates_error: None,
+            updates_checked: false,
+            results: Vec::new(),
+            action_text: String::new(),
+            refresh_updates: false,
         }
+    }
+}
+impl AppsState {
+    pub fn busy(&self) -> bool {
+        self.action.running()
     }
 }
 
 enum PAct {
     Sort(AppSort),
     Filter(String),
+    View(AppFilter),
     Uninstall(usize),
     Reload,
     Settings,
+    ToggleStore(String, bool),
+    RemoveSelected,
+    CheckUpdates,
+    SetupUpdates,
+    ToggleUpdate(String, bool),
+    UpgradeSelected,
+    OpenStore(String),
+    OpenLocation(String),
 }
 
 impl App {
     pub fn start_apps_load(&mut self, ctx: &egui::Context) {
-        if !self.apps.load.running() {
-            self.apps.load = Task::spawn(ctx, list);
+        if !self.apps.load.running() && !self.apps.busy() {
+            self.apps.load = Task::spawn(ctx, inventory);
         }
     }
 
-    pub fn poll_apps(&mut self) {
+    pub fn poll_apps(&mut self, ctx: &egui::Context) {
         if let Some(r) = self.apps.load.poll() {
             match r {
-                Ok(v) => self.apps.list = v,
+                Ok(out) => {
+                    self.apps.list = out.list;
+                    self.apps.loaded = true;
+                    self.apps.store_error = out.store_error;
+                    let available: HashSet<String> = self
+                        .apps
+                        .list
+                        .iter()
+                        .filter_map(|a| match &a.kind {
+                            AppKind::Store(p) if p.protection_reason().is_none() => {
+                                Some(p.full_name.clone())
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    self.apps.selected_store.retain(|p| available.contains(p));
+                }
                 Err(e) => self.toast(
                     ToastKind::Error,
                     format!("Couldn't read installed apps: {e}"),
                 ),
             }
         }
+        if let Some(r) = self.apps.update_scan.poll() {
+            self.apps.updates_checked = true;
+            match r {
+                Ok(Ok(updates)) => {
+                    self.apps.updates = updates;
+                    self.apps.updates_error = None;
+                    self.apps.selected_updates.clear();
+                }
+                Ok(Err(e)) | Err(e) => {
+                    self.apps.updates_error = Some(e);
+                    self.apps.updates.clear();
+                    self.apps.selected_updates.clear();
+                }
+            }
+        }
+        if let Some(r) = self.apps.action.poll() {
+            match r {
+                Ok(results) => {
+                    let good = results.iter().filter(|r| r.success).count();
+                    self.toast(if good==results.len(){ToastKind::Success}else{ToastKind::Info},format!("App actions finished: {good} completed, {} failed. Review the results below.",results.len()-good));
+                    self.apps.results = results;
+                }
+                Err(e) => self.toast(
+                    ToastKind::Error,
+                    format!("App action stopped: {e}. Refresh to check the current state."),
+                ),
+            }
+            self.apps.selected_store.clear();
+            self.apps.selected_updates.clear();
+            self.start_apps_load(ctx);
+            if self.apps.refresh_updates {
+                self.start_app_updates(ctx);
+            }
+        }
+    }
+
+    pub fn start_app_updates(&mut self, ctx: &egui::Context) {
+        if !self.apps.update_scan.running() && !self.apps.busy() {
+            self.apps.updates_error = None;
+            self.apps.update_scan = Task::spawn(ctx, app_packages::available_updates);
+        }
+    }
+
+    pub fn start_package_action(&mut self, action: PackageAction, ctx: &egui::Context) {
+        if self.apps.busy() {
+            return;
+        }
+        let (count, text, refresh) = match &action {
+            PackageAction::SetupUpdates => (
+                1,
+                "Setting up Microsoft's app update module for your account",
+                true,
+            ),
+            PackageAction::Remove(p) => (
+                p.len(),
+                "Removing selected Store apps from your account",
+                false,
+            ),
+            PackageAction::Upgrade(p) => (
+                p.len(),
+                "Updating selected apps. Keep PCSweep open; installers may ask for permission",
+                true,
+            ),
+        };
+        if count == 0 {
+            return;
+        }
+        self.apps.action_text = format!("{text} ({count})");
+        self.apps.refresh_updates = refresh;
+        self.apps.results.clear();
+        self.apps.action = Task::spawn(ctx, move || app_packages::run(action));
     }
 
     pub fn launch_uninstall(&mut self, app: &InstalledApp) {
@@ -278,6 +487,19 @@ impl App {
         }
     }
 
+    fn ask_store_remove(&mut self, packages: Vec<StorePackage>) {
+        if packages.is_empty() {
+            return;
+        }
+        self.modal=Some(Modal{
+            title:format!("Remove {} Store app(s)?",packages.len()),
+            body:"Only the selected apps will be removed from your current Windows account. Other accounts and Windows provisioning are unchanged. Close the apps and save your work first.".into(),
+            details:packages.iter().map(|p|format!("{} · {} · {}",p.name,p.version,p.full_name)).collect(),
+            note:Some("Removal may delete local app data and settings. Reinstalling from Microsoft Store does not restore that data. Required frameworks and Windows/security components are protected; identities and dependencies are checked again before removal.".into()),
+            confirm:"Remove selected apps".into(),danger:true,action:Action::AppPackage(PackageAction::Remove(packages)),
+        });
+    }
+
     pub fn page_apps(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
         let mut acts = Vec::new();
@@ -286,22 +508,85 @@ impl App {
             match a {
                 PAct::Sort(s) => self.apps.sort = s,
                 PAct::Filter(f) => self.apps.filter = f,
+                PAct::View(v) => self.apps.view = v,
                 PAct::Reload => self.start_apps_load(&ctx),
                 PAct::Settings => util::open_uri("ms-settings:appsfeatures"),
+                PAct::ToggleStore(id, on) => {
+                    if on {
+                        self.apps.selected_store.insert(id);
+                    } else {
+                        self.apps.selected_store.remove(&id);
+                    }
+                }
+                PAct::ToggleUpdate(id, on) => {
+                    if on {
+                        self.apps.selected_updates.insert(id);
+                    } else {
+                        self.apps.selected_updates.remove(&id);
+                    }
+                }
+                PAct::CheckUpdates => self.start_app_updates(&ctx),
+                PAct::SetupUpdates => {
+                    self.modal = Some(Modal {
+                        title: "Set up selected app updates?".into(),
+                        body: "Download and install Microsoft's signed Microsoft.WinGet.Client PowerShell module from the official PowerShell Gallery, for your current account. If needed, its NuGet provider prerequisite is installed for your account too.".into(),
+                        details: vec!["Module: Microsoft.WinGet.Client · repository: https://www.powershellgallery.com/api/v2".into(),"PCSweep verifies the Microsoft publisher, module identity, version and supported update commands before using it.".into()],
+                        note: Some("This downloads software and writes to your user module/provider folders. It does not update your apps yet. Repository trust, execution policy and WinGet sources are left unchanged. Existing Windows policy may block setup; Microsoft documentation is available below.".into()),
+                        confirm: "Install Microsoft update module".into(),
+                        danger: false,
+                        action: Action::AppPackage(PackageAction::SetupUpdates),
+                    });
+                }
+                PAct::OpenStore(uri) => util::open_uri(&uri),
+                PAct::OpenLocation(p) => util::open_path(std::path::Path::new(&p)),
+                PAct::RemoveSelected => {
+                    let packages = self
+                        .apps
+                        .list
+                        .iter()
+                        .filter_map(|a| match &a.kind {
+                            AppKind::Store(p)
+                                if self.apps.selected_store.contains(&p.full_name)
+                                    && p.protection_reason().is_none() =>
+                            {
+                                Some(p.clone())
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    self.ask_store_remove(packages);
+                }
+                PAct::UpgradeSelected => {
+                    let packages: Vec<AppUpgrade> = self
+                        .apps
+                        .updates
+                        .iter()
+                        .filter(|p| self.apps.selected_updates.contains(&p.key()))
+                        .cloned()
+                        .collect();
+                    if !packages.is_empty() {
+                        self.modal=Some(Modal{
+                    title:format!("Update {} selected app(s)?",packages.len()),
+                    body:"PCSweep will ask Windows Package Manager to install exactly these reviewed versions, one app at a time. Save your work and close the selected apps. Installers may request administrator permission.".into(),
+                    details:packages.iter().map(|p|format!("{} · {} → {} · {} ({})",p.name,p.installed,p.available,p.id,p.source)).collect(),
+                    note:Some("Package-manager and publisher agreements apply. Updates can change app behavior; PCSweep cannot undo an app update. A result is recorded for each app.".into()),
+                    confirm:"Update selected apps".into(),danger:false,action:Action::AppPackage(PackageAction::Upgrade(packages)),
+                });
+                    }
+                }
                 PAct::Uninstall(i) => {
-                    if let Some(app) = self.apps.list.get(i) {
-                        let name = app.name.clone();
-                        self.modal = Some(Modal {
-                            title: format!("Uninstall {name}?"),
-                            body: format!(
-                                "PCSweep will start {name}'s own uninstaller. It will ask you to confirm and walk you through removal."
-                            ),
-                            details: Vec::new(),
-                            note: None,
-                            confirm: "Start uninstaller".into(),
-                            danger: true,
-                            action: Action::Uninstall(app.clone()),
-                        });
+                    if let Some(app) = self.apps.list.get(i).cloned() {
+                        match &app.kind {
+                            AppKind::Store(p) => self.ask_store_remove(vec![p.clone()]),
+                            AppKind::Desktop => {
+                                self.modal=Some(Modal{
+                    title:format!("Uninstall {}?",app.name),body:format!("PCSweep will start {}'s registered uninstaller. Review the app's own removal options and save your work first.",app.name),
+                    details:vec![format!("Version: {} · Publisher: {}",app.version,app.publisher),format!("Account scope: {}",app.scope)],
+                    note:Some("Removal may delete app settings and data. Reinstalling later does not guarantee they can be recovered.".into()),
+                    confirm:"Start uninstaller".into(),danger:true,action:Action::Uninstall(app),
+                });
+                            }
+                        }
                     }
                 }
             }
@@ -313,148 +598,358 @@ impl App {
         widgets::page_header(
             ui,
             "Installed apps",
-            "Big programs you no longer use are often the easiest space to win back.",
+            "Review what is installed, remove optional apps, and update the apps you choose.",
         );
         let total: u64 = s.list.iter().map(|a| a.size).sum();
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(
                 RichText::new(fmt_num(s.list.len() as u64))
                     .font(widgets::light(30.0))
                     .color(TEXT),
             );
             ui.label(widgets::dim(format!(
-                "apps using about {}",
+                "registered apps · {} reported size",
                 fmt_bytes(total)
             )));
-            ui.add_space(16.0);
+            ui.add_space(12.0);
             let mut f = s.filter.clone();
             if widgets::search_box(ui, &mut f, "Search apps or publishers", 220.0).changed() {
                 acts.push(PAct::Filter(f));
             }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui
-                    .add(widgets::small(widgets::icon_text(
-                        ic::REFRESH,
-                        "Refresh",
-                        13.0,
-                        TEXT,
-                    )))
-                    .clicked()
-                {
-                    acts.push(PAct::Reload);
+            if ui
+                .add_enabled(!s.load.running() && !s.busy(), widgets::small("Refresh"))
+                .clicked()
+            {
+                acts.push(PAct::Reload);
+            }
+            if ui.add(widgets::small("Windows installed apps")).clicked() {
+                acts.push(PAct::Settings);
+            }
+            if s.load.running() {
+                ui.spinner();
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            for (view, label) in [
+                (AppFilter::All, "All apps"),
+                (AppFilter::Desktop, "Desktop"),
+                (AppFilter::Store, "Store apps"),
+                (AppFilter::Protected, "Protected"),
+                (AppFilter::Updates, "App updates"),
+            ] {
+                if ui.add(widgets::chip(label, s.view == view)).clicked() {
+                    acts.push(PAct::View(view));
                 }
-                if ui.add(widgets::small("Windows installed apps")).clicked() {
-                    acts.push(PAct::Settings);
-                }
-                if s.load.running() {
-                    ui.spinner();
+            }
+        });
+        if s.busy() {
+            ui.horizontal_wrapped(|ui| {
+                ui.spinner();
+                ui.label(widgets::dim(&s.action_text));
+            });
+        }
+        for r in s.results.iter().take(8) {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "{}: {}",
+                        r.name,
+                        if r.success { "completed" } else { "failed" }
+                    ))
+                    .color(if r.success { GOOD } else { WARN }),
+                );
+                ui.label(widgets::faint(&r.detail));
+                if let Some(uri) = &r.store_uri {
+                    if ui
+                        .add(widgets::small("Find in Store to reinstall"))
+                        .clicked()
+                    {
+                        acts.push(PAct::OpenStore(uri.clone()));
+                    }
                 }
             });
-        });
-        ui.horizontal(|ui| {
+        }
+        if s.results.len() > 8 {
+            ui.label(widgets::faint(
+                "More app action results are recorded in Activity.",
+            ));
+        }
+        if s.view == AppFilter::Updates {
+            self.render_app_updates(ui, acts);
+            return;
+        }
+        if let Some(error) = &s.store_error {
+            ui.label(
+                RichText::new(format!("Store app inventory unavailable: {error}")).color(WARN),
+            );
+        }
+        ui.horizontal_wrapped(|ui| {
             ui.label(widgets::dim("Sort by"));
-            for (srt, label) in [
+            for (sort, label) in [
                 (AppSort::Size, "Size"),
                 (AppSort::Name, "Name"),
                 (AppSort::Oldest, "Install date"),
             ] {
-                if ui.add(widgets::chip(label, s.sort == srt)).clicked() {
-                    acts.push(PAct::Sort(srt));
+                if ui.add(widgets::chip(label, s.sort == sort)).clicked() {
+                    acts.push(PAct::Sort(sort));
                 }
             }
+            if !s.selected_store.is_empty()
+                && ui
+                    .add_enabled(
+                        !s.busy(),
+                        widgets::small(format!("Review removal ({})", s.selected_store.len())),
+                    )
+                    .clicked()
+            {
+                acts.push(PAct::RemoveSelected);
+            }
         });
-        ui.label(widgets::faint(
-            "Sizes are what each app reports to Windows and can be missing or approximate. Microsoft Store apps are managed in Windows settings.",
-        ));
-        ui.add_space(4.0);
-
+        ui.label(widgets::faint("Sizes are app-reported estimates. Store sizes and install dates are unknown. Running/startup badges use known executable locations, not last-used guesses."));
         let filter = s.filter.to_lowercase();
         let mut idx: Vec<usize> = (0..s.list.len())
             .filter(|&i| {
-                filter.is_empty()
-                    || s.list[i].name.to_lowercase().contains(&filter)
-                    || s.list[i].publisher.to_lowercase().contains(&filter)
+                let a = &s.list[i];
+                let view = match s.view {
+                    AppFilter::Desktop => matches!(a.kind, AppKind::Desktop),
+                    AppFilter::Store => matches!(a.kind, AppKind::Store(_)),
+                    AppFilter::Protected => {
+                        matches!(&a.kind,AppKind::Store(p) if p.protection_reason().is_some())
+                    }
+                    _ => true,
+                };
+                view && (filter.is_empty()
+                    || a.name.to_lowercase().contains(&filter)
+                    || a.publisher.to_lowercase().contains(&filter))
             })
             .collect();
         match s.sort {
             AppSort::Size => idx.sort_by(|&a, &b| s.list[b].size.cmp(&s.list[a].size)),
-            AppSort::Name => idx.sort_by(|&a, &b| {
-                s.list[a]
-                    .name
-                    .to_lowercase()
-                    .cmp(&s.list[b].name.to_lowercase())
-            }),
+            AppSort::Name => idx.sort_by_key(|&i| s.list[i].name.to_lowercase()),
             AppSort::Oldest => {
-                idx.sort_by(|&a, &b| match (s.list[a].installed, s.list[b].installed) {
-                    (Some(x), Some(y)) => x.cmp(&y),
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => std::cmp::Ordering::Equal,
-                })
+                idx.sort_by_key(|&i| (s.list[i].installed.is_none(), s.list[i].installed))
             }
         }
         if idx.is_empty() && !s.load.running() {
-            ui.label(widgets::dim(if filter.is_empty() {
-                "No registered desktop apps found. Open Windows installed apps to manage Store apps."
-            } else {
-                "No apps match your search."
-            }));
+            ui.label(widgets::dim(
+                "No apps match this view. Refresh to read installed apps again.",
+            ));
         }
-        let top = s.list.iter().map(|a| a.size).max().unwrap_or(1).max(1) as f32;
-        let today = chrono::Local::now().date_naive();
+        ScrollArea::vertical().id_salt("apps_scroll").auto_shrink([false,false]).show_rows(ui,66.0,idx.len(),|ui,range|{
+            for &i in &idx[range] {let a=&s.list[i];widgets::row(ui,66.0,|ui|{
+                if let AppKind::Store(p)=&a.kind {
+                    let mut on=s.selected_store.contains(&p.full_name);let reason=p.protection_reason();
+                    let response=ui.add_enabled(reason.is_none()&&!s.busy(),egui::Checkbox::without_text(&mut on));
+                    if response.changed(){acts.push(PAct::ToggleStore(p.full_name.clone(),on));}
+                    if let Some(reason)=reason{response.on_disabled_hover_text(reason);}
+                }else{ui.add_space(24.0);}
+                ui.label(widgets::icon(ic::APPS,18.0,ACCENT));
+                ui.with_layout(Layout::right_to_left(Align::Center),|ui|{
+                    let reason=match &a.kind {AppKind::Store(p)=>p.protection_reason(),AppKind::Desktop if a.uninstall.is_empty()=>Some("No registered uninstaller. Use Windows installed apps.".into()),_=>None};
+                    let response=ui.add_enabled(reason.is_none()&&!s.busy(),widgets::small(if reason.is_some(){"Protected"}else{"Uninstall"}));
+                    if response.clicked(){acts.push(PAct::Uninstall(i));}if let Some(reason)=reason{response.on_disabled_hover_text(reason);}
+                    if let AppKind::Store(p)=&a.kind {if let Some(uri)=p.store_uri(){if ui.add(widgets::small("Store")).on_hover_text("Find this app in Microsoft Store; availability is not guaranteed").clicked(){acts.push(PAct::OpenStore(uri));}}}
+                    if !a.location.is_empty()&&ui.add(widgets::small("Folder")).on_hover_text(&a.location).clicked(){acts.push(PAct::OpenLocation(a.location.clone()));}
+                    widgets::cell(ui,88.0,true,widgets::strong(if a.size>0{fmt_bytes(a.size)}else{"size unknown".into()},13.0));
+                    ui.with_layout(Layout::left_to_right(Align::Center),|ui|{ui.vertical(|ui|{
+                        ui.spacing_mut().item_spacing.y=1.0;
+                        ui.add(Label::new(widgets::strong(&a.name,14.5)).truncate()).on_hover_text(format!("{}\n{}\n{}",a.name,a.publisher,a.location));
+                        let mut meta=vec![match a.kind{AppKind::Desktop=>"Desktop".to_string(),AppKind::Store(_)=>"Store / MSIX".to_string()}];
+                        if !a.version.is_empty(){meta.push(a.version.clone());}if !a.publisher.is_empty(){meta.push(a.publisher.clone());}meta.push(a.scope.to_string());
+                        if a.running==Some(true){meta.push("Running".into());}if a.startup==Some(true){meta.push("Starts with Windows".into());}
+                        if let Some(date)=a.installed{meta.push(format!("installed {}",date.format("%b %d, %Y")));}
+                        ui.add(Label::new(widgets::faint(meta.join(" · "))).truncate());
+                    });});
+                });
+            });}
+        });
+    }
 
+    fn render_app_updates(&self, ui: &mut Ui, acts: &mut Vec<PAct>) {
+        let s = &self.apps;
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    !s.update_scan.running() && !s.busy(),
+                    widgets::small("Check app updates"),
+                )
+                .clicked()
+            {
+                acts.push(PAct::CheckUpdates);
+            }
+            if ui
+                .add_enabled(
+                    !s.selected_updates.is_empty() && !s.busy() && !s.update_scan.running(),
+                    widgets::small(format!("Review updates ({})", s.selected_updates.len())),
+                )
+                .clicked()
+            {
+                acts.push(PAct::UpgradeSelected);
+            }
+            if ui.add(widgets::small("Microsoft Store Library")).clicked() {
+                acts.push(PAct::OpenStore(
+                    "ms-windows-store://downloadsandupdates".into(),
+                ));
+            }
+            if s.update_scan.running() {
+                ui.spinner();
+                ui.label(widgets::dim("Checking Windows Package Manager…"));
+            }
+        });
+        ui.label(widgets::faint("Checks use Microsoft's signed WinGet PowerShell module. Setup is optional and always reviewed first. Only selected apps and reviewed versions are updated."));
+        if let Some(error) = &s.updates_error {
+            ui.label(RichText::new(error).color(WARN));
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(!s.busy(), widgets::small("Set up app updates"))
+                    .clicked()
+                {
+                    acts.push(PAct::SetupUpdates);
+                }
+                if ui
+                    .add(widgets::small("Microsoft setup documentation"))
+                    .clicked()
+                {
+                    acts.push(PAct::OpenStore(
+                        "https://learn.microsoft.com/windows/package-manager/winget/".into(),
+                    ));
+                }
+            });
+        } else if s.updates_checked && s.updates.is_empty() && !s.update_scan.running() {
+            ui.label(widgets::dim(
+                "No verifiable app updates were reported by Windows Package Manager.",
+            ));
+        } else if !s.updates_checked && !s.update_scan.running() {
+            ui.label(widgets::dim("Check for updates to see each app's installed and available version before selecting anything."));
+        }
+        let filter = s.filter.to_lowercase();
         ScrollArea::vertical()
-            .id_salt("apps_scroll")
+            .id_salt("app_updates_scroll")
             .auto_shrink([false, false])
-            .show_rows(ui, 48.0, idx.len(), |ui, range| {
-                for &i in &idx[range] {
-                    let app = &s.list[i];
-                    widgets::row(ui, 48.0, |ui| {
-                        ui.label(widgets::icon(ic::APPS, 18.0, ACCENT));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.add_space(6.0);
-                            if app.uninstall.is_empty() {
-                                ui.add_enabled(false, widgets::small("Uninstall"))
-                                    .on_disabled_hover_text("This app didn't register an uninstaller. Use Windows installed apps instead.");
-                            } else if ui.add(widgets::small("Uninstall")).clicked() {
-                                acts.push(PAct::Uninstall(i));
-                            }
-                            let age = app
-                                .installed
-                                .map(|d| {
-                                    let days = (today - d).num_days().max(0);
-                                    if days > 365 {
-                                        format!("installed {:.0} years ago", (days as f64 / 365.25).floor().max(1.0))
-                                    } else if days > 60 {
-                                        format!("installed {} months ago", days / 30)
-                                    } else {
-                                        format!("installed {}", d.format("%b %d, %Y"))
-                                    }
-                                })
-                                .unwrap_or_default();
-                            widgets::cell(ui, 160.0, true, widgets::faint(age));
-                            let size = if app.size > 0 { fmt_bytes(app.size) } else { "unknown".into() };
-                            widgets::cell(ui, 80.0, true, widgets::strong(size, 14.0));
-                            widgets::bar(ui, app.size as f32 / top, ACCENT_STRONG, egui::vec2(90.0, 6.0));
-                            ui.add_space(8.0);
-                            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                                ui.vertical(|ui| {
-                                    ui.spacing_mut().item_spacing.y = 1.0;
-                                    ui.add(Label::new(widgets::strong(&app.name, 14.5)).truncate());
-                                    let mut meta = Vec::new();
-                                    if !app.publisher.is_empty() {
-                                        meta.push(app.publisher.clone());
-                                    }
-                                    if !app.version.is_empty() {
-                                        meta.push(format!("version {}", app.version));
-                                    }
-                                    meta.push(app.scope.to_string());
-                                    ui.add(Label::new(widgets::faint(meta.join(", "))).truncate());
-                                });
-                            });
+            .show(ui, |ui| {
+                for p in &s.updates {
+                    if !filter.is_empty()
+                        && !p.name.to_lowercase().contains(&filter)
+                        && !p.id.to_lowercase().contains(&filter)
+                    {
+                        continue;
+                    }
+                    widgets::row(ui, 58.0, |ui| {
+                        let mut selected = s.selected_updates.contains(&p.key());
+                        if ui
+                            .add_enabled(!s.busy(), egui::Checkbox::without_text(&mut selected))
+                            .changed()
+                        {
+                            acts.push(PAct::ToggleUpdate(p.key(), selected));
+                        }
+                        ui.vertical(|ui| {
+                            ui.label(widgets::strong(&p.name, 14.5));
+                            ui.label(widgets::faint(format!(
+                                "{} · {} → {} · {}",
+                                p.id, p.installed, p.available, p.source
+                            )));
                         });
                     });
                 }
             });
     }
+}
+
+#[cfg(test)]
+pub(crate) fn preview_fixture() -> AppsState {
+    let mut s = AppsState::default();
+    s.loaded = true;
+    s.list = vec![
+        InstalledApp {
+            name: "Visual Studio Code".into(),
+            version: "1.105.1".into(),
+            publisher: "Microsoft Corporation".into(),
+            size: 435 * 1024 * 1024,
+            installed: NaiveDate::from_ymd_opt(2026, 9, 5),
+            uninstall: "fixture-uninstaller.exe".into(),
+            scope: "Your account",
+            location: r"C:\Users\Preview\AppData\Local\Programs\Microsoft VS Code".into(),
+            kind: AppKind::Desktop,
+            running: Some(true),
+            startup: Some(false),
+        },
+        InstalledApp {
+            name: "Mozilla Firefox".into(),
+            version: "144.0".into(),
+            publisher: "Mozilla".into(),
+            size: 350 * 1024 * 1024,
+            installed: NaiveDate::from_ymd_opt(2026, 8, 14),
+            uninstall: "fixture-uninstaller.exe".into(),
+            scope: "All users",
+            location: r"C:\Program Files\Mozilla Firefox".into(),
+            kind: AppKind::Desktop,
+            running: Some(false),
+            startup: Some(false),
+        },
+    ];
+    for p in [
+        StorePackage {
+            name: "Microsoft Photos".into(),
+            identity: "Microsoft.Windows.Photos".into(),
+            full_name: "Microsoft.Windows.Photos_2026.11110.1001.0_x64__8wekyb3d8bbwe".into(),
+            family: "Microsoft.Windows.Photos_8wekyb3d8bbwe".into(),
+            version: "2026.11110.1001.0".into(),
+            publisher: "Microsoft Corporation".into(),
+            location: r"C:\Program Files\WindowsApps\Microsoft.Windows.Photos".into(),
+            ..Default::default()
+        },
+        StorePackage {
+            name: "Windows Security".into(),
+            identity: "Microsoft.SecHealthUI".into(),
+            full_name: "Microsoft.SecHealthUI_1000.0.0.0_x64__8wekyb3d8bbwe".into(),
+            family: "Microsoft.SecHealthUI_8wekyb3d8bbwe".into(),
+            version: "1000.0.0.0".into(),
+            publisher: "Microsoft Corporation".into(),
+            system: true,
+            ..Default::default()
+        },
+        StorePackage {
+            name: "Microsoft Visual C++ runtime".into(),
+            identity: "Microsoft.VCLibs.140.00".into(),
+            full_name: "Microsoft.VCLibs.140.00_14.0.0.0_x64__8wekyb3d8bbwe".into(),
+            family: "Microsoft.VCLibs.140.00_8wekyb3d8bbwe".into(),
+            version: "14.0.0.0".into(),
+            publisher: "Microsoft Corporation".into(),
+            framework: true,
+            dependents: vec!["Microsoft Photos".into()],
+            ..Default::default()
+        },
+    ] {
+        s.list.push(InstalledApp {
+            name: p.name.clone(),
+            version: p.version.clone(),
+            publisher: p.publisher.clone(),
+            size: 0,
+            installed: None,
+            uninstall: String::new(),
+            scope: "Your account",
+            location: p.location.clone(),
+            kind: AppKind::Store(p),
+            running: None,
+            startup: None,
+        });
+    }
+    s.updates_checked = true;
+    s.updates = vec![
+        AppUpgrade {
+            name: "Mozilla Firefox".into(),
+            id: "Mozilla.Firefox".into(),
+            source: "winget".into(),
+            installed: "144.0".into(),
+            available: "145.0".into(),
+        },
+        AppUpgrade {
+            name: "Visual Studio Code".into(),
+            id: "Microsoft.VisualStudioCode".into(),
+            source: "winget".into(),
+            installed: "1.105.1".into(),
+            available: "1.106.0".into(),
+        },
+    ];
+    s
 }

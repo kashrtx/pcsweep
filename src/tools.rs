@@ -530,6 +530,13 @@ impl App {
             ToolKind::Open(uri) => util::open_uri(uri),
             ToolKind::Launch(p) => util::launch(p),
             ToolKind::Cmd { program, args } => {
+                if self.mutations_running() {
+                    self.toast(
+                        ToastKind::Info,
+                        "Wait for the current operation to finish before running another tool.",
+                    );
+                    return;
+                }
                 if self.tools.run.as_ref().map_or(false, |r| !r.is_done()) {
                     self.toast(ToastKind::Info, "Another tool is still running.");
                     return;
