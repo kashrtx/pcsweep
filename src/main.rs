@@ -1,6 +1,7 @@
 // Hide the console window in release builds.
 #![windows_subsystem = "windows"]
 
+mod ads;
 mod analyzer;
 mod app;
 mod app_packages;
@@ -8,8 +9,11 @@ mod apps;
 mod background;
 mod cleaner;
 mod dashboard;
+mod dns;
 mod duplicates;
+mod network;
 mod platform;
+mod power;
 mod privacy;
 mod processes;
 mod security;
@@ -27,6 +31,9 @@ mod widgets;
 use eframe::egui;
 
 fn main() -> Result<(), eframe::Error> {
+    if let Some(code) = dns::run_helper_mode() {
+        std::process::exit(code);
+    }
     if let Some(code) = updates::run_helper_mode() {
         std::process::exit(code);
     }

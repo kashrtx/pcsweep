@@ -1,6 +1,6 @@
 # PCSweep
 
-A fast, careful cleanup, privacy and PC health tool for Windows 11, written in Rust.
+A careful cleanup, privacy and PC health tool for Windows 10 and 11, written in Rust.
 
 PCSweep shows you exactly where your disk space goes, finds junk that is safe to remove, and only deletes after you've reviewed it and confirmed.
 
@@ -23,6 +23,9 @@ The first release of a Cargo version uses its usual tag, such as `v1.1.0`. Furth
 ## What it does
 
 - **Privacy and ads:** review supported account preferences for advertising ID, Windows tips, welcome suggestions and lock-screen tips. Each change is confirmed and has persistent Undo. Unknown or managed settings open the relevant Windows page. Includes reviews for personalized offers, optional diagnostics, permissions, Recall and clipboard sync; clearing the current clipboard is a separate confirmed action.
+- **Ads and tracking:** open the official uBlock Origin page for Firefox or uBlock Origin Lite page for Chrome/Edge. The browser asks for installation and permissions; PCSweep does not force extensions or claim they are active. Optional classic DNS filtering uses AdGuard Public DNS or the IP addresses of an existing local resolver such as AdGuard Home/Pi-hole. Review the adapter and both address families, then try a 90-second trial with resolver checks, Keep and Restore controls. A separate recovery process restores the saved automatic/manual DNS configuration if the trial is not kept, even if the app closes. Changing DNS requires administrator rights; browser setup does not.
+- **Connection health:** review physical adapters, negotiated link rates, driver details, available Wi-Fi signal/rates and packet-counter changes. Inspect driver-reported options and open Windows network tools. Small, optional gateway/DNS/HTTPS checks help distinguish local connectivity problems; they do not measure internet bandwidth. No blanket adapter tuning is applied.
+- **Battery and power:** review battery charge, runtime estimates, reported capacity and cycle count where available. Supported Windows builds offer separate plugged-in and battery power preferences, saved before applying and verified afterward, with persistent Undo. Older builds offer recognized power plans already advertised by Windows. Create local battery/SleepStudy reports or inspect sleep blockers, last wake and wake timers. Windows handles Energy Saver and manufacturer-specific charging limits.
 - **Security check:** Defender provider status, signature freshness, recent detections, signature updates, quick/full scans and potentially unwanted app blocking with Undo. Scans use Defender's existing threat actions. Offline scanning opens Windows Security with a restart explanation.
 - **Reviewed debloating:** desktop and current-user Store apps in one list. Frameworks, shared dependencies and Windows/security components are protected. Selected Store removals recheck the reviewed identities. Reinstall links are provided where available; deleted app data is not restored by reinstalling.
 - **Installed-app updates:** preview and select updates through Microsoft's official WinGet PowerShell module. If needed, explicit setup installs the Microsoft-signed module for your account. PCSweep does not silently install support packages or change PowerShell execution policy.
@@ -42,6 +45,8 @@ The first release of a Cargo version uses its usual tag, such as `v1.1.0`. Furth
 
 - Changes are reviewed first. Cleanup, app/package actions, privacy changes and update installation are serialized so they cannot interrupt each other.
 - Privacy Undo restores the saved value and refuses to overwrite a preference changed outside PCSweep. Undo for settings does not restore deleted files or app data.
+- DNS changes are limited to the reviewed physical adapter and preserve the original IPv4/IPv6 automatic/manual sources. Managed/encrypted DNS, active VPN routes, domain-managed connections and remote sessions are guarded. The recovery record is protected for administrator writes; an outside DNS change is preserved for review. DNS filtering cannot remove every ad: browser secure DNS, VPNs and same-domain advertising can bypass it.
+- Power Undo restores only the preferences PCSweep changed and preserves outside changes. Windows policy, hardware and manufacturer signals can affect the effective power mode. Performance can increase heat and energy use; efficiency can reduce throughput.
 - Privacy controls reduce supported Windows suggestions and personalization. They do not block all internet advertising or promise zero diagnostic traffic. Defender handles malware findings; an unknown application is not automatically labeled spyware.
 - **Downloads is never touched.** Nothing in your Downloads folder can be deleted or moved by any feature, including Downloads folders you have moved to another drive. You can still see those files in the analyzer, marked with a lock.
 - The junk cleaner can't delete anything inside Documents, Desktop, Pictures, Videos, Music or OneDrive, even if a cache path somehow pointed there.
@@ -67,11 +72,13 @@ The first release of a Cargo version uses its usual tag, such as `v1.1.0`. Furth
 
 On Windows with Rust and the Visual Studio C++ build tools: `cargo build --release --locked`. The app is at `target\release\PCSweep.exe`. Run regression tests with `cargo test --locked`.
 
-Tests use fake state and disposable files/registry keys for mutations. Windows smoke tests read Defender, Store-app and Task Scheduler status; they do not uninstall real apps, change security preferences, run malware scans or install modules. Rendering tests create previews under `target\ui-previews`.
+Tests use fake state and disposable files/registry keys for mutations. Windows smoke tests read Defender, Store-app, Task Scheduler, adapter and power status; they do not uninstall real apps, change real DNS/power/security settings, run malware scans or install modules. Rendering tests create previews under `target\ui-previews`, including the new pages and long confirmation dialogs at supported window sizes.
 
 ## Local data and network use
 
-Logs, settings, task/security undo records and staged updates are stored under `%LOCALAPPDATA%\PCSweep`. The precise privacy undo journal is stored in `HKEY_CURRENT_USER\Software\PCSweep\PrivacyUndo`. No background service is installed. App update checks are manual by default and send no device ID, inventory or activity history. GitHub still receives normal connection information such as the IP address. WinGet setup/updates and Defender updates contact their configured providers only when requested.
+Logs, settings, task/security undo records and staged updates are stored under `%LOCALAPPDATA%\PCSweep`. Power reports are saved in its `reports` folder and can include device and usage details; PCSweep does not upload them. Privacy Undo lives in `HKEY_CURRENT_USER\Software\PCSweep\PrivacyUndo`, power Undo in `HKEY_CURRENT_USER\Software\PCSweep\PowerUndo`, and the administrator-protected DNS recovery record in `HKEY_LOCAL_MACHINE\SOFTWARE\PCSweep\DnsUndo`.
+
+No background service is installed. A DNS trial starts a temporary recovery process; supported Windows AC/DC power preferences continue to work without PCSweep running. App update checks are manual by default and send no device ID, inventory or activity history. GitHub still receives normal connection information such as the IP address. WinGet setup/updates and Defender updates contact their configured providers only when requested. Optional connection checks contact the gateway and Microsoft endpoints; DNS trial checks also query an ad-domain probe through the selected resolver. A chosen public DNS provider receives normal DNS requests under its own privacy policy. Browser extension links open the relevant official store.
 
 Updater hashes protect download integrity using the official GitHub release as the trust source. Releases are currently unsigned; independent publisher signature verification is not claimed.
 

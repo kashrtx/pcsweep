@@ -607,22 +607,70 @@ pub fn save_settings(pairs: &[(String, String)]) {
 
 // ---------------------------------------------------------------- shell
 
+fn explorer_command() -> Result<Command, String> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetSystemWindowsDirectoryW(buffer: *mut u16, size: u32) -> u32;
+    }
+    let mut buffer = vec![0u16; 32768];
+    let length =
+        unsafe { GetSystemWindowsDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+    if length == 0 || length >= buffer.len() {
+        return Err("Windows Explorer's system folder is unavailable.".into());
+    }
+    use std::os::windows::ffi::OsStringExt;
+    let directory = PathBuf::from(std::ffi::OsString::from_wide(&buffer[..length]));
+    Ok(Command::new(directory.join("explorer.exe")))
+}
+
+/// Resolve an internal Windows tool or document without searching the portable
+/// application's current folder or PATH, including while running elevated.
+fn system_file(name: &str) -> Result<PathBuf, String> {
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'.' || c == b'-' || c == b'_')
+        || name == "."
+        || name == ".."
+    {
+        return Err("Invalid Windows system file name.".into());
+    }
+    Ok(crate::platform::system_directory()?.join(name))
+}
+
+pub fn open_system_document(program: &str, document: &str) -> Result<(), String> {
+    Command::new(system_file(program)?)
+        .arg(system_file(document)?)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Could not open this Windows tool: {e}"))
+}
+
 pub fn show_in_explorer(p: &Path) {
-    let _ = Command::new("explorer.exe")
-        .raw_arg(format!("/select,\"{}\"", p.display()))
-        .spawn();
+    if let Ok(mut command) = explorer_command() {
+        let mut selection = std::ffi::OsString::from("/select,\"");
+        selection.push(p);
+        selection.push("\"");
+        let _ = command.raw_arg(selection).spawn();
+    }
 }
 
 pub fn open_path(p: &Path) {
-    let _ = Command::new("explorer.exe").arg(p).spawn();
+    if let Ok(mut command) = explorer_command() {
+        let _ = command.arg(p).spawn();
+    }
 }
 
 pub fn open_uri(uri: &str) {
-    let _ = Command::new("explorer.exe").arg(uri).spawn();
+    if let Ok(mut command) = explorer_command() {
+        let _ = command.arg(uri).spawn();
+    }
 }
 
 pub fn launch(program: &str) {
-    let _ = Command::new(program).spawn();
+    if let Ok(path) = system_file(program) {
+        let _ = Command::new(path).spawn();
+    }
 }
 
 pub fn hidden_command(program: &str) -> Command {
@@ -635,6 +683,23 @@ pub fn hidden_command(program: &str) -> Command {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn windows_launch_targets_are_absolute_and_reject_path_traversal() {
+        assert!(Path::new(explorer_command().unwrap().get_program()).is_absolute());
+        assert!(system_file("control.exe").unwrap().is_absolute());
+        assert!(system_file("devmgmt.msc").unwrap().is_absolute());
+        for input in [
+            "",
+            ".",
+            "..",
+            r"..\control.exe",
+            "C:\\control.exe",
+            "/tmp/tool",
+        ] {
+            assert!(system_file(input).is_err(), "accepted {input}");
+        }
+    }
 
     struct TempFolder(PathBuf);
     impl TempFolder {

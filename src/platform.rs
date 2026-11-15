@@ -10,6 +10,23 @@ pub fn ps_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+/// Resolve Windows tools without searching the current folder or PATH.
+pub fn system_directory() -> Result<std::path::PathBuf, String> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetSystemDirectoryW(buffer: *mut u16, size: u32) -> u32;
+    }
+    let mut buffer = vec![0u16; 32768];
+    let n = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+    if n == 0 || n >= buffer.len() {
+        return Err("Windows system folder is unavailable.".into());
+    }
+    use std::os::windows::ffi::OsStringExt;
+    Ok(std::path::PathBuf::from(std::ffi::OsString::from_wide(
+        &buffer[..n],
+    )))
+}
+
 fn capture<R: Read + Send + 'static>(mut pipe: R) -> mpsc::Receiver<Result<Vec<u8>, String>> {
     let (send, recv) = mpsc::channel();
     std::thread::spawn(move || {
@@ -54,7 +71,10 @@ pub fn powershell(script: &str, timeout: Duration) -> Result<String, String> {
     );
     let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
     let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-    let mut command = crate::util::hidden_command("powershell.exe");
+    use std::os::windows::process::CommandExt;
+    let executable = system_directory()?.join(r"WindowsPowerShell\v1.0\powershell.exe");
+    let mut command = std::process::Command::new(executable);
+    command.creation_flags(crate::util::CREATE_NO_WINDOW);
     let mut child = command
         .args([
             "-NoLogo",

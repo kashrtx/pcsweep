@@ -1,9 +1,9 @@
 //! Headless layout regression checks and reviewable CPU-rendered UI previews.
 //! These tests send no input events, poll no workers, and invoke no system changes.
-use crate::app::{App, Page};
+use crate::app::{Action, App, Modal, Page};
 use crate::theme;
 use eframe::egui::{self, Color32, Frame, ImageData, Margin, Pos2, Rect, TextureId};
-use egui::epaint::{ClippedPrimitive, ImageDelta, Primitive, Vertex};
+use egui::epaint::{ClippedPrimitive, ImageDelta, Primitive, Shape, Vertex};
 use image::{Rgba, RgbaImage};
 use std::collections::HashMap;
 use std::path::Path;
@@ -59,6 +59,13 @@ impl CpuPainter {
                 panic!("page previews must not depend on a GPU paint callback");
             };
             assert!(mesh.is_valid(), "egui mesh must have valid indices");
+            assert!(
+                mesh.vertices.iter().all(|v| v.pos.x.is_finite()
+                    && v.pos.y.is_finite()
+                    && v.uv.x.is_finite()
+                    && v.uv.y.is_finite()),
+                "every UI mesh vertex and UV must be finite, including clipped geometry"
+            );
             let texture = self
                 .textures
                 .get(&mesh.texture_id)
@@ -295,6 +302,9 @@ fn all_management_pages_render_at_minimum_and_default_window_sizes() {
         ("memory", Page::Memory),
         ("apps", Page::Apps),
         ("updates", Page::Updates),
+        ("ads", Page::Ads),
+        ("network", Page::Network),
+        ("power", Page::Power),
     ] {
         for size in [[1040, 680], [1320, 860]] {
             let path = directory.join(format!("{name}-{}x{}.png", size[0], size[1]));
@@ -376,4 +386,98 @@ fn cpu_renderer_respects_clip_and_triangle_winding() {
     assert_eq!(normal.get_pixel(0, 0).0, [0, 0, 0, 0]);
     assert_eq!(normal.get_pixel(2, 2).0, Color32::RED.to_array());
     assert_eq!(normal.get_pixel(6, 2).0, [0, 0, 0, 0]);
+}
+
+fn matching_text_rects(shape: &Shape, clip: Rect, expected: &str, found: &mut Vec<(Rect, Rect)>) {
+    match shape {
+        Shape::Text(text) if text.galley.job.text == expected => {
+            found.push((text.galley.rect.translate(text.pos.to_vec2()), clip));
+        }
+        Shape::Vec(shapes) => {
+            for shape in shapes {
+                matching_text_rects(shape, clip, expected, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn long_confirmation_content_keeps_both_actions_visible_at_supported_sizes() {
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("ui-previews");
+    std::fs::create_dir_all(&directory).unwrap();
+    for size in [[1040, 680], [1320, 860]] {
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(size[0] as f32, size[1] as f32));
+        let ctx = egui::Context::default();
+        theme::setup_fonts(&ctx);
+        theme::apply(&ctx);
+        let mut app = App::test_fixture();
+        app.page = Page::Privacy;
+        app.modal = Some(Modal {
+            title: "Review every affected setting before confirming a change with a deliberately long title".repeat(3),
+            body: "This preview describes a reversible settings change. Read the affected values and any restart requirements before you choose an action. ".repeat(80),
+            details: (0..80).map(|i| format!("Setting {i}: C:\\Users\\Example\\AppData\\Local\\Vendor\\a-long-folder-name-for-preview\\setting.json" )).collect(),
+            note: Some("Your previous values will be saved for Undo. Managed settings are kept. Save your work if a restart will be needed. ".repeat(30)),
+            confirm: "Confirm preview change".into(),
+            danger: false,
+            // Even an accidental execution cannot launch a real tool: this index
+            // is intentionally invalid. The test sends no interaction events.
+            action: Action::RunTool(usize::MAX),
+        });
+        let mut painter = CpuPainter::default();
+        for frame in 0..3 {
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    time: Some(frame as f64 / 60.0),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(Frame::none().fill(theme::BG))
+                        .show(ctx, |ui| {
+                            ui.label("PCSweep confirmation preview");
+                        });
+                    app.modal_ui(ctx);
+                },
+            );
+            assert!(app.modal.is_some(), "without input a modal must stay open");
+            assert!(
+                !app.mutations_running(),
+                "rendering a modal must not execute its action"
+            );
+            for (id, delta) in &output.textures_delta.set {
+                painter.set_texture(*id, delta);
+            }
+            if frame == 2 {
+                for expected in ["Cancel", "Confirm preview change"] {
+                    let mut found = Vec::new();
+                    for shape in &output.shapes {
+                        matching_text_rects(&shape.shape, shape.clip_rect, expected, &mut found);
+                    }
+                    assert_eq!(
+                        found.len(),
+                        1,
+                        "the {expected} action must be drawn exactly once"
+                    );
+                    let (text, clip) = found[0];
+                    assert!(screen.contains_rect(text.expand(8.0)), "{expected} action must remain reachable in the {size:?} viewport; text={text:?}");
+                    assert!(
+                        clip.contains_rect(text),
+                        "{expected} action must not be hidden by the content scroll clip"
+                    );
+                }
+                let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
+                let image = painter.render(size, &primitives);
+                image
+                    .save(directory.join(format!("confirmation-{}x{}.png", size[0], size[1])))
+                    .unwrap();
+            }
+            for id in output.textures_delta.free {
+                painter.textures.remove(&id);
+            }
+        }
+    }
 }

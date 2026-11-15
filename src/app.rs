@@ -29,6 +29,9 @@ pub enum Page {
     Privacy,
     Security,
     Background,
+    Ads,
+    Network,
+    Power,
     Updates,
     Tools,
     Activity,
@@ -72,6 +75,9 @@ pub enum Action {
     Update(crate::updates::UpdateAction),
     Memory(crate::processes::MemoryAction),
     AppPackage(crate::app_packages::PackageAction),
+    Ads(crate::ads::AdsAction),
+    Network(crate::network::NetworkAction),
+    Power(crate::power::PowerAction),
 }
 
 pub struct Modal {
@@ -99,10 +105,14 @@ pub struct App {
     pub security: crate::security::SecurityState,
     pub background: crate::background::BackgroundState,
     pub updates: crate::updates::UpdateState,
+    pub ads: crate::ads::AdsState,
+    pub network: crate::network::NetworkState,
+    pub power: crate::power::PowerState,
     pub modal: Option<Modal>,
     pub toasts: Vec<Toast>,
     pub relaunch: Task<bool>,
     activity_filter: String,
+    last_nav_page: Option<Page>,
 }
 
 impl App {
@@ -125,10 +135,14 @@ impl App {
             security: Default::default(),
             background: Default::default(),
             updates: Default::default(),
+            ads: Default::default(),
+            network: Default::default(),
+            power: Default::default(),
             modal: None,
             toasts: Vec::new(),
             relaunch: Task::default(),
             activity_filter: String::new(),
+            last_nav_page: None,
         };
         util::load_log_history();
         util::log(format!(
@@ -191,7 +205,8 @@ impl App {
     }
 
     fn execute(&mut self, action: Action, ctx: &egui::Context) {
-        if self.mutations_running() {
+        let resolving_dns = matches!(&action, Action::Ads(action) if action.is_resolution());
+        if self.mutations_running() && !resolving_dns {
             self.toast(ToastKind::Info, "An operation is already running. Wait for it to finish before starting another change.");
             return;
         }
@@ -226,6 +241,9 @@ impl App {
             Action::Update(action) => self.execute_update(action, ctx),
             Action::Memory(action) => self.execute_memory(action, ctx),
             Action::AppPackage(action) => self.start_package_action(action, ctx),
+            Action::Ads(action) => self.execute_ads(action, ctx),
+            Action::Network(action) => self.execute_network(action, ctx),
+            Action::Power(action) => self.execute_power(action, ctx),
         }
     }
 
@@ -240,6 +258,9 @@ impl App {
         self.poll_security(ctx);
         self.poll_background(ctx);
         self.poll_updates(ctx);
+        self.poll_ads(ctx);
+        self.poll_network(ctx);
+        self.poll_power(ctx);
         if let Some(r) = self.relaunch.poll() {
             match r {
                 Ok(true) => {
@@ -260,6 +281,9 @@ impl App {
             || self.privacy.busy()
             || self.security.busy()
             || self.background.busy()
+            || self.ads.busy()
+            || self.network.busy()
+            || self.power.busy()
             || self.updates.installing()
             || self.relaunch.running()
             || self.tools.run.as_ref().is_some_and(|run| !run.is_done())
@@ -338,11 +362,14 @@ impl App {
                 (Page::Apps, ic::APPS, "Installed apps"),
             ],
             &[
+                (Page::Ads, ic::GLOBE, "Ads and tracking"),
                 (Page::Privacy, ic::LOCK, "Privacy and ads"),
                 (Page::Security, ic::SHIELD, "Security check"),
                 (Page::Startup, ic::POWER, "Startup apps"),
                 (Page::Background, ic::BOLT, "Background activity"),
                 (Page::Memory, ic::SPEED, "Memory and apps"),
+                (Page::Network, ic::GLOBE, "Connection health"),
+                (Page::Power, ic::POWER, "Battery and power"),
             ],
             &[
                 (Page::Tools, ic::TOOLS, "Tools"),
@@ -350,6 +377,8 @@ impl App {
                 (Page::Activity, ic::HISTORY, "Activity log"),
             ],
         ];
+        let reveal_selected = self.last_nav_page != Some(self.page);
+        self.last_nav_page = Some(self.page);
         ScrollArea::vertical()
             .id_salt("navigation_scroll")
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
@@ -363,9 +392,12 @@ impl App {
                             Page::Startup => startup_badge.as_deref(),
                             _ => None,
                         };
-                        if widgets::nav_item(ui, icon_char, label, self.page == page, badge)
-                            .clicked()
-                        {
+                        let response =
+                            widgets::nav_item(ui, icon_char, label, self.page == page, badge);
+                        if reveal_selected && self.page == page {
+                            response.scroll_to_me(Some(Align::Center));
+                        }
+                        if response.clicked() {
                             if page == Page::Startup {
                                 self.startup.reload();
                             }
@@ -429,6 +461,9 @@ impl App {
             Page::Privacy => self.page_privacy(ui),
             Page::Security => self.page_security(ui),
             Page::Background => self.page_background(ui),
+            Page::Ads => self.page_ads(ui),
+            Page::Network => self.page_network(ui),
+            Page::Power => self.page_power(ui),
             Page::Updates => self.page_updates(ui),
             Page::Tools => self.page_tools(ui),
             Page::Activity => self.page_activity(ui),
@@ -452,10 +487,14 @@ impl App {
             security: crate::security::preview_fixture(),
             background: crate::background::preview_fixture(),
             updates: crate::updates::preview_fixture(),
+            ads: crate::ads::preview_fixture(),
+            network: crate::network::preview_fixture(),
+            power: crate::power::preview_fixture(),
             modal: None,
             toasts: Vec::new(),
             relaunch: Default::default(),
             activity_filter: String::new(),
+            last_nav_page: None,
         }
     }
 
@@ -526,7 +565,7 @@ impl App {
 
     // ------------------------------------------------------------ overlays
 
-    fn modal_ui(&mut self, ctx: &egui::Context) {
+    pub(crate) fn modal_ui(&mut self, ctx: &egui::Context) {
         let Some(modal) = &self.modal else { return };
         ctx.layer_painter(LayerId::new(Order::PanelResizeLine, Id::new("modal_dim")))
             .rect_filled(
@@ -550,40 +589,46 @@ impl App {
             )
             .show(ctx, |ui| {
                 ui.set_width(470.0);
-                ui.horizontal(|ui| {
-                    let (c, col) = if modal.danger {
-                        (ic::WARN, BAD)
-                    } else {
-                        (ic::INFO, ACCENT)
-                    };
-                    ui.label(widgets::icon(c, 20.0, col));
-                    ui.add(Label::new(widgets::strong(&modal.title, 19.0)).wrap());
-                });
-                ui.add_space(4.0);
-                ui.label(RichText::new(&modal.body).color(TEXT_DIM));
-                if !modal.details.is_empty() {
-                    ui.add_space(4.0);
-                    Frame::none()
-                        .fill(BG)
-                        .rounding(Rounding::same(8.0))
-                        .inner_margin(Margin::same(10.0))
-                        .show(ui, |ui| {
-                            ui.set_min_width(ui.available_width());
-                            ScrollArea::vertical()
-                                .id_salt("modal_details")
-                                .max_height(180.0)
-                                .show(ui, |ui| {
-                                    for d in &modal.details {
-                                        ui.add(Label::new(widgets::faint(d)).truncate())
-                                            .on_hover_text(d);
-                                    }
-                                });
+                ScrollArea::vertical()
+                    .id_salt("confirmation_content")
+                    .max_height((ctx.screen_rect().height() - 160.0).clamp(120.0, 620.0))
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let (c, col) = if modal.danger {
+                                (ic::WARN, BAD)
+                            } else {
+                                (ic::INFO, ACCENT)
+                            };
+                            ui.label(widgets::icon(c, 20.0, col));
+                            ui.add(Label::new(widgets::strong(&modal.title, 19.0)).wrap());
                         });
-                }
-                if let Some(n) = &modal.note {
-                    ui.add_space(2.0);
-                    ui.label(RichText::new(n).color(WARN).size(13.0));
-                }
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(&modal.body).color(TEXT_DIM));
+                        if !modal.details.is_empty() {
+                            ui.add_space(4.0);
+                            Frame::none()
+                                .fill(BG)
+                                .rounding(Rounding::same(8.0))
+                                .inner_margin(Margin::same(10.0))
+                                .show(ui, |ui| {
+                                    ui.set_min_width(ui.available_width());
+                                    ScrollArea::vertical()
+                                        .id_salt("modal_details")
+                                        .max_height(180.0)
+                                        .show(ui, |ui| {
+                                            for d in &modal.details {
+                                                ui.add(Label::new(widgets::faint(d)).truncate())
+                                                    .on_hover_text(d);
+                                            }
+                                        });
+                                });
+                        }
+                        if let Some(n) = &modal.note {
+                            ui.add_space(2.0);
+                            ui.label(RichText::new(n).color(WARN).size(13.0));
+                        }
+                    });
                 ui.add_space(12.0);
                 let w = ui.available_width();
                 ui.allocate_ui_with_layout(
@@ -682,6 +727,15 @@ impl eframe::App for App {
                     .inner_margin(Margin::symmetric(30.0, 22.0)),
             )
             .show(ctx, |ui| {
+                if self.ads.trial_pending() {
+                    widgets::banner(ui, WARN, ic::GLOBE, |ui| {
+                        ui.vertical(|ui| {
+                            ui.label("A DNS trial is waiting for your decision. It will restore the previous settings unless you keep it.");
+                            if ui.add(widgets::small("Review DNS trial")).clicked() { self.page = Page::Ads; }
+                        });
+                    });
+                    ui.add_space(8.0);
+                }
                 ui.add_enabled_ui(enabled, |ui| self.render_page(ui));
             });
 
