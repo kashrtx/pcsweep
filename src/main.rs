@@ -30,6 +30,7 @@ fn main() -> Result<(), eframe::Error> {
             .with_title("PCSweep")
             .with_inner_size([1320.0, 860.0])
             .with_min_inner_size([1040.0, 680.0])
+            .with_clamp_size_to_monitor_size(true)
             .with_icon(app_icon()),
         ..Default::default()
     };
@@ -41,8 +42,12 @@ fn main() -> Result<(), eframe::Error> {
     )
 }
 
-/// Draws the window/taskbar icon in code so no image files are needed.
+/// Use the same embedded artwork for the taskbar and Explorer. The procedural
+/// icon is a fallback if the embedded image cannot be decoded.
 fn app_icon() -> egui::IconData {
+    if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
+        return icon;
+    }
     let n: u32 = 64;
     let half = n as f32 / 2.0;
     let radius = 15.0;

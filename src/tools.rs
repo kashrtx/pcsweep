@@ -60,7 +60,7 @@ pub fn tools() -> Vec<ToolDef> {
             icon: ic::CLEAN,
             admin: true,
             duration: "5 to 20 minutes",
-            confirm: Some("After this, already-installed updates can no longer be uninstalled. Windows keeps working normally."),
+            confirm: Some("Superseded system components will be removed. Keep your PC powered on until Windows finishes."),
             kind: ToolKind::Cmd {
                 program: "Dism.exe",
                 args: &["/Online", "/Cleanup-Image", "/StartComponentCleanup"],
@@ -154,7 +154,7 @@ pub fn tools() -> Vec<ToolDef> {
         ToolDef {
             section: "Repair and health",
             name: "Check the system drive for errors",
-            desc: "An online, read-only scan of the file system. Nothing is changed and you can keep working.",
+            desc: "Checks the file system while you keep working. Windows may repair issues online or request a repair at restart.",
             icon: ic::DRIVE,
             admin: true,
             duration: "1 to 10 minutes",
@@ -224,35 +224,115 @@ pub fn tools() -> Vec<ToolDef> {
 #[derive(Default)]
 struct Decoder {
     utf16: Option<bool>,
+    oem: bool,
     pending: Vec<u8>,
 }
 
+fn decode_oem(bytes: &[u8]) -> String {
+    use windows_sys::Win32::Globalization::{MultiByteToWideChar, CP_OEMCP};
+    if bytes.is_empty() {
+        return String::new();
+    }
+    let mut units = vec![0u16; bytes.len()];
+    let n = unsafe {
+        MultiByteToWideChar(
+            CP_OEMCP,
+            0,
+            bytes.as_ptr(),
+            bytes.len() as i32,
+            units.as_mut_ptr(),
+            units.len() as i32,
+        )
+    };
+    if n > 0 {
+        String::from_utf16_lossy(&units[..n as usize])
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+}
+
 impl Decoder {
-    /// Windows tools print either the OEM code page or UTF-16 (sfc). Detect which.
+    /// Preserve incomplete characters between pipe reads. SFC emits UTF-16;
+    /// other Windows tools use UTF-8 or the active OEM code page.
     fn feed(&mut self, data: &[u8]) -> String {
         let mut bytes = std::mem::take(&mut self.pending);
         bytes.extend_from_slice(data);
         let utf16 = match self.utf16 {
             Some(v) => v,
             None => {
+                if bytes.len() < 4 && !bytes.starts_with(&[0xff, 0xfe]) {
+                    self.pending = bytes;
+                    return String::new();
+                }
                 let odd_zero = bytes.iter().skip(1).step_by(2).filter(|&&b| b == 0).count();
-                let v = bytes.len() >= 4 && odd_zero * 4 >= bytes.len();
+                let v = bytes.starts_with(&[0xff, 0xfe])
+                    || (bytes.len() >= 4 && odd_zero * 4 >= bytes.len());
                 self.utf16 = Some(v);
                 v
             }
         };
         if utf16 {
-            let even = bytes.len() & !1;
-            if even < bytes.len() {
-                self.pending.push(bytes[even]);
+            let mut end = bytes.len() & !1;
+            if end >= 2 {
+                let last = u16::from_le_bytes([bytes[end - 2], bytes[end - 1]]);
+                if (0xd800..=0xdbff).contains(&last) {
+                    end -= 2;
+                }
             }
-            let units: Vec<u16> = bytes[..even]
+            self.pending.extend_from_slice(&bytes[end..]);
+            let units: Vec<u16> = bytes[..end]
                 .chunks_exact(2)
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect();
-            String::from_utf16_lossy(&units).replace('\u{feff}', "")
+            String::from_utf16_lossy(&units)
+                .trim_start_matches('\u{feff}')
+                .to_string()
         } else {
-            String::from_utf8_lossy(&bytes).into_owned()
+            if !self.oem {
+                match std::str::from_utf8(&bytes) {
+                    Ok(text) => return text.to_string(),
+                    Err(e) if e.error_len().is_none() => {
+                        let end = e.valid_up_to();
+                        self.pending.extend_from_slice(&bytes[end..]);
+                        return String::from_utf8_lossy(&bytes[..end]).into_owned();
+                    }
+                    Err(_) => self.oem = true,
+                }
+            }
+            // DBCS OEM code pages also have two-byte characters. Keep a trailing
+            // lead byte until the next read instead of replacing it with '?'.
+            use windows_sys::Win32::Globalization::{GetOEMCP, IsDBCSLeadByteEx};
+            let cp = unsafe { GetOEMCP() };
+            let mut end = 0;
+            while end < bytes.len() {
+                let width = if unsafe { IsDBCSLeadByteEx(cp, bytes[end]) } != 0 {
+                    2
+                } else {
+                    1
+                };
+                if end + width > bytes.len() {
+                    break;
+                }
+                end += width;
+            }
+            self.pending.extend_from_slice(&bytes[end..]);
+            decode_oem(&bytes[..end])
+        }
+    }
+
+    fn finish(&mut self) -> String {
+        let bytes = std::mem::take(&mut self.pending);
+        if self.utf16 == Some(true) {
+            let units: Vec<u16> = bytes
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            String::from_utf16_lossy(&units)
+        } else {
+            match std::str::from_utf8(&bytes) {
+                Ok(s) if !self.oem => s.to_string(),
+                _ => decode_oem(&bytes),
+            }
         }
     }
 }
@@ -304,7 +384,11 @@ impl ToolRun {
     }
 }
 
-fn reader<R: Read + Send + 'static>(mut r: R, out: Arc<Mutex<String>>, ctx: egui::Context) -> std::thread::JoinHandle<()> {
+fn reader<R: Read + Send + 'static>(
+    mut r: R,
+    out: Arc<Mutex<String>>,
+    ctx: egui::Context,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut dec = Decoder::default();
         let mut buf = [0u8; 4096];
@@ -318,10 +402,17 @@ fn reader<R: Read + Send + 'static>(mut r: R, out: Arc<Mutex<String>>, ctx: egui
                 }
             }
         }
+        append(&out, &dec.finish());
+        ctx.request_repaint();
     })
 }
 
-pub fn spawn(name: &'static str, program: &'static str, args: Vec<String>, ctx: egui::Context) -> ToolRun {
+pub fn spawn(
+    name: &'static str,
+    program: &'static str,
+    args: Vec<String>,
+    ctx: egui::Context,
+) -> ToolRun {
     let output = Arc::new(Mutex::new(String::new()));
     let done = Arc::new(AtomicBool::new(false));
     let exit = Arc::new(Mutex::new(None));
@@ -350,7 +441,14 @@ pub fn spawn(name: &'static str, program: &'static str, args: Vec<String>, ctx: 
                 if let Ok(mut e) = x.lock() {
                     *e = code;
                 }
-                append(&o, &format!("\n\nFinished with exit code {}.\n", code.map(|c| c.to_string()).unwrap_or_else(|| "unknown".into())));
+                append(
+                    &o,
+                    &format!(
+                        "\n\nFinished with exit code {}.\n",
+                        code.map(|c| c.to_string())
+                            .unwrap_or_else(|| "unknown".into())
+                    ),
+                );
             }
         }
         d.store(true, Ordering::Relaxed);
@@ -368,12 +466,18 @@ pub fn spawn(name: &'static str, program: &'static str, args: Vec<String>, ctx: 
 
 /// Sizes of Windows-managed files in the system drive root (pagefile, hibernation file).
 pub fn system_files() -> Vec<(String, u64)> {
-    let root = format!("{}\\", std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into()));
+    let root = format!(
+        "{}\\",
+        std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into())
+    );
     let mut out = Vec::new();
     if let Ok(rd) = fs::read_dir(&root) {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().to_lowercase();
-            if matches!(name.as_str(), "pagefile.sys" | "hiberfil.sys" | "swapfile.sys") {
+            if matches!(
+                name.as_str(),
+                "pagefile.sys" | "hiberfil.sys" | "swapfile.sys"
+            ) {
                 if let Ok(md) = e.metadata() {
                     out.push((name, md.len()));
                 }
@@ -412,7 +516,16 @@ enum TAct {
 
 impl App {
     pub fn start_tool(&mut self, i: usize, ctx: &egui::Context) {
-        let Some(def) = self.tools.defs.get(i).copied() else { return };
+        let Some(def) = self.tools.defs.get(i).copied() else {
+            return;
+        };
+        if def.admin && !self.is_admin {
+            self.toast(
+                ToastKind::Error,
+                "Restart PCSweep as administrator to run this tool.",
+            );
+            return;
+        }
         match def.kind {
             ToolKind::Open(uri) => util::open_uri(uri),
             ToolKind::Launch(p) => util::launch(p),
@@ -441,12 +554,21 @@ impl App {
             util::log(format!(
                 "Tool finished: {} (exit code {})",
                 name,
-                code.map(|c| c.to_string()).unwrap_or_else(|| "unknown".into())
+                code.map(|c| c.to_string())
+                    .unwrap_or_else(|| "unknown".into())
             ));
-            if code == Some(0) {
+            if code == Some(3010) {
+                self.toast(
+                    ToastKind::Success,
+                    format!("{name} finished. Restart Windows to complete the changes."),
+                );
+            } else if code == Some(0) {
                 self.toast(ToastKind::Success, format!("{name} finished"));
             } else {
-                self.toast(ToastKind::Error, format!("{name} reported a problem. See the output."));
+                self.toast(
+                    ToastKind::Error,
+                    format!("{name} reported a problem. See the output."),
+                );
             }
             self.tools.sysfiles = system_files();
             self.sys.refresh_drives();
@@ -497,7 +619,7 @@ impl App {
                 ui.horizontal(|ui| {
                     if run.is_done() {
                         let code = run.exit.lock().ok().and_then(|e| *e);
-                        if code == Some(0) {
+                        if matches!(code, Some(0 | 3010)) {
                             ui.label(widgets::icon(ic::CHECK, 16.0, GOOD));
                         } else {
                             ui.label(widgets::icon(ic::WARN, 16.0, WARN));
@@ -506,7 +628,10 @@ impl App {
                         ui.spinner();
                     }
                     ui.label(widgets::strong(run.name, 16.0));
-                    ui.label(widgets::faint(format!("{}s", run.started.elapsed().as_secs())));
+                    ui.label(widgets::faint(format!(
+                        "{}s",
+                        run.started.elapsed().as_secs()
+                    )));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if run.is_done() && ui.add(widgets::small("Close")).clicked() {
                             acts.push(TAct::CloseOutput);
@@ -525,7 +650,7 @@ impl App {
                     .show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
                         ScrollArea::vertical()
-                            .id_source("tool_output")
+                            .id_salt("tool_output")
                             .max_height(220.0)
                             .stick_to_bottom(true)
                             .auto_shrink([false, true])
@@ -538,7 +663,7 @@ impl App {
         }
 
         ScrollArea::vertical()
-            .id_source("tools_scroll")
+            .id_salt("tools_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 if !t.sysfiles.is_empty() {
@@ -601,5 +726,59 @@ impl App {
                 }
                 ui.add_space(20.0);
             });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{append, Decoder};
+    use std::sync::Mutex;
+
+    #[test]
+    fn utf16_output_survives_every_pipe_boundary() {
+        let expected = "Checking files 🧹\r\nDone.";
+        let bytes: Vec<u8> = std::iter::once(0xfeffu16)
+            .chain(expected.encode_utf16())
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        for size in 1..=bytes.len() {
+            let mut decoder = Decoder::default();
+            let mut output = String::new();
+            for chunk in bytes.chunks(size) {
+                output.push_str(&decoder.feed(chunk));
+            }
+            output.push_str(&decoder.finish());
+            assert_eq!(output, expected, "chunk size {size}");
+        }
+    }
+
+    #[test]
+    fn utf8_output_survives_every_pipe_boundary() {
+        let expected = "Progress: café 🧹 complete.";
+        for size in 1..=expected.len() {
+            let mut decoder = Decoder::default();
+            let mut output = String::new();
+            for chunk in expected.as_bytes().chunks(size) {
+                output.push_str(&decoder.feed(chunk));
+            }
+            output.push_str(&decoder.finish());
+            assert_eq!(output, expected, "chunk size {size}");
+        }
+    }
+
+    #[test]
+    fn final_short_output_is_not_lost() {
+        let mut decoder = Decoder::default();
+        assert_eq!(decoder.feed(b"OK"), "");
+        assert_eq!(decoder.finish(), "OK");
+    }
+
+    #[test]
+    fn progress_replaces_only_the_current_line() {
+        let output = Mutex::new(String::new());
+        append(&output, "Beginning\r\n10%");
+        append(&output, "\r20%\r");
+        append(&output, "100%\r\nDone\n");
+        assert_eq!(*output.lock().unwrap(), "Beginning\n100%\nDone\n");
     }
 }

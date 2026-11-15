@@ -35,7 +35,9 @@ pub const PALETTE: [Color32; 8] = [
 
 pub fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
     let l = |x: u8, y: u8| -> u8 {
-        (x as f32 + (y as f32 - x as f32) * t).round().clamp(0.0, 255.0) as u8
+        (x as f32 + (y as f32 - x as f32) * t)
+            .round()
+            .clamp(0.0, 255.0) as u8
     };
     Color32::from_rgb(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()))
 }
@@ -90,23 +92,38 @@ pub fn setup_fonts(ctx: &egui::Context) {
     }
 
     fonts.families.insert(FontFamily::Proportional, body);
-    fonts.families.insert(FontFamily::Name("semibold".into()), semi);
-    fonts.families.insert(FontFamily::Name("light".into()), light);
-    fonts.families.insert(FontFamily::Name("icons".into()), icons);
+    fonts
+        .families
+        .insert(FontFamily::Name("semibold".into()), semi);
+    fonts
+        .families
+        .insert(FontFamily::Name("light".into()), light);
+    fonts
+        .families
+        .insert(FontFamily::Name("icons".into()), icons);
     ctx.set_fonts(fonts);
 }
 
 pub fn apply(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
     style.text_styles = [
-        (TextStyle::Small, FontId::new(12.0, FontFamily::Proportional)),
+        (
+            TextStyle::Small,
+            FontId::new(12.0, FontFamily::Proportional),
+        ),
         (TextStyle::Body, FontId::new(14.5, FontFamily::Proportional)),
-        (TextStyle::Button, FontId::new(14.0, FontFamily::Proportional)),
+        (
+            TextStyle::Button,
+            FontId::new(14.0, FontFamily::Proportional),
+        ),
         (
             TextStyle::Heading,
             FontId::new(26.0, FontFamily::Name("semibold".into())),
         ),
-        (TextStyle::Monospace, FontId::new(13.0, FontFamily::Monospace)),
+        (
+            TextStyle::Monospace,
+            FontId::new(13.0, FontFamily::Monospace),
+        ),
     ]
     .into();
     style.spacing.item_spacing = vec2(8.0, 8.0);
@@ -120,7 +137,7 @@ pub fn apply(ctx: &egui::Context) {
     v.dark_mode = true;
     v.panel_fill = BG;
     v.window_fill = CARD;
-    v.window_stroke = Stroke::new(1.0, BORDER);
+    v.window_stroke = Stroke::new(1.0_f32, BORDER);
     v.window_rounding = Rounding::same(14.0);
     v.menu_rounding = Rounding::same(10.0);
     v.extreme_bg_color = Color32::from_rgb(13, 15, 21);
@@ -128,7 +145,7 @@ pub fn apply(ctx: &egui::Context) {
     v.code_bg_color = Color32::from_rgb(13, 15, 21);
     v.hyperlink_color = ACCENT;
     v.selection.bg_fill = ACCENT_SOFT;
-    v.selection.stroke = Stroke::new(1.0, ACCENT);
+    v.selection.stroke = Stroke::new(1.0_f32, ACCENT);
     v.warn_fg_color = WARN;
     v.error_fg_color = BAD;
 
@@ -137,26 +154,26 @@ pub fn apply(ctx: &egui::Context) {
         let w = &mut v.widgets;
         w.noninteractive.bg_fill = CARD;
         w.noninteractive.weak_bg_fill = CARD;
-        w.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
-        w.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
+        w.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER);
+        w.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT);
         w.noninteractive.rounding = r;
 
         w.inactive.bg_fill = CARD_HI;
         w.inactive.weak_bg_fill = CARD_HI;
-        w.inactive.bg_stroke = Stroke::new(1.0, BORDER);
-        w.inactive.fg_stroke = Stroke::new(1.0, TEXT);
+        w.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER);
+        w.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT);
         w.inactive.rounding = r;
 
         w.hovered.bg_fill = Color32::from_rgb(44, 51, 68);
         w.hovered.weak_bg_fill = Color32::from_rgb(44, 51, 68);
-        w.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(70, 80, 104));
-        w.hovered.fg_stroke = Stroke::new(1.5, TEXT);
+        w.hovered.bg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(70, 80, 104));
+        w.hovered.fg_stroke = Stroke::new(1.5_f32, TEXT);
         w.hovered.rounding = r;
 
         w.active.bg_fill = Color32::from_rgb(52, 60, 80);
         w.active.weak_bg_fill = Color32::from_rgb(52, 60, 80);
-        w.active.bg_stroke = Stroke::new(1.0, ACCENT);
-        w.active.fg_stroke = Stroke::new(2.0, TEXT);
+        w.active.bg_stroke = Stroke::new(1.0_f32, ACCENT);
+        w.active.fg_stroke = Stroke::new(2.0_f32, TEXT);
         w.active.rounding = r;
 
         w.open = w.active.clone();

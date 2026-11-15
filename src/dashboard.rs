@@ -47,7 +47,11 @@ impl App {
                 score -= 10;
                 recs.push(Rec {
                     sev: Sev::Medium,
-                    text: format!("{} has {} free. Keeping at least 20% free helps performance.", d.letter(), fmt_bytes(d.free)),
+                    text: format!(
+                        "{} has {} free. Keeping at least 20% free helps performance.",
+                        d.letter(),
+                        fmt_bytes(d.free)
+                    ),
                     go: Some(Page::Analyzer),
                     action: "Find space",
                 });
@@ -58,37 +62,80 @@ impl App {
         const GB: u64 = 1024 * 1024 * 1024;
         if junk > 5 * GB {
             score -= 15;
-            recs.push(Rec { sev: Sev::High, text: format!("{} of junk files can be removed safely.", fmt_bytes(junk)), go: Some(Page::Cleaner), action: "Review" });
+            recs.push(Rec {
+                sev: Sev::High,
+                text: format!("{} of junk files can be removed safely.", fmt_bytes(junk)),
+                go: Some(Page::Cleaner),
+                action: "Review",
+            });
         } else if junk > GB {
             score -= 8;
-            recs.push(Rec { sev: Sev::Medium, text: format!("{} of junk files can be removed safely.", fmt_bytes(junk)), go: Some(Page::Cleaner), action: "Review" });
+            recs.push(Rec {
+                sev: Sev::Medium,
+                text: format!("{} of junk files can be removed safely.", fmt_bytes(junk)),
+                go: Some(Page::Cleaner),
+                action: "Review",
+            });
         } else if junk > 200 * 1024 * 1024 {
             score -= 3;
-            recs.push(Rec { sev: Sev::Low, text: format!("{} of junk files found.", fmt_bytes(junk)), go: Some(Page::Cleaner), action: "Review" });
+            recs.push(Rec {
+                sev: Sev::Low,
+                text: format!("{} of junk files found.", fmt_bytes(junk)),
+                go: Some(Page::Cleaner),
+                action: "Review",
+            });
         }
 
         let bin = self.cleaner.recycle_bin_bytes();
         if bin > 2 * GB {
             score -= 5;
-            recs.push(Rec { sev: Sev::Low, text: format!("The Recycle Bin is holding {}.", fmt_bytes(bin)), go: Some(Page::Cleaner), action: "Review" });
+            recs.push(Rec {
+                sev: Sev::Low,
+                text: format!("The Recycle Bin is holding {}.", fmt_bytes(bin)),
+                go: Some(Page::Cleaner),
+                action: "Review",
+            });
         }
 
         let mf = self.sys.mem_frac();
         if mf > 0.90 {
             score -= 15;
-            recs.push(Rec { sev: Sev::High, text: format!("Memory is {:.0}% full. Close heavy apps to stop slowdowns.", mf * 100.0), go: Some(Page::Memory), action: "See apps" });
+            recs.push(Rec {
+                sev: Sev::High,
+                text: format!(
+                    "Memory is {:.0}% full. Close heavy apps to stop slowdowns.",
+                    mf * 100.0
+                ),
+                go: Some(Page::Memory),
+                action: "See apps",
+            });
         } else if mf > 0.80 {
             score -= 7;
-            recs.push(Rec { sev: Sev::Medium, text: format!("Memory is {:.0}% full.", mf * 100.0), go: Some(Page::Memory), action: "See apps" });
+            recs.push(Rec {
+                sev: Sev::Medium,
+                text: format!("Memory is {:.0}% full.", mf * 100.0),
+                go: Some(Page::Memory),
+                action: "See apps",
+            });
         }
 
         let st = self.startup.enabled_count();
         if st > 15 {
             score -= 10;
-            recs.push(Rec { sev: Sev::Medium, text: format!("{st} apps start with Windows. Turning some off speeds up sign-in."), go: Some(Page::Startup), action: "Manage" });
+            recs.push(Rec {
+                sev: Sev::Medium,
+                text: format!("{st} apps start with Windows. Turning some off speeds up sign-in."),
+                go: Some(Page::Startup),
+                action: "Manage",
+            });
         } else if st > 8 {
             score -= 5;
-            recs.push(Rec { sev: Sev::Low, text: format!("{st} apps start with Windows."), go: Some(Page::Startup), action: "Manage" });
+            recs.push(Rec {
+                sev: Sev::Low,
+                text: format!("{st} apps start with Windows."),
+                go: Some(Page::Startup),
+                action: "Manage",
+            });
         }
 
         let up = system::uptime_secs();
@@ -128,11 +175,16 @@ impl App {
         widgets::page_header(
             ui,
             greet,
-            &format!("{}, {}, running for {}", self.sys.host, self.sys.os, util::fmt_duration(system::uptime_secs())),
+            &format!(
+                "{}, {}, running for {}",
+                self.sys.host,
+                self.sys.os,
+                util::fmt_duration(system::uptime_secs())
+            ),
         );
 
         ScrollArea::vertical()
-            .id_source("dash_scroll")
+            .id_salt("dash_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let (score, recs) = self.health();
@@ -209,11 +261,18 @@ impl App {
                         let max = top.first().map(|t| t.1).unwrap_or(1).max(1) as f32;
                         for (i, b) in top {
                             ui.horizontal(|ui| {
-                                ui.add_sized([180.0, 18.0], Label::new(RichText::new(self.cleaner.cats[i].name).color(TEXT_DIM)).truncate());
+                                widgets::cell(ui, 190.0, false, RichText::new(self.cleaner.cats[i].name).color(TEXT_DIM));
                                 let bw = (ui.available_width() - 90.0).max(20.0);
                                 widgets::bar(ui, b as f32 / max, ACCENT, egui::vec2(bw, 6.0));
-                                ui.label(widgets::faint(fmt_bytes(b)));
+                                widgets::cell(ui, 80.0, true, widgets::faint(fmt_bytes(b)));
                             });
+                        }
+                        let optional = self.cleaner.optional_total();
+                        if optional > 0 {
+                            ui.label(widgets::faint(format!(
+                                "Plus {} in optional categories like package and shader caches. You can choose those in the Junk cleaner.",
+                                fmt_bytes(optional)
+                            )));
                         }
                         ui.add_space(8.0);
                         if ui.add(widgets::primary(widgets::icon_text(ic::CLEAN, "Review and clean", 14.0, Color32::WHITE))).clicked() {
@@ -275,10 +334,10 @@ impl App {
                         let max = groups.first().map(|g| g.mem).unwrap_or(1).max(1) as f32;
                         for g in groups.iter().take(4) {
                             ui.horizontal(|ui| {
-                                ui.add_sized([160.0, 18.0], Label::new(RichText::new(&g.name).color(TEXT_DIM)).truncate());
+                                widgets::cell(ui, 190.0, false, RichText::new(&g.name).color(TEXT_DIM));
                                 let bw = (ui.available_width() - 90.0).max(20.0);
                                 widgets::bar(ui, g.mem as f32 / max, ACCENT_STRONG, egui::vec2(bw, 6.0));
-                                ui.label(widgets::faint(fmt_bytes(g.mem)));
+                                widgets::cell(ui, 80.0, true, widgets::faint(fmt_bytes(g.mem)));
                             });
                         }
                     });

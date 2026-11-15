@@ -96,23 +96,34 @@ impl FileCat {
 
 pub fn classify(ext: &str) -> FileCat {
     match ext {
-        "mp4" | "mkv" | "avi" | "mov" | "wmv" | "webm" | "m4v" | "flv" | "mpg" | "mpeg" | "ts" | "m2ts" | "3gp" => FileCat::Video,
-        "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" | "heic" | "heif" | "tif" | "tiff" | "raw" | "cr2" | "nef" | "arw" | "dng" | "psd" | "svg" | "ico" => FileCat::Image,
+        "mp4" | "mkv" | "avi" | "mov" | "wmv" | "webm" | "m4v" | "flv" | "mpg" | "mpeg"
+        | "m2ts" | "3gp" => FileCat::Video,
+        "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" | "heic" | "heif" | "tif" | "tiff"
+        | "raw" | "cr2" | "nef" | "arw" | "dng" | "psd" | "svg" | "ico" => FileCat::Image,
         "mp3" | "flac" | "wav" | "aac" | "m4a" | "ogg" | "wma" | "opus" | "aiff" => FileCat::Audio,
-        "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "odt" | "ods" | "txt" | "rtf" | "epub" | "md" | "csv" | "pst" | "ost" => FileCat::Document,
-        "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" | "zst" | "cab" | "tgz" => FileCat::Archive,
-        "iso" | "img" | "vhd" | "vhdx" | "vmdk" | "vdi" | "qcow2" | "wim" | "esd" | "avhdx" => FileCat::DiskImage,
+        "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "odt" | "ods" | "txt"
+        | "rtf" | "epub" | "md" | "csv" | "pst" | "ost" => FileCat::Document,
+        "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" | "zst" | "cab" | "tgz" => {
+            FileCat::Archive
+        }
+        "iso" | "img" | "vhd" | "vhdx" | "vmdk" | "vdi" | "qcow2" | "wim" | "esd" | "avhdx" => {
+            FileCat::DiskImage
+        }
         "msi" | "msix" | "msixbundle" | "appx" | "appxbundle" | "msp" | "msu" => FileCat::Installer,
         "exe" | "dll" | "sys" | "so" | "lib" | "ocx" | "node" | "pyd" | "jar" => FileCat::Program,
-        "rs" | "c" | "cpp" | "h" | "cs" | "js" | "ts" | "py" | "java" | "json" | "xml" | "db" | "sqlite" | "sql" | "log" | "pdb" | "obj" | "rlib" | "o" | "pack" | "idx" => FileCat::Code,
-        "pak" | "bsa" | "ba2" | "vpk" | "bundle" | "assets" | "ucas" | "utoc" | "forge" | "big" | "dat" => FileCat::Game,
+        "rs" | "c" | "cpp" | "h" | "cs" | "js" | "ts" | "py" | "java" | "json" | "xml" | "db"
+        | "sqlite" | "sql" | "log" | "pdb" | "obj" | "rlib" | "o" | "pack" | "idx" => FileCat::Code,
+        "pak" | "bsa" | "ba2" | "vpk" | "bundle" | "assets" | "ucas" | "utoc" | "forge" | "big"
+        | "dat" => FileCat::Game,
         _ => FileCat::Other,
     }
 }
 
 fn ext_of(name: &str) -> String {
     match name.rsplit_once('.') {
-        Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() && ext.len() <= 12 => ext.to_lowercase(),
+        Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() && ext.len() <= 12 => {
+            ext.to_lowercase()
+        }
         _ => "(none)".to_string(),
     }
 }
@@ -164,6 +175,15 @@ fn scan_dir(path: &Path, name: String, sh: &Shared<'_>, depth: u32) -> Node {
     if depth > 200 || sh.progress.cancel.load(Ordering::Relaxed) {
         return node;
     }
+    // Check the chosen root too, and recheck each directory before entering it.
+    // DirEntry metadata alone does not protect a folder replaced with a junction.
+    let valid_dir =
+        fs::symlink_metadata(path).is_ok_and(|md| md.is_dir() && !util::is_reparse(&md));
+    if !valid_dir {
+        sh.denied.fetch_add(1, Ordering::Relaxed);
+        node.kind = NodeKind::Denied;
+        return node;
+    }
     let rd = match fs::read_dir(path) {
         Ok(r) => r,
         Err(_) => {
@@ -178,7 +198,12 @@ fn scan_dir(path: &Path, name: String, sh: &Shared<'_>, depth: u32) -> Node {
     let mut local_ext: HashMap<String, (u64, u64)> = HashMap::new();
     let mut local_big: Vec<FileRec> = Vec::new();
     for entry in rd.flatten() {
-        let Ok(md) = entry.metadata() else { continue };
+        if sh.progress.cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let Ok(md) = fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
         let attrs = md.file_attributes();
         // Never follow junctions or symlinks (avoids loops and double counting).
         if attrs & util::ATTR_REPARSE != 0 || md.file_type().is_symlink() {
@@ -189,7 +214,14 @@ fn scan_dir(path: &Path, name: String, sh: &Shared<'_>, depth: u32) -> Node {
             subdirs.push((entry.path(), fname));
             continue;
         }
-        let size = if attrs & util::CLOUD_MASK != 0 { 0 } else { md.len() };
+        if !md.is_file() {
+            continue;
+        }
+        let size = if attrs & util::CLOUD_MASK != 0 {
+            0
+        } else {
+            md.len()
+        };
         let modified = md.modified().ok();
         node.modified = node.modified.max(modified);
         node.files += 1;
@@ -292,11 +324,17 @@ pub fn scan(root_path: PathBuf, progress: Arc<Progress>) -> ScanResult {
             let e = cat_map.entry(cat).or_insert((0, 0));
             e.0 += bytes;
             e.1 += count;
-            ExtStat { ext, bytes, count, cat }
+            ExtStat {
+                ext,
+                bytes,
+                count,
+                cat,
+            }
         })
         .collect();
     exts.sort_unstable_by(|a, b| b.bytes.cmp(&a.bytes));
-    let mut cats: Vec<(FileCat, u64, u64)> = cat_map.into_iter().map(|(c, (b, n))| (c, b, n)).collect();
+    let mut cats: Vec<(FileCat, u64, u64)> =
+        cat_map.into_iter().map(|(c, (b, n))| (c, b, n)).collect();
     cats.sort_by(|a, b| b.1.cmp(&a.1));
     ScanResult {
         root_path,
@@ -309,6 +347,10 @@ pub fn scan(root_path: PathBuf, progress: Arc<Progress>) -> ScanResult {
         dirs: progress.dirs.load(Ordering::Relaxed),
         cancelled: progress.cancel.load(Ordering::Relaxed),
     }
+}
+
+fn path_removed(path: &Path, removed: &HashSet<PathBuf>) -> bool {
+    removed.iter().any(|root| path.starts_with(root))
 }
 
 fn node_at<'a>(root: &'a Node, nav: &[usize]) -> &'a Node {
@@ -428,21 +470,40 @@ fn treemap(ui: &mut Ui, node: &Node, height: f32) -> Option<usize> {
     let (rect, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, Rounding::same(12.0), CARD);
-    let items: Vec<(usize, f64)> = node
+    let mut items: Vec<(usize, f64)> = node
         .children
         .iter()
         .enumerate()
         .filter(|(_, c)| c.size > 0)
-        .take(150)
+        .take(149)
         .map(|(i, c)| (i, c.size as f64))
         .collect();
+    // Preserve the area of the long tail instead of making the first 150
+    // entries appear to occupy the entire folder.
+    let other = Node {
+        name: "Other items".into(),
+        size: node.children.iter().skip(149).map(|c| c.size).sum(),
+        files: node.children.iter().skip(149).map(|c| c.files).sum(),
+        kind: NodeKind::SmallFiles,
+        modified: None,
+        children: Vec::new(),
+    };
+    if other.size > 0 {
+        items.push((node.children.len(), other.size as f64));
+    }
     if items.is_empty() {
-        painter.text(rect.center(), Align2::CENTER_CENTER, "This folder is empty", FontId::proportional(14.0), TEXT_DIM);
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "This folder is empty",
+            FontId::proportional(14.0),
+            TEXT_DIM,
+        );
         return None;
     }
     let mut clicked = None;
     for (k, (idx, r)) in squarify(&items, rect.shrink(4.0)).into_iter().enumerate() {
-        let child = &node.children[idx];
+        let child = node.children.get(idx).unwrap_or(&other);
         let r = r.shrink(1.5);
         if r.width() < 1.0 || r.height() < 1.0 {
             continue;
@@ -450,11 +511,21 @@ fn treemap(ui: &mut Ui, node: &Node, height: f32) -> Option<usize> {
         let base = node_color(child, k);
         let resp = ui.interact(r, ui.id().with(("treemap_cell", idx)), Sense::click());
         let hovered = resp.hovered();
-        let fill = if hovered { mix(base, Color32::WHITE, 0.18) } else { base };
+        let fill = if hovered {
+            mix(base, Color32::WHITE, 0.18)
+        } else {
+            base
+        };
         painter.rect_filled(r, Rounding::same(6.0), fill);
         if r.width() > 64.0 && r.height() > 40.0 {
             let p = painter.with_clip_rect(r.shrink(4.0));
-            p.text(r.left_top() + vec2(9.0, 8.0), Align2::LEFT_TOP, &child.name, widgets::semibold(13.5), Color32::WHITE);
+            p.text(
+                r.left_top() + vec2(9.0, 8.0),
+                Align2::LEFT_TOP,
+                &child.name,
+                widgets::semibold(13.5),
+                Color32::WHITE,
+            );
             p.text(
                 r.left_top() + vec2(9.0, 27.0),
                 Align2::LEFT_TOP,
@@ -464,7 +535,13 @@ fn treemap(ui: &mut Ui, node: &Node, height: f32) -> Option<usize> {
             );
         } else if r.width() > 46.0 && r.height() > 20.0 {
             let p = painter.with_clip_rect(r.shrink(3.0));
-            p.text(r.left_top() + vec2(6.0, 4.0), Align2::LEFT_TOP, &child.name, FontId::proportional(11.5), Color32::WHITE);
+            p.text(
+                r.left_top() + vec2(6.0, 4.0),
+                Align2::LEFT_TOP,
+                &child.name,
+                FontId::proportional(11.5),
+                Color32::WHITE,
+            );
         }
         let enterable = child.kind == NodeKind::Dir && !child.children.is_empty();
         let tip = format!(
@@ -554,8 +631,11 @@ enum AAct {
 impl App {
     pub fn start_analyze(&mut self, path: PathBuf, ctx: &egui::Context) {
         self.page = Page::Analyzer;
-        if self.analyzer.scan.running() {
-            self.toast(ToastKind::Info, "A scan is already running.");
+        if self.analyzer.scan.running() || self.analyzer.recycle.running() {
+            self.toast(
+                ToastKind::Info,
+                "Wait for the current scan or Recycle Bin operation to finish.",
+            );
             return;
         }
         let progress = Arc::new(Progress::default());
@@ -597,13 +677,28 @@ impl App {
                         self.analyzer.selected.remove(&p);
                         self.analyzer.removed.insert(p);
                     }
+                    self.analyzer
+                        .selected
+                        .retain(|p| !path_removed(p, &self.analyzer.removed));
                     if n > 0 {
-                        self.toast(ToastKind::Success, format!("Moved {} item(s), {}, to the Recycle Bin", n, fmt_bytes(rep.bytes)));
+                        self.toast(
+                            ToastKind::Success,
+                            format!(
+                                "Moved {} item(s), {}, to the Recycle Bin",
+                                n,
+                                fmt_bytes(rep.bytes)
+                            ),
+                        );
                     }
                     if let Some((p, why)) = rep.failed.first() {
                         self.toast(
                             ToastKind::Error,
-                            format!("{} item(s) not moved. {}: {}", rep.failed.len(), p.display(), why),
+                            format!(
+                                "{} item(s) not moved. {}: {}",
+                                rep.failed.len(),
+                                p.display(),
+                                why
+                            ),
                         );
                     }
                     self.sys.refresh_drives();
@@ -621,7 +716,10 @@ impl App {
             match a {
                 AAct::Scan(p) => self.start_analyze(p, &ctx),
                 AAct::PickFolder => {
-                    if let Some(p) = rfd::FileDialog::new().set_title("Choose a folder to analyze").pick_folder() {
+                    if let Some(p) = rfd::FileDialog::new()
+                        .set_title("Choose a folder to analyze")
+                        .pick_folder()
+                    {
                         self.start_analyze(p, &ctx);
                     }
                 }
@@ -663,7 +761,10 @@ impl App {
             .filter(|(p, _)| util::block_reason_fast(p).is_none())
             .collect();
         if items.is_empty() {
-            self.toast(ToastKind::Info, "Nothing to move. Protected items can't be selected.");
+            self.toast(
+                ToastKind::Info,
+                "Nothing to move. Protected items can't be selected.",
+            );
             return;
         }
         let total: u64 = items.iter().map(|i| i.1).sum();
@@ -677,7 +778,22 @@ impl App {
         }
         let appdata = items.iter().any(|(p, _)| util::in_appdata(p));
         let any_dir = items.iter().any(|(p, _)| p.is_dir());
+        // USB drives and network shares have no Recycle Bin: Windows deletes permanently there.
+        let removable: Vec<String> = self
+            .sys
+            .drives
+            .iter()
+            .filter(|d| d.removable)
+            .map(|d| util::norm(Path::new(&d.mount)))
+            .collect();
+        let permanent = items.iter().any(|(p, _)| {
+            let n = util::norm(p);
+            n.starts_with(r"\\") || removable.iter().any(|r| util::is_within(&n, r))
+        });
         let mut notes = Vec::new();
+        if permanent {
+            notes.push("Some items are on a USB or network drive, which has no Recycle Bin, so they will be deleted permanently.");
+        }
         if appdata {
             notes.push("Some items are inside AppData and may belong to an installed app.");
         }
@@ -703,34 +819,54 @@ impl App {
         widgets::page_header(
             ui,
             "Space analyzer",
-            "A map of exactly where your space goes, plus the biggest files and the ones you haven't touched in ages.",
+            "Map your disk space, find large files, and review files that have not changed in a long time.",
         );
         let scanning = a.scan.running();
 
         // Source picker
         ui.horizontal_wrapped(|ui| {
             for d in &self.sys.drives {
-                let label = format!("{}  {} free of {}", d.letter(), fmt_bytes(d.free), fmt_bytes(d.total));
+                let label = format!(
+                    "{}  {} free of {}",
+                    d.letter(),
+                    fmt_bytes(d.free),
+                    fmt_bytes(d.total)
+                );
                 let selected = a
                     .scan_root
                     .as_ref()
                     .map(|r| util::norm(r) == util::norm(Path::new(&d.mount)))
                     .unwrap_or(false);
                 if ui
-                    .add_enabled(!scanning, widgets::chip(widgets::icon_text(ic::DRIVE, &label, 14.0, TEXT), selected))
+                    .add_enabled(
+                        !scanning,
+                        widgets::chip(widgets::icon_text(ic::DRIVE, &label, 14.0, TEXT), selected),
+                    )
                     .clicked()
                 {
                     acts.push(AAct::Scan(PathBuf::from(&d.mount)));
                 }
             }
             if ui
-                .add_enabled(!scanning, widgets::chip(widgets::icon_text(ic::FOLDER, "Your user folder", 14.0, TEXT), false))
+                .add_enabled(
+                    !scanning,
+                    widgets::chip(
+                        widgets::icon_text(ic::FOLDER, "Your user folder", 14.0, TEXT),
+                        false,
+                    ),
+                )
                 .clicked()
             {
                 acts.push(AAct::Scan(util::folders().profile.clone()));
             }
             if ui
-                .add_enabled(!scanning, widgets::chip(widgets::icon_text(ic::SEARCH, "Choose a folder", 14.0, TEXT), false))
+                .add_enabled(
+                    !scanning,
+                    widgets::chip(
+                        widgets::icon_text(ic::SEARCH, "Choose a folder", 14.0, TEXT),
+                        false,
+                    ),
+                )
                 .clicked()
             {
                 acts.push(AAct::PickFolder);
@@ -743,7 +879,11 @@ impl App {
                 widgets::card(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.spinner();
-                        let root = a.scan_root.as_ref().map(|r| r.display().to_string()).unwrap_or_default();
+                        let root = a
+                            .scan_root
+                            .as_ref()
+                            .map(|r| r.display().to_string())
+                            .unwrap_or_default();
                         ui.label(widgets::strong(format!("Mapping {root}"), 17.0));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if ui.add(widgets::ghost("Stop")).clicked() {
@@ -752,7 +892,11 @@ impl App {
                         });
                     });
                     let secs = a.started.map(|s| s.elapsed().as_secs()).unwrap_or(0);
-                    ui.label(RichText::new(fmt_bytes(p.bytes.load(Ordering::Relaxed))).font(widgets::light(40.0)).color(TEXT));
+                    ui.label(
+                        RichText::new(fmt_bytes(p.bytes.load(Ordering::Relaxed)))
+                            .font(widgets::light(40.0))
+                            .color(TEXT),
+                    );
                     ui.label(widgets::dim(format!(
                         "{} files in {} folders so far, {}s",
                         fmt_num(p.files.load(Ordering::Relaxed)),
@@ -784,6 +928,9 @@ impl App {
 
         // Summary line
         ui.horizontal_wrapped(|ui| {
+            if ui.add_enabled(!a.recycle.running(), widgets::small("Rescan")).on_hover_text("Refresh this map after files have changed").clicked() {
+                acts.push(AAct::Scan(res.root_path.clone()));
+            }
             ui.label(RichText::new(fmt_bytes(res.root.size)).font(widgets::light(30.0)).color(TEXT));
             ui.label(widgets::dim(format!(
                 "in {} files and {} folders, mapped in {:.1}s.",
@@ -808,13 +955,18 @@ impl App {
                 }
             }
         });
+        if !a.removed.is_empty() {
+            ui.label(widgets::faint(
+                "Map totals reflect the scan. Rescan to refresh sizes after moving files.",
+            ));
+        }
         ui.add_space(4.0);
 
         ui.horizontal(|ui| {
             for (t, label) in [
                 (ATab::Folders, "Folders"),
                 (ATab::Largest, "Largest files"),
-                (ATab::Old, "Old and unused"),
+                (ATab::Old, "Old files"),
                 (ATab::Types, "File types"),
             ] {
                 if ui.add(widgets::chip(label, a.tab == t)).clicked() {
@@ -829,16 +981,20 @@ impl App {
             ATab::Largest => {
                 let filter = a.filter.to_lowercase();
                 let idx: Vec<usize> = (0..res.big.len())
-                    .filter(|&i| !a.removed.contains(&res.big[i].path))
+                    .filter(|&i| !path_removed(&res.big[i].path, &a.removed))
                     .filter(|&i| filter.is_empty() || res.big[i].lower.contains(&filter))
                     .take(1000)
                     .collect();
                 ui.horizontal(|ui| {
                     let mut f = a.filter.clone();
-                    if widgets::search_box(ui, &mut f, "Filter by name or folder", 280.0).changed() {
+                    if widgets::search_box(ui, &mut f, "Filter by name or folder", 280.0).changed()
+                    {
                         acts.push(AAct::Filter(f));
                     }
-                    ui.label(widgets::faint(format!("Files of 10 MB and up, {} shown", fmt_num(idx.len() as u64))));
+                    ui.label(widgets::faint(format!(
+                        "Files of 10 MB and up, {} shown",
+                        fmt_num(idx.len() as u64)
+                    )));
                 });
                 self.render_file_list(ui, res, &idx, acts);
             }
@@ -848,21 +1004,32 @@ impl App {
                     .filter(|&i| {
                         let f = &res.big[i];
                         f.size >= a.old_min
-                            && !a.removed.contains(&f.path)
-                            && f.modified.map(|m| util::age_days(m) >= min_days).unwrap_or(false)
+                            && !path_removed(&f.path, &a.removed)
+                            && f.modified
+                                .map(|m| util::age_days(m) >= min_days)
+                                .unwrap_or(false)
                     })
                     .take(1000)
                     .collect();
                 ui.horizontal_wrapped(|ui| {
                     ui.label(widgets::dim("Not changed in"));
-                    for (m, label) in [(6, "6 months"), (12, "1 year"), (24, "2 years"), (36, "3 years")] {
+                    for (m, label) in [
+                        (6, "6 months"),
+                        (12, "1 year"),
+                        (24, "2 years"),
+                        (36, "3 years"),
+                    ] {
                         if ui.add(widgets::chip(label, a.old_months == m)).clicked() {
                             acts.push(AAct::OldMonths(m));
                         }
                     }
                     ui.add_space(12.0);
                     ui.label(widgets::dim("At least"));
-                    for (b, label) in [(10u64 << 20, "10 MB"), (100 << 20, "100 MB"), (1 << 30, "1 GB")] {
+                    for (b, label) in [
+                        (10u64 << 20, "10 MB"),
+                        (100 << 20, "100 MB"),
+                        (1 << 30, "1 GB"),
+                    ] {
                         if ui.add(widgets::chip(label, a.old_min == b)).clicked() {
                             acts.push(AAct::OldMin(b));
                         }
@@ -888,14 +1055,24 @@ impl App {
         // Breadcrumb
         ui.horizontal_wrapped(|ui| {
             if ui
-                .add_enabled(!a.nav.is_empty(), widgets::small(widgets::icon_text(ic::BACK, "Up", 13.0, TEXT)))
+                .add_enabled(
+                    !a.nav.is_empty(),
+                    widgets::small(widgets::icon_text(ic::BACK, "Up", 13.0, TEXT)),
+                )
                 .clicked()
             {
                 acts.push(AAct::Up);
             }
             let root_label = res.root_path.display().to_string();
             if ui
-                .add(Label::new(RichText::new(root_label).color(if a.nav.is_empty() { TEXT } else { ACCENT })).sense(Sense::click()))
+                .add(
+                    Label::new(RichText::new(root_label).color(if a.nav.is_empty() {
+                        TEXT
+                    } else {
+                        ACCENT
+                    }))
+                    .sense(Sense::click()),
+                )
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
                 .clicked()
             {
@@ -908,7 +1085,10 @@ impl App {
                 ui.label(widgets::icon(ic::CHEVRON, 10.0, TEXT_FAINT));
                 let last = depth + 1 == a.nav.len();
                 if ui
-                    .add(Label::new(RichText::new(&c.name).color(if last { TEXT } else { ACCENT })).sense(Sense::click()))
+                    .add(
+                        Label::new(RichText::new(&c.name).color(if last { TEXT } else { ACCENT }))
+                            .sense(Sense::click()),
+                    )
                     .on_hover_cursor(egui::CursorIcon::PointingHand)
                     .clicked()
                 {
@@ -916,7 +1096,15 @@ impl App {
                 }
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.add(widgets::small(widgets::icon_text(ic::OPEN, "Open in Explorer", 13.0, TEXT))).clicked() {
+                if ui
+                    .add(widgets::small(widgets::icon_text(
+                        ic::OPEN,
+                        "Open in Explorer",
+                        13.0,
+                        TEXT,
+                    )))
+                    .clicked()
+                {
                     acts.push(AAct::Open(cur_path.clone()));
                 }
             });
@@ -930,13 +1118,13 @@ impl App {
 
         let parent = node.size.max(1) as f32;
         ScrollArea::vertical()
-            .id_source("folder_rows")
+            .id_salt("folder_rows")
             .auto_shrink([false, false])
             .show_rows(ui, 34.0, node.children.len(), |ui, range| {
                 for idx in range {
                     let child = &node.children[idx];
                     let child_path = cur_path.join(&child.name);
-                    let removed = a.removed.contains(&child_path);
+                    let removed = path_removed(&child_path, &a.removed);
                     widgets::row(ui, 34.0, |ui| {
                         let (icon_c, col) = match child.kind {
                             NodeKind::Dir => (ic::FOLDER, PALETTE[idx % PALETTE.len()]),
@@ -947,40 +1135,73 @@ impl App {
                         ui.label(widgets::icon(icon_c, 16.0, col));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             ui.add_space(6.0);
-                            let actionable = matches!(child.kind, NodeKind::Dir | NodeKind::File) && !removed;
+                            let actionable =
+                                matches!(child.kind, NodeKind::Dir | NodeKind::File) && !removed;
                             if actionable {
                                 let block = util::block_reason_fast(&child_path);
-                                let btn = ui.add_enabled(block.is_none(), widgets::small(widgets::icon(ic::CLEAN, 13.0, TEXT_DIM)));
+                                let btn = ui.add_enabled(
+                                    block.is_none(),
+                                    widgets::small(widgets::icon(ic::CLEAN, 13.0, TEXT_DIM)),
+                                );
                                 let btn = match block {
                                     Some(why) => btn.on_disabled_hover_text(why),
                                     None => btn.on_hover_text("Move to Recycle Bin"),
                                 };
                                 if btn.clicked() {
-                                    acts.push(AAct::AskRecycle(vec![(child_path.clone(), child.size)]));
+                                    acts.push(AAct::AskRecycle(vec![(
+                                        child_path.clone(),
+                                        child.size,
+                                    )]));
                                 }
-                                if ui.add(widgets::small(widgets::icon(ic::OPEN, 13.0, TEXT_DIM))).on_hover_text("Show in Explorer").clicked() {
+                                if ui
+                                    .add(widgets::small(widgets::icon(ic::OPEN, 13.0, TEXT_DIM)))
+                                    .on_hover_text("Show in Explorer")
+                                    .clicked()
+                                {
                                     acts.push(AAct::Show(child_path.clone()));
                                 }
                             }
-                            ui.add_sized([96.0, 20.0], Label::new(widgets::faint(fmt_age(child.modified))));
+                            ui.add_sized(
+                                [96.0, 20.0],
+                                Label::new(widgets::faint(fmt_age(child.modified))),
+                            );
                             let files = if child.kind == NodeKind::Denied {
                                 "no access".to_string()
                             } else {
                                 format!("{} files", fmt_num(child.files))
                             };
                             ui.add_sized([96.0, 20.0], Label::new(widgets::faint(files)));
-                            ui.add_sized([50.0, 20.0], Label::new(widgets::faint(format!("{:.0}%", child.size as f32 / parent * 100.0))));
-                            ui.add_sized([84.0, 20.0], Label::new(widgets::strong(fmt_bytes(child.size), 14.0)));
+                            ui.add_sized(
+                                [50.0, 20.0],
+                                Label::new(widgets::faint(format!(
+                                    "{:.0}%",
+                                    child.size as f32 / parent * 100.0
+                                ))),
+                            );
+                            ui.add_sized(
+                                [84.0, 20.0],
+                                Label::new(widgets::strong(fmt_bytes(child.size), 14.0)),
+                            );
                             widgets::bar(ui, child.size as f32 / parent, col, vec2(110.0, 6.0));
                             ui.add_space(8.0);
                             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                                let enterable = child.kind == NodeKind::Dir && !child.children.is_empty();
-                                let mut text = RichText::new(&child.name).color(if removed { TEXT_FAINT } else { TEXT });
+                                let enterable =
+                                    child.kind == NodeKind::Dir && !child.children.is_empty();
+                                let mut text = RichText::new(&child.name).color(if removed {
+                                    TEXT_FAINT
+                                } else {
+                                    TEXT
+                                });
                                 if removed {
                                     text = text.strikethrough();
                                 }
-                                let resp = ui.add(Label::new(text).truncate().sense(Sense::click()));
-                                let resp = if enterable { resp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { resp };
+                                let resp =
+                                    ui.add(Label::new(text).truncate().sense(Sense::click()));
+                                let resp = if enterable {
+                                    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+                                } else {
+                                    resp
+                                };
                                 if enterable && resp.clicked() {
                                     acts.push(AAct::Enter(idx));
                                 }
@@ -1009,7 +1230,7 @@ impl App {
         let sel_items: Vec<(PathBuf, u64)> = res
             .big
             .iter()
-            .filter(|f| a.selected.contains(&f.path) && !a.removed.contains(&f.path))
+            .filter(|f| a.selected.contains(&f.path) && !path_removed(&f.path, &a.removed))
             .map(|f| (f.path.clone(), f.size))
             .collect();
         let sel_total: u64 = sel_items.iter().map(|i| i.1).sum();
@@ -1027,13 +1248,22 @@ impl App {
                 if ui.add(widgets::small("Clear selection")).clicked() {
                     acts.push(AAct::ClearSel);
                 }
-                ui.label(widgets::dim(format!("{} selected, {}", sel_items.len(), fmt_bytes(sel_total))));
+                ui.label(widgets::dim(format!(
+                    "{} selected, {}",
+                    sel_items.len(),
+                    fmt_bytes(sel_total)
+                )));
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui
                     .add_enabled(
                         !sel_items.is_empty() && !a.recycle.running(),
-                        widgets::danger(widgets::icon_text(ic::CLEAN, "Move selected to Recycle Bin", 14.0, Color32::WHITE)),
+                        widgets::danger(widgets::icon_text(
+                            ic::CLEAN,
+                            "Move selected to Recycle Bin",
+                            14.0,
+                            Color32::WHITE,
+                        )),
                     )
                     .clicked()
                 {
@@ -1050,34 +1280,61 @@ impl App {
             return;
         }
         ScrollArea::vertical()
-            .id_source("big_files")
+            .id_salt("big_files")
             .auto_shrink([false, false])
             .show_rows(ui, 44.0, idx.len(), |ui, range| {
                 for &i in &idx[range] {
                     let f = &res.big[i];
                     widgets::row(ui, 44.0, |ui| {
                         let mut sel = a.selected.contains(&f.path);
-                        let cb = ui.add_enabled(f.block.is_none(), egui::Checkbox::new(&mut sel, ""));
+                        let cb =
+                            ui.add_enabled(f.block.is_none(), egui::Checkbox::new(&mut sel, ""));
                         if let Some(why) = f.block {
                             cb.on_disabled_hover_text(why);
                         } else if cb.changed() {
                             acts.push(AAct::Select(f.path.clone(), sel));
                         }
-                        let name = f.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                        let name = f
+                            .path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default();
                         let cat = classify(&ext_of(&name));
-                        ui.label(widgets::icon(if f.block.is_some() { ic::LOCK } else { ic::FILE }, 16.0, cat.color()));
+                        ui.label(widgets::icon(
+                            if f.block.is_some() {
+                                ic::LOCK
+                            } else {
+                                ic::FILE
+                            },
+                            16.0,
+                            cat.color(),
+                        ));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             ui.add_space(6.0);
-                            if ui.add(widgets::small(widgets::icon(ic::OPEN, 13.0, TEXT_DIM))).on_hover_text("Show in Explorer").clicked() {
+                            if ui
+                                .add(widgets::small(widgets::icon(ic::OPEN, 13.0, TEXT_DIM)))
+                                .on_hover_text("Show in Explorer")
+                                .clicked()
+                            {
                                 acts.push(AAct::Show(f.path.clone()));
                             }
-                            ui.add_sized([110.0, 20.0], Label::new(widgets::faint(fmt_age(f.modified))));
-                            ui.add_sized([88.0, 20.0], Label::new(widgets::strong(fmt_bytes(f.size), 14.0)));
+                            ui.add_sized(
+                                [110.0, 20.0],
+                                Label::new(widgets::faint(fmt_age(f.modified))),
+                            );
+                            ui.add_sized(
+                                [88.0, 20.0],
+                                Label::new(widgets::strong(fmt_bytes(f.size), 14.0)),
+                            );
                             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                                 ui.vertical(|ui| {
                                     ui.spacing_mut().item_spacing.y = 1.0;
                                     ui.add(Label::new(RichText::new(&name).color(TEXT)).truncate());
-                                    let folder = f.path.parent().map(|p| p.display().to_string()).unwrap_or_default();
+                                    let folder = f
+                                        .path
+                                        .parent()
+                                        .map(|p| p.display().to_string())
+                                        .unwrap_or_default();
                                     ui.add(Label::new(widgets::faint(folder)).truncate());
                                 });
                             });
@@ -1090,7 +1347,7 @@ impl App {
     fn render_types(&self, ui: &mut Ui, res: &ScanResult) {
         let total = res.root.size.max(1) as f32;
         ScrollArea::vertical()
-            .id_source("types_scroll")
+            .id_salt("types_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.columns(2, |cols| {
@@ -1106,8 +1363,12 @@ impl App {
                             if seg < 0.5 {
                                 continue;
                             }
-                            let r = Rect::from_min_max(pos2(x, rect.top()), pos2((x + seg).min(rect.right()), rect.bottom()));
-                            ui.painter().rect_filled(r, Rounding::same(2.0), cat.color());
+                            let r = Rect::from_min_max(
+                                pos2(x, rect.top()),
+                                pos2((x + seg).min(rect.right()), rect.bottom()),
+                            );
+                            ui.painter()
+                                .rect_filled(r, Rounding::same(2.0), cat.color());
                             x += seg;
                         }
                         ui.add_space(10.0);
@@ -1117,7 +1378,10 @@ impl App {
                                 ui.label(cat.label());
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     ui.label(widgets::faint(format!("{} files", fmt_num(*count))));
-                                    ui.add_sized([80.0, 20.0], Label::new(widgets::strong(fmt_bytes(*bytes), 14.0)));
+                                    ui.add_sized(
+                                        [80.0, 20.0],
+                                        Label::new(widgets::strong(fmt_bytes(*bytes), 14.0)),
+                                    );
                                 });
                             });
                         }
@@ -1128,17 +1392,75 @@ impl App {
                         let top = res.exts.first().map(|e| e.bytes).unwrap_or(1).max(1) as f32;
                         for e in res.exts.iter().take(25) {
                             ui.horizontal(|ui| {
-                                ui.add_sized([70.0, 20.0], Label::new(RichText::new(format!(".{}", e.ext)).color(TEXT)));
+                                ui.add_sized(
+                                    [70.0, 20.0],
+                                    Label::new(RichText::new(format!(".{}", e.ext)).color(TEXT)),
+                                );
                                 let bw = (ui.available_width() - 190.0).max(20.0);
-                                widgets::bar(ui, e.bytes as f32 / top, e.cat.color(), vec2(bw, 6.0));
+                                widgets::bar(
+                                    ui,
+                                    e.bytes as f32 / top,
+                                    e.cat.color(),
+                                    vec2(bw, 6.0),
+                                );
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     ui.label(widgets::faint(fmt_num(e.count)));
-                                    ui.add_sized([80.0, 20.0], Label::new(widgets::strong(fmt_bytes(e.bytes), 14.0)));
+                                    ui.add_sized(
+                                        [80.0, 20.0],
+                                        Label::new(widgets::strong(fmt_bytes(e.bytes), 14.0)),
+                                    );
                                 });
                             });
                         }
                     });
                 });
             });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn removed_folder_hides_descendants_but_not_neighbors() {
+        let removed = HashSet::from([PathBuf::from(r"C:\data\photos")]);
+        assert!(path_removed(
+            Path::new(r"C:\data\photos\trip.jpg"),
+            &removed
+        ));
+        assert!(!path_removed(
+            Path::new(r"C:\data\photos-old\trip.jpg"),
+            &removed
+        ));
+    }
+
+    #[test]
+    fn typescript_is_classified_as_code() {
+        assert!(matches!(classify("ts"), FileCat::Code));
+        assert!(matches!(classify("m2ts"), FileCat::Video));
+        assert_eq!(ext_of("script.TS"), "ts");
+    }
+
+    #[test]
+    fn map_layout_preserves_area_and_keeps_rectangles_inside_bounds() {
+        let bounds = Rect::from_min_size(pos2(5.0, 10.0), vec2(800.0, 400.0));
+        let cells = squarify(&[(0, 60.0), (1, 30.0), (2, 10.0)], bounds);
+        assert_eq!(cells.len(), 3);
+        let total: f32 = cells.iter().map(|(_, r)| r.area()).sum();
+        assert!((total - bounds.area()).abs() < 1.0);
+        for (_, cell) in cells {
+            assert!(bounds.contains_rect(cell));
+        }
+    }
+
+    #[test]
+    fn cancelled_scan_does_not_visit_folders() {
+        let progress = Arc::new(Progress::default());
+        progress.cancel.store(true, Ordering::Relaxed);
+        let result = scan(std::env::temp_dir(), progress);
+        assert!(result.cancelled);
+        assert_eq!(result.dirs, 0);
+        assert_eq!(result.root.files, 0);
     }
 }

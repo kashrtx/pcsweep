@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::os::windows::fs::MetadataExt;
 use std::os::windows::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
@@ -135,11 +136,36 @@ pub fn expand_env(s: &str) -> String {
     out
 }
 
-/// Lower-case, backslash-separated, no trailing slash, no \\?\ prefix.
+/// Case-insensitive Windows path key, including lexical `.`/`..` normalization.
+/// Verbatim and ordinary UNC paths must produce the same key for protection checks.
 pub fn norm(p: &Path) -> String {
     let mut s = p.to_string_lossy().replace('/', "\\").to_lowercase();
-    if let Some(r) = s.strip_prefix(r"\\?\") {
+    if let Some(r) = s.strip_prefix(r"\\?\unc\") {
+        s = format!(r"\\{r}");
+    } else if let Some(r) = s.strip_prefix(r"\\?\") {
         s = r.to_string();
+    }
+    // Almost every scanned path is already clean; avoid allocating/rebuilding
+    // each component on that hot path.
+    if s.split('\\').any(|part| part == "." || part == "..") {
+        let mut normalized = PathBuf::new();
+        for part in Path::new(&s).components() {
+            match part {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if matches!(
+                        normalized.components().next_back(),
+                        Some(Component::Normal(_))
+                    ) {
+                        normalized.pop();
+                    } else if !normalized.has_root() {
+                        normalized.push(part.as_os_str());
+                    }
+                }
+                _ => normalized.push(part.as_os_str()),
+            }
+        }
+        s = normalized.to_string_lossy().into_owned();
     }
     while s.ends_with('\\') && s.len() > 3 {
         s.pop();
@@ -234,7 +260,14 @@ pub fn folders() -> &'static Folders {
                 push_variants(&mut libraries, &p);
             }
         }
-        for d in ["Desktop", "Documents", "Pictures", "Music", "Videos", "OneDrive"] {
+        for d in [
+            "Desktop",
+            "Documents",
+            "Pictures",
+            "Music",
+            "Videos",
+            "OneDrive",
+        ] {
             push_variants(&mut libraries, &profile.join(d));
         }
         for var in ["OneDrive", "OneDriveConsumer", "OneDriveCommercial"] {
@@ -244,7 +277,13 @@ pub fn folders() -> &'static Folders {
         }
 
         let mut system = Vec::new();
-        for var in ["SystemRoot", "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "ProgramData"] {
+        for var in [
+            "SystemRoot",
+            "ProgramFiles",
+            "ProgramFiles(x86)",
+            "ProgramW6432",
+            "ProgramData",
+        ] {
             if let Some(p) = env(var) {
                 push_variants(&mut system, &p);
             }
@@ -275,6 +314,9 @@ pub fn junk_delete_allowed(p: &Path) -> bool {
 pub fn block_reason_fast(p: &Path) -> Option<&'static str> {
     let n = norm(p);
     let f = folders();
+    if !p.is_absolute() {
+        return Some("An absolute path is required");
+    }
     if within_any(&n, &f.downloads) {
         return Some("In Downloads, which PCSweep never deletes from");
     }
@@ -291,7 +333,7 @@ pub fn block_reason_fast(p: &Path) -> Option<&'static str> {
     ) {
         return Some("Managed by Windows. See Tools");
     }
-    if n.len() <= 3 {
+    if n.len() <= 3 || p.parent().is_none() {
         return Some("Drive root");
     }
     // Never allow removing a folder that *contains* something protected.
@@ -301,10 +343,26 @@ pub fn block_reason_fast(p: &Path) -> Option<&'static str> {
     if f.downloads.iter().any(|d| is_within(d, &n)) {
         return Some("Contains your Downloads folder");
     }
-    if f.system.iter().chain(f.libraries.iter()).any(|d| is_within(d, &n)) {
+    if f.system
+        .iter()
+        .chain(f.libraries.iter())
+        .any(|d| is_within(d, &n))
+    {
         return Some("Contains a protected folder");
     }
     None
+}
+
+/// Reject links anywhere along the path, including a cache directory replaced
+/// by a junction between scanning and cleaning. Metadata errors fail closed.
+fn has_reparse_ancestor(p: &Path) -> Result<bool, String> {
+    for ancestor in p.ancestors() {
+        let md = fs::symlink_metadata(ancestor).map_err(|e| e.to_string())?;
+        if is_reparse(&md) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Full check, also resolving links/short names on disk.
@@ -312,12 +370,15 @@ pub fn block_reason(p: &Path) -> Option<&'static str> {
     if let Some(r) = block_reason_fast(p) {
         return Some(r);
     }
-    if let Ok(c) = fs::canonicalize(p) {
-        if let Some(r) = block_reason_fast(&c) {
-            return Some(r);
-        }
+    match has_reparse_ancestor(p) {
+        Ok(false) => {}
+        Ok(true) => return Some("Links and junctions are protected"),
+        Err(_) => return Some("The item could not be checked; scan again"),
     }
-    None
+    match fs::canonicalize(p) {
+        Ok(c) => block_reason_fast(&c),
+        Err(_) => Some("The item could not be checked; scan again"),
+    }
 }
 
 pub fn in_appdata(p: &Path) -> bool {
@@ -326,24 +387,45 @@ pub fn in_appdata(p: &Path) -> bool {
 
 // ---------------------------------------------------------------- deleting
 
-/// Permanently deletes one junk file. Refuses protected locations, folders and links.
-pub fn delete_junk_file(p: &Path) -> Result<u64, String> {
-    if !junk_delete_allowed(p) {
+/// Permanently deletes a reviewed junk file only if it still matches the scan.
+/// Canonical protection and ancestor checks are repeated at deletion time.
+pub fn delete_junk_file(
+    p: &Path,
+    expected_size: u64,
+    expected_modified: Option<SystemTime>,
+    expected_created: Option<SystemTime>,
+) -> Result<u64, String> {
+    if !p.is_absolute() || !junk_delete_allowed(p) || has_reparse_ancestor(p)? {
         return Err("protected".into());
     }
-    let md = fs::symlink_metadata(p).map_err(|e| e.to_string())?;
-    if md.is_dir() || is_reparse(&md) {
+    let resolved = fs::canonicalize(p).map_err(|e| e.to_string())?;
+    if !junk_delete_allowed(&resolved) {
+        return Err("protected".into());
+    }
+    let md = fs::symlink_metadata(&resolved).map_err(|e| e.to_string())?;
+    if !md.is_file() || is_reparse(&md) || md.file_attributes() & CLOUD_MASK != 0 {
         return Err("skipped".into());
     }
+    if md.len() != expected_size
+        || md.modified().ok() != expected_modified
+        || md.created().ok() != expected_created
+    {
+        return Err("changed since scan".into());
+    }
     let size = md.len();
-    match fs::remove_file(p) {
+    match fs::remove_file(&resolved) {
         Ok(()) => Ok(size),
         Err(e) => {
             if md.permissions().readonly() {
-                let mut perm = md.permissions();
+                let original = md.permissions();
+                let mut perm = original.clone();
                 perm.set_readonly(false);
-                if fs::set_permissions(p, perm).is_ok() && fs::remove_file(p).is_ok() {
-                    return Ok(size);
+                if fs::set_permissions(&resolved, perm).is_ok() {
+                    if fs::remove_file(&resolved).is_ok() {
+                        return Ok(size);
+                    }
+                    // A locked file should keep its original read-only attribute.
+                    let _ = fs::set_permissions(&resolved, original);
                 }
             }
             Err(e.to_string())
@@ -355,12 +437,18 @@ pub fn delete_junk_file(p: &Path) -> Result<u64, String> {
 pub fn remove_empty_dirs(mut dirs: Vec<PathBuf>) {
     dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
     for d in dirs {
-        if !junk_delete_allowed(&d) {
+        if !junk_delete_allowed(&d) || has_reparse_ancestor(&d) != Ok(false) {
             continue;
         }
-        if let Ok(md) = fs::symlink_metadata(&d) {
+        let Ok(resolved) = fs::canonicalize(&d) else {
+            continue;
+        };
+        if !junk_delete_allowed(&resolved) {
+            continue;
+        }
+        if let Ok(md) = fs::symlink_metadata(&resolved) {
             if md.is_dir() && !is_reparse(&md) {
-                let _ = fs::remove_dir(&d);
+                let _ = fs::remove_dir(&resolved);
             }
         }
     }
@@ -387,7 +475,11 @@ pub fn recycle(items: Vec<(PathBuf, u64)>) -> RecycleReport {
         }
         match trash::delete(&p) {
             Ok(()) => {
-                lines.push(format!("  moved to Recycle Bin: {} ({})", p.display(), fmt_bytes(size)));
+                lines.push(format!(
+                    "  moved to Recycle Bin: {} ({})",
+                    p.display(),
+                    fmt_bytes(size)
+                ));
                 rep.bytes += size;
                 rep.done.push(p);
             }
@@ -435,6 +527,20 @@ pub fn log(msg: impl AsRef<str>) {
     append_file(&[line]);
 }
 
+/// Loads recent history from the log file so the Activity page shows past sessions too.
+pub fn load_log_history() {
+    let Ok(text) = fs::read_to_string(log_path()) else {
+        return;
+    };
+    let lines: Vec<&str> = text.lines().filter(|l| l.starts_with('[')).collect();
+    let start = lines.len().saturating_sub(500);
+    if let Ok(mut l) = LOG.lock() {
+        let mut old: Vec<String> = lines[start..].iter().map(|s| s.to_string()).collect();
+        old.append(&mut l);
+        *l = old;
+    }
+}
+
 pub fn log_file_only(lines: &[String]) {
     if !lines.is_empty() {
         append_file(lines);
@@ -462,6 +568,43 @@ pub fn log_lines() -> Vec<String> {
     LOG.lock().map(|l| l.clone()).unwrap_or_default()
 }
 
+// ---------------------------------------------------------------- settings
+
+pub fn settings_path() -> PathBuf {
+    log_path().with_file_name("settings.txt")
+}
+
+/// Simple key=value settings stored next to the activity log.
+pub fn load_settings() -> HashMap<String, String> {
+    let mut m = HashMap::new();
+    if let Ok(text) = fs::read_to_string(settings_path()) {
+        for line in text.lines() {
+            if let Some((k, v)) = line.split_once('=') {
+                m.insert(k.trim().to_string(), v.trim().to_string());
+            }
+        }
+    }
+    m
+}
+
+pub fn save_settings(pairs: &[(String, String)]) {
+    let mut m = load_settings();
+    for (k, v) in pairs {
+        m.insert(k.clone(), v.clone());
+    }
+    let mut keys: Vec<&String> = m.keys().collect();
+    keys.sort();
+    let text: String = keys
+        .into_iter()
+        .map(|k| format!("{}={}\n", k, m[k]))
+        .collect();
+    let p = settings_path();
+    if let Some(d) = p.parent() {
+        let _ = fs::create_dir_all(d);
+    }
+    let _ = fs::write(p, text);
+}
+
 // ---------------------------------------------------------------- shell
 
 pub fn show_in_explorer(p: &Path) {
@@ -486,4 +629,85 @@ pub fn hidden_command(program: &str) -> Command {
     let mut c = Command::new(program);
     c.creation_flags(CREATE_NO_WINDOW);
     c
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct TempFolder(PathBuf);
+    impl TempFolder {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let p = std::env::temp_dir().join(format!(
+                "pcsweep-safety-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+    }
+    impl Drop for TempFolder {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn path_protection_handles_aliases_and_boundaries() {
+        assert_eq!(
+            norm(Path::new(r"\\?\C:\Users\Me\Cache\..\Downloads\.\")),
+            r"c:\users\me\downloads"
+        );
+        assert_eq!(
+            norm(Path::new(r"\\?\UNC\Server\Share\Downloads\")),
+            norm(Path::new(r"\\server\share\downloads"))
+        );
+        assert!(is_within(r"c:\downloads\file.txt", r"c:\downloads"));
+        assert!(!is_within(r"c:\downloads-old\file.txt", r"c:\downloads"));
+        assert!(block_reason_fast(Path::new(r"\\server\share\")).is_some());
+        assert!(block_reason_fast(Path::new(r"relative\file.txt")).is_some());
+    }
+
+    #[test]
+    fn cleanup_keeps_files_that_changed_after_review() {
+        let tmp = TempFolder::new();
+        let p = tmp.0.join("cache.dat");
+        fs::write(&p, b"reviewed").unwrap();
+        let md = fs::metadata(&p).unwrap();
+        fs::write(&p, b"new work since review").unwrap();
+        assert!(delete_junk_file(&p, md.len(), md.modified().ok(), md.created().ok()).is_err());
+        assert_eq!(fs::read(&p).unwrap(), b"new work since review");
+    }
+
+    #[test]
+    fn cleanup_removes_an_unchanged_reviewed_file() {
+        let tmp = TempFolder::new();
+        let p = tmp.0.join("cache.dat");
+        fs::write(&p, b"cache").unwrap();
+        let md = fs::metadata(&p).unwrap();
+        assert_eq!(
+            delete_junk_file(&p, md.len(), md.modified().ok(), md.created().ok()),
+            Ok(5)
+        );
+        assert!(!p.exists());
+    }
+
+    #[test]
+    fn cleanup_keeps_files_with_an_unexpected_timestamp() {
+        let tmp = TempFolder::new();
+        let p = tmp.0.join("cache.dat");
+        fs::write(&p, b"cache").unwrap();
+        let md = fs::metadata(&p).unwrap();
+        assert!(delete_junk_file(
+            &p,
+            md.len(),
+            Some(SystemTime::UNIX_EPOCH),
+            md.created().ok()
+        )
+        .is_err());
+        assert!(p.exists());
+    }
 }

@@ -52,10 +52,16 @@ pub enum Origin {
 /// Everything that changes the system goes through a confirmation dialog first.
 pub enum Action {
     CleanJunk,
-    Recycle { items: Vec<(PathBuf, u64)>, origin: Origin },
-    Kill { pids: Vec<u32>, name: String },
+    Recycle {
+        items: Vec<(PathBuf, u64)>,
+        origin: Origin,
+    },
+    Kill {
+        pids: Vec<(u32, u64)>,
+        name: String,
+    },
     RunTool(usize),
-    Uninstall(usize),
+    Uninstall(crate::apps::InstalledApp),
 }
 
 pub struct Modal {
@@ -82,6 +88,7 @@ pub struct App {
     pub modal: Option<Modal>,
     pub toasts: Vec<Toast>,
     pub relaunch: Task<bool>,
+    activity_filter: String,
 }
 
 impl App {
@@ -103,7 +110,9 @@ impl App {
             modal: None,
             toasts: Vec::new(),
             relaunch: Task::default(),
+            activity_filter: String::new(),
         };
+        util::load_log_history();
         util::log(format!(
             "PCSweep {} started{}",
             env!("CARGO_PKG_VERSION"),
@@ -133,10 +142,26 @@ impl App {
     }
 
     fn start_recycle(&mut self, items: Vec<(PathBuf, u64)>, origin: Origin, ctx: &egui::Context) {
-        let task = Task::spawn(ctx, move || util::recycle(items));
+        if self.cleaner.clean.running()
+            || self.analyzer.recycle.running()
+            || self.dups.recycle.running()
+        {
+            self.toast(
+                ToastKind::Info,
+                "A cleanup is already running. Wait for it to finish before moving more files.",
+            );
+            return;
+        }
         match origin {
-            Origin::Analyzer => self.analyzer.recycle = task,
-            Origin::Duplicates => self.dups.recycle = task,
+            Origin::Analyzer => {
+                self.analyzer.recycle = Task::spawn(ctx, move || util::recycle(items));
+            }
+            Origin::Duplicates => {
+                let groups = self.dups.groups.clone().unwrap_or_default();
+                self.dups.recycle = Task::spawn(ctx, move || {
+                    crate::duplicates::recycle_verified(items, groups)
+                });
+            }
         }
     }
 
@@ -147,14 +172,25 @@ impl App {
             Action::Kill { pids, name } => {
                 let n = self.sys.kill(&pids);
                 util::log(format!("Ended {name} ({n} process(es))"));
-                if n > 0 {
+                if n == pids.len() && n > 0 {
                     self.toast(ToastKind::Success, format!("Ended {name}"));
+                } else if n > 0 {
+                    self.toast(
+                        ToastKind::Info,
+                        format!(
+                        "Ended {n} of {} processes for {name}. Some exited or could not be ended.",
+                        pids.len()
+                    ),
+                    );
                 } else {
-                    self.toast(ToastKind::Error, format!("{name} could not be ended. It may need administrator rights."));
+                    self.toast(
+                        ToastKind::Error,
+                        format!("{name} could not be ended. It may need administrator rights."),
+                    );
                 }
             }
             Action::RunTool(i) => self.start_tool(i, ctx),
-            Action::Uninstall(i) => self.launch_uninstall(i),
+            Action::Uninstall(app) => self.launch_uninstall(&app),
         }
     }
 
@@ -194,14 +230,25 @@ impl App {
         let ctx = ui.ctx().clone();
         ui.horizontal(|ui| {
             let (rect, _) = ui.allocate_exact_size(vec2(36.0, 36.0), egui::Sense::hover());
-            ui.painter().rect_filled(rect, Rounding::same(10.0), ACCENT_STRONG);
-            ui.painter().circle_stroke(rect.center(), 9.0, Stroke::new(2.5, Color32::WHITE));
-            ui.painter().circle_filled(rect.center(), 3.0, Color32::WHITE);
+            ui.painter()
+                .rect_filled(rect, Rounding::same(10.0), ACCENT_STRONG);
+            ui.painter()
+                .circle_stroke(rect.center(), 9.0, Stroke::new(2.5_f32, Color32::WHITE));
+            ui.painter()
+                .circle_filled(rect.center(), 3.0, Color32::WHITE);
             ui.add_space(4.0);
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
-                ui.label(RichText::new("PCSweep").font(widgets::semibold(19.0)).color(TEXT));
-                ui.label(RichText::new("Keep your PC clean and quick").size(11.5).color(TEXT_FAINT));
+                ui.label(
+                    RichText::new("PCSweep")
+                        .font(widgets::semibold(19.0))
+                        .color(TEXT),
+                );
+                ui.label(
+                    RichText::new("Keep your PC clean and quick")
+                        .size(11.5)
+                        .color(TEXT_FAINT),
+                );
             });
         });
         ui.add_space(22.0);
@@ -261,17 +308,30 @@ impl App {
         let busy = self.relaunch.running();
         let is_admin = self.is_admin;
         ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
-            ui.label(widgets::faint(format!("Version {}", env!("CARGO_PKG_VERSION"))));
+            ui.label(widgets::faint(format!(
+                "Version {}",
+                env!("CARGO_PKG_VERSION")
+            )));
             ui.add_space(6.0);
             if is_admin {
                 ui.horizontal(|ui| {
                     ui.label(widgets::icon(ic::SHIELD, 13.0, GOOD));
-                    ui.label(RichText::new("Running as administrator").color(GOOD).size(12.5));
+                    ui.label(
+                        RichText::new("Running as administrator")
+                            .color(GOOD)
+                            .size(12.5),
+                    );
                 });
             } else {
                 ui.label(widgets::faint("Unlocks system-level cleanup"));
                 let w = ui.available_width();
-                let btn = widgets::ghost(widgets::icon_text(ic::SHIELD, "Restart as admin", 13.5, WARN)).min_size(vec2(w, 34.0));
+                let btn = widgets::ghost(widgets::icon_text(
+                    ic::SHIELD,
+                    "Restart as admin",
+                    13.5,
+                    WARN,
+                ))
+                .min_size(vec2(w, 34.0));
                 if ui.add_enabled(!busy, btn).clicked() {
                     want_relaunch = true;
                 }
@@ -288,9 +348,10 @@ impl App {
         widgets::page_header(
             ui,
             "Activity log",
-            "Everything PCSweep has cleaned, moved or changed. It's also saved on disk.",
+            "Everything PCSweep has cleaned, moved or changed, newest first. It's saved on disk, so earlier sessions are here too.",
         );
         let path = util::log_path();
+        let lines = util::log_lines();
         ui.horizontal(|ui| {
             if ui.add(widgets::small("Open log file")).clicked() {
                 util::open_path(&path);
@@ -300,17 +361,48 @@ impl App {
             }
             ui.label(widgets::faint(path.display().to_string()));
         });
+        ui.horizontal(|ui| {
+            widgets::search_box(ui, &mut self.activity_filter, "Search activity", 260.0);
+            if !self.activity_filter.is_empty() && ui.add(widgets::small("Clear")).clicked() {
+                self.activity_filter.clear();
+            }
+            if ui.add(widgets::small("Copy visible log")).clicked() {
+                let query = self.activity_filter.trim().to_lowercase();
+                let text = lines
+                    .iter()
+                    .rev()
+                    .filter(|line| query.is_empty() || line.to_lowercase().contains(&query))
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                ui.output_mut(|output| output.copied_text = text);
+            }
+        });
         ui.add_space(4.0);
-        let lines = util::log_lines();
+        let query = self.activity_filter.trim().to_lowercase();
+        let visible: Vec<_> = lines
+            .iter()
+            .rev()
+            .filter(|line| query.is_empty() || line.to_lowercase().contains(&query))
+            .collect();
+        ui.label(widgets::faint(format!(
+            "{} of {} entries",
+            visible.len(),
+            lines.len()
+        )));
         widgets::card(ui, |ui| {
             ScrollArea::vertical()
-                .id_source("activity_scroll")
+                .id_salt("activity_scroll")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    if lines.is_empty() {
-                        ui.label(widgets::dim("Nothing yet this session."));
+                    if visible.is_empty() {
+                        ui.label(widgets::dim(if query.is_empty() {
+                            "No activity recorded yet."
+                        } else {
+                            "No activity matches your search."
+                        }));
                     }
-                    for l in lines.iter().rev() {
+                    for &l in &visible {
                         ui.label(RichText::new(l).monospace().size(12.5).color(TEXT_DIM));
                     }
                 });
@@ -322,7 +414,11 @@ impl App {
     fn modal_ui(&mut self, ctx: &egui::Context) {
         let Some(modal) = &self.modal else { return };
         ctx.layer_painter(LayerId::new(Order::PanelResizeLine, Id::new("modal_dim")))
-            .rect_filled(ctx.screen_rect(), Rounding::ZERO, Color32::from_black_alpha(160));
+            .rect_filled(
+                ctx.screen_rect(),
+                Rounding::ZERO,
+                Color32::from_black_alpha(160),
+            );
 
         let mut decision: Option<bool> = None;
         egui::Window::new("pcsweep_confirm")
@@ -333,14 +429,18 @@ impl App {
             .frame(
                 Frame::window(&ctx.style())
                     .fill(CARD)
-                    .stroke(Stroke::new(1.0, BORDER))
+                    .stroke(Stroke::new(1.0_f32, BORDER))
                     .rounding(Rounding::same(16.0))
                     .inner_margin(Margin::same(24.0)),
             )
             .show(ctx, |ui| {
                 ui.set_width(470.0);
                 ui.horizontal(|ui| {
-                    let (c, col) = if modal.danger { (ic::WARN, BAD) } else { (ic::INFO, ACCENT) };
+                    let (c, col) = if modal.danger {
+                        (ic::WARN, BAD)
+                    } else {
+                        (ic::INFO, ACCENT)
+                    };
                     ui.label(widgets::icon(c, 20.0, col));
                     ui.add(Label::new(widgets::strong(&modal.title, 19.0)).wrap());
                 });
@@ -355,11 +455,12 @@ impl App {
                         .show(ui, |ui| {
                             ui.set_min_width(ui.available_width());
                             ScrollArea::vertical()
-                                .id_source("modal_details")
+                                .id_salt("modal_details")
                                 .max_height(180.0)
                                 .show(ui, |ui| {
                                     for d in &modal.details {
-                                        ui.add(Label::new(widgets::faint(d)).truncate());
+                                        ui.add(Label::new(widgets::faint(d)).truncate())
+                                            .on_hover_text(d);
                                     }
                                 });
                         });
@@ -370,19 +471,23 @@ impl App {
                 }
                 ui.add_space(12.0);
                 let w = ui.available_width();
-                ui.allocate_ui_with_layout(vec2(w, 36.0), Layout::right_to_left(Align::Center), |ui| {
-                    let btn = if modal.danger {
-                        widgets::danger(modal.confirm.clone())
-                    } else {
-                        widgets::primary(modal.confirm.clone())
-                    };
-                    if ui.add(btn).clicked() {
-                        decision = Some(true);
-                    }
-                    if ui.add(widgets::ghost("Cancel")).clicked() {
-                        decision = Some(false);
-                    }
-                });
+                ui.allocate_ui_with_layout(
+                    vec2(w, 36.0),
+                    Layout::right_to_left(Align::Center),
+                    |ui| {
+                        let btn = if modal.danger {
+                            widgets::danger(modal.confirm.clone())
+                        } else {
+                            widgets::primary(modal.confirm.clone())
+                        };
+                        if ui.add(btn).clicked() {
+                            decision = Some(true);
+                        }
+                        if ui.add(widgets::ghost("Cancel")).clicked() {
+                            decision = Some(false);
+                        }
+                    },
+                );
             });
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
             decision = Some(false);
@@ -397,7 +502,8 @@ impl App {
     }
 
     fn toasts_ui(&mut self, ctx: &egui::Context) {
-        self.toasts.retain(|t| t.born.elapsed() < Duration::from_secs(6));
+        self.toasts
+            .retain(|t| t.born.elapsed() < Duration::from_secs(6));
         if self.toasts.is_empty() {
             return;
         }
@@ -415,7 +521,7 @@ impl App {
                     };
                     Frame::none()
                         .fill(CARD_HI)
-                        .stroke(Stroke::new(1.0, mix(CARD_HI, col, 0.5)))
+                        .stroke(Stroke::new(1.0_f32, mix(CARD_HI, col, 0.5)))
                         .rounding(Rounding::same(12.0))
                         .inner_margin(Margin::symmetric(14.0, 10.0))
                         .show(ui, |ui| {
@@ -445,13 +551,21 @@ impl eframe::App for App {
             .exact_width(236.0)
             .resizable(false)
             .show_separator_line(false)
-            .frame(Frame::none().fill(SIDEBAR).inner_margin(Margin::symmetric(14.0, 20.0)))
+            .frame(
+                Frame::none()
+                    .fill(SIDEBAR)
+                    .inner_margin(Margin::symmetric(14.0, 20.0)),
+            )
             .show(ctx, |ui| {
                 ui.add_enabled_ui(enabled, |ui| self.sidebar(ui));
             });
 
         egui::CentralPanel::default()
-            .frame(Frame::none().fill(BG).inner_margin(Margin::symmetric(30.0, 22.0)))
+            .frame(
+                Frame::none()
+                    .fill(BG)
+                    .inner_margin(Margin::symmetric(30.0, 22.0)),
+            )
             .show(ctx, |ui| {
                 ui.add_enabled_ui(enabled, |ui| match self.page {
                     Page::Dashboard => self.page_dashboard(ui),

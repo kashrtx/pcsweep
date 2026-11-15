@@ -1,8 +1,8 @@
 use crate::theme::*;
 use eframe::egui::{
     self, pos2, text::LayoutJob, vec2, Align, Align2, Button, Color32, FontFamily, FontId, Frame,
-    Layout, Margin, Rect, Response, RichText, Rounding, Sense, Shape, Stroke, TextFormat, Ui,
-    Vec2, WidgetText,
+    Layout, Margin, Rect, Response, RichText, Rounding, Sense, Shape, Stroke, TextFormat, Ui, Vec2,
+    WidgetText,
 };
 
 /// Segoe Fluent Icons / Segoe MDL2 Assets code points.
@@ -57,7 +57,9 @@ pub fn icon_font(size: f32) -> FontId {
 }
 
 pub fn icon(c: char, size: f32, color: Color32) -> RichText {
-    RichText::new(c.to_string()).font(icon_font(size)).color(color)
+    RichText::new(c.to_string())
+        .font(icon_font(size))
+        .color(color)
 }
 
 /// Icon + label in one piece of text (for buttons and chips).
@@ -114,7 +116,7 @@ pub fn card_frame() -> Frame {
     Frame::none()
         .fill(CARD)
         .rounding(Rounding::same(14.0))
-        .stroke(Stroke::new(1.0, BORDER))
+        .stroke(Stroke::new(1.0_f32, BORDER))
         .inner_margin(Margin::same(18.0))
 }
 
@@ -122,7 +124,7 @@ pub fn tight_frame() -> Frame {
     Frame::none()
         .fill(CARD)
         .rounding(Rounding::same(10.0))
-        .stroke(Stroke::new(1.0, BORDER))
+        .stroke(Stroke::new(1.0_f32, BORDER))
         .inner_margin(Margin::symmetric(14.0, 10.0))
 }
 
@@ -154,7 +156,7 @@ pub fn danger(text: impl Into<WidgetText>) -> Button<'static> {
 pub fn ghost(text: impl Into<WidgetText>) -> Button<'static> {
     Button::new(text)
         .fill(CARD_HI)
-        .stroke(Stroke::new(1.0, BORDER))
+        .stroke(Stroke::new(1.0_f32, BORDER))
         .rounding(Rounding::same(9.0))
         .min_size(vec2(0.0, 34.0))
 }
@@ -168,9 +170,9 @@ pub fn small(text: impl Into<WidgetText>) -> Button<'static> {
 
 pub fn chip(text: impl Into<WidgetText>, selected: bool) -> Button<'static> {
     let (fill, stroke) = if selected {
-        (ACCENT_SOFT, Stroke::new(1.0, ACCENT))
+        (ACCENT_SOFT, Stroke::new(1.0_f32, ACCENT))
     } else {
-        (CARD, Stroke::new(1.0, BORDER))
+        (CARD, Stroke::new(1.0_f32, BORDER))
     };
     Button::new(text)
         .fill(fill)
@@ -179,15 +181,32 @@ pub fn chip(text: impl Into<WidgetText>, selected: bool) -> Button<'static> {
         .min_size(vec2(0.0, 32.0))
 }
 
+/// A small rounded label. Drawn directly so it never stretches to fill a row.
 pub fn badge(ui: &mut Ui, text: &str, color: Color32) -> Response {
-    Frame::none()
-        .fill(mix(CARD, color, 0.16))
-        .rounding(Rounding::same(6.0))
-        .inner_margin(Margin::symmetric(7.0, 1.0))
-        .show(ui, |ui| {
-            ui.label(RichText::new(text).size(11.5).color(color));
-        })
-        .response
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), FontId::proportional(11.5), color);
+    let size = galley.size() + vec2(14.0, 6.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
+    ui.painter()
+        .rect_filled(rect, Rounding::same(6.0), mix(CARD, color, 0.16));
+    ui.painter()
+        .galley(rect.center() - galley.size() / 2.0, galley, color);
+    resp
+}
+
+/// A fixed-width text cell, left or right aligned, truncated if too long.
+pub fn cell(ui: &mut Ui, width: f32, right: bool, text: impl Into<WidgetText>) -> Response {
+    let layout = if right {
+        Layout::right_to_left(Align::Center)
+    } else {
+        Layout::left_to_right(Align::Center)
+    };
+    ui.allocate_ui_with_layout(vec2(width, 20.0), layout, |ui| {
+        ui.set_width(width);
+        ui.add(egui::Label::new(text).truncate())
+    })
+    .inner
 }
 
 pub fn dot(ui: &mut Ui, color: Color32) {
@@ -210,12 +229,24 @@ pub fn bar(ui: &mut Ui, frac: f32, color: Color32, size: Vec2) -> Response {
 }
 
 /// A circular gauge with a big light numeral in the middle.
-pub fn ring(ui: &mut Ui, frac: f32, diameter: f32, thickness: f32, color: Color32, big: &str, small_text: &str) {
+pub fn ring(
+    ui: &mut Ui,
+    frac: f32,
+    diameter: f32,
+    thickness: f32,
+    color: Color32,
+    big: &str,
+    small_text: &str,
+) {
     let (rect, _) = ui.allocate_exact_size(vec2(diameter, diameter), Sense::hover());
     let c = rect.center();
     let rad = diameter / 2.0 - thickness / 2.0;
     let painter = ui.painter();
-    painter.circle_stroke(c, rad, Stroke::new(thickness, Color32::from_rgb(40, 46, 60)));
+    painter.circle_stroke(
+        c,
+        rad,
+        Stroke::new(thickness, Color32::from_rgb(40, 46, 60)),
+    );
     let f = frac.clamp(0.0, 1.0);
     if f > 0.0 {
         let n = 120usize;
@@ -249,7 +280,11 @@ pub fn ring(ui: &mut Ui, frac: f32, diameter: f32, thickness: f32, color: Color3
 /// iOS-style switch. Returns the response; check `.clicked()`.
 pub fn toggle(ui: &mut Ui, on: bool, enabled: bool) -> Response {
     let size = vec2(40.0, 22.0);
-    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
     let (rect, resp) = ui.allocate_exact_size(size, sense);
     let t = ui.ctx().animate_bool(resp.id, on);
     let off_col = Color32::from_rgb(58, 66, 86);
@@ -269,14 +304,23 @@ pub fn toggle(ui: &mut Ui, on: bool, enabled: bool) -> Response {
     }
 }
 
-pub fn nav_item(ui: &mut Ui, icon_char: char, label: &str, selected: bool, badge_text: Option<&str>) -> Response {
+pub fn nav_item(
+    ui: &mut Ui,
+    icon_char: char,
+    label: &str,
+    selected: bool,
+    badge_text: Option<&str>,
+) -> Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::click());
     let hovered = resp.hovered();
     let painter = ui.painter();
     if selected {
         painter.rect_filled(rect, Rounding::same(9.0), ACCENT_SOFT);
         painter.rect_filled(
-            Rect::from_min_size(pos2(rect.left(), rect.top() + 10.0), vec2(3.0, rect.height() - 20.0)),
+            Rect::from_min_size(
+                pos2(rect.left(), rect.top() + 10.0),
+                vec2(3.0, rect.height() - 20.0),
+            ),
             Rounding::same(2.0),
             ACCENT,
         );
@@ -314,11 +358,15 @@ pub fn nav_item(ui: &mut Ui, icon_char: char, label: &str, selected: bool, badge
 pub fn row<R>(ui: &mut Ui, height: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
     let bg = ui.painter().add(Shape::Noop);
     let width = ui.available_width();
-    let inner = ui.allocate_ui_with_layout(vec2(width, height), Layout::left_to_right(Align::Center), |ui| {
-        ui.set_min_size(vec2(width, height));
-        ui.add_space(6.0);
-        add(ui)
-    });
+    let inner = ui.allocate_ui_with_layout(
+        vec2(width, height),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            ui.set_min_size(vec2(width, height));
+            ui.add_space(6.0);
+            add(ui)
+        },
+    );
     let rect = inner.response.rect;
     if ui.rect_contains_pointer(rect) {
         ui.painter()
@@ -328,10 +376,15 @@ pub fn row<R>(ui: &mut Ui, height: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
 }
 
 /// A colored message strip with an icon.
-pub fn banner<R>(ui: &mut Ui, color: Color32, icon_char: char, add: impl FnOnce(&mut Ui) -> R) -> R {
+pub fn banner<R>(
+    ui: &mut Ui,
+    color: Color32,
+    icon_char: char,
+    add: impl FnOnce(&mut Ui) -> R,
+) -> R {
     Frame::none()
         .fill(mix(BG, color, 0.10))
-        .stroke(Stroke::new(1.0, mix(BG, color, 0.35)))
+        .stroke(Stroke::new(1.0_f32, mix(BG, color, 0.35)))
         .rounding(Rounding::same(10.0))
         .inner_margin(Margin::symmetric(14.0, 10.0))
         .show(ui, |ui| {

@@ -28,6 +28,15 @@ impl App {
                 MAct::SortCpu(v) => self.mem.by_cpu = v,
                 MAct::Go(p) => self.page = p,
                 MAct::AskKill(pids, name, mem) => {
+                    // Keep the observed identity with the confirmation. Windows can
+                    // reuse a PID while the dialog is open.
+                    let pids: Vec<_> = self
+                        .sys
+                        .procs
+                        .iter()
+                        .filter(|process| pids.contains(&process.pid))
+                        .map(|process| (process.pid, process.start_time))
+                        .collect();
                     self.modal = Some(Modal {
                         title: format!("End {name}?"),
                         body: format!(
@@ -58,13 +67,34 @@ impl App {
             widgets::card(&mut cols[0], |ui| {
                 ui.horizontal(|ui| {
                     let f = s.mem_frac();
-                    let col = if f > 0.9 { BAD } else if f > 0.8 { WARN } else { ACCENT };
-                    widgets::ring(ui, f, 120.0, 11.0, col, &format!("{:.0}%", f * 100.0), "memory");
+                    let col = if f > 0.9 {
+                        BAD
+                    } else if f > 0.8 {
+                        WARN
+                    } else {
+                        ACCENT
+                    };
+                    widgets::ring(
+                        ui,
+                        f,
+                        120.0,
+                        11.0,
+                        col,
+                        &format!("{:.0}%", f * 100.0),
+                        "memory",
+                    );
                     ui.add_space(10.0);
                     ui.vertical(|ui| {
                         ui.label(widgets::strong("Memory", 16.0));
-                        ui.label(widgets::dim(format!("{} in use of {}", fmt_bytes(s.mem_used), fmt_bytes(s.mem_total))));
-                        ui.label(widgets::dim(format!("{} available", fmt_bytes(s.mem_avail))));
+                        ui.label(widgets::dim(format!(
+                            "{} in use of {}",
+                            fmt_bytes(s.mem_used),
+                            fmt_bytes(s.mem_total)
+                        )));
+                        ui.label(widgets::dim(format!(
+                            "{} available",
+                            fmt_bytes(s.mem_avail)
+                        )));
                         if s.swap_total > 0 {
                             ui.label(widgets::faint(format!(
                                 "Page file: {} of {} used",
@@ -78,8 +108,22 @@ impl App {
             widgets::card(&mut cols[1], |ui| {
                 ui.horizontal(|ui| {
                     let f = s.cpu / 100.0;
-                    let col = if f > 0.9 { BAD } else if f > 0.7 { WARN } else { GOOD };
-                    widgets::ring(ui, f, 120.0, 11.0, col, &format!("{:.0}%", s.cpu), "processor");
+                    let col = if f > 0.9 {
+                        BAD
+                    } else if f > 0.7 {
+                        WARN
+                    } else {
+                        GOOD
+                    };
+                    widgets::ring(
+                        ui,
+                        f,
+                        120.0,
+                        11.0,
+                        col,
+                        &format!("{:.0}%", s.cpu),
+                        "processor",
+                    );
                     ui.add_space(10.0);
                     ui.vertical(|ui| {
                         ui.label(widgets::strong("Processor", 16.0));
@@ -101,13 +145,16 @@ impl App {
 
         let mut groups = s.groups();
         if self.mem.by_cpu {
-            groups.sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal));
+            groups.sort_by(|a, b| {
+                b.cpu
+                    .partial_cmp(&a.cpu)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
         }
-        let filter = self.mem.filter.to_lowercase();
+        let filter = self.mem.filter.trim().to_lowercase();
         let groups: Vec<_> = groups
             .into_iter()
             .filter(|g| filter.is_empty() || g.name.to_lowercase().contains(&filter))
-            .take(150)
             .collect();
         let top = groups.iter().map(|g| g.mem).max().unwrap_or(1).max(1) as f32;
 
@@ -116,7 +163,10 @@ impl App {
             if ui.add(widgets::chip("Memory", !self.mem.by_cpu)).clicked() {
                 acts.push(MAct::SortCpu(false));
             }
-            if ui.add(widgets::chip("Processor", self.mem.by_cpu)).clicked() {
+            if ui
+                .add(widgets::chip("Processor", self.mem.by_cpu))
+                .clicked()
+            {
                 acts.push(MAct::SortCpu(true));
             }
             ui.add_space(12.0);
@@ -125,12 +175,25 @@ impl App {
                 acts.push(MAct::Filter(f));
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(widgets::faint(format!("{} processes, refreshed every 3 seconds", fmt_num(s.procs.len() as u64))));
+                ui.label(widgets::faint(format!(
+                    "{} processes, refreshed every 3 seconds",
+                    fmt_num(s.procs.len() as u64)
+                )));
             });
         });
 
+        if groups.is_empty() {
+            ui.add_space(16.0);
+            ui.label(widgets::dim(if filter.is_empty() {
+                "Waiting for running apps…"
+            } else {
+                "No apps match your search. Try part of an executable name."
+            }));
+        } else {
+            ui.label(widgets::faint(format!("{} app groups", groups.len())));
+        }
         ScrollArea::vertical()
-            .id_source("procs_scroll")
+            .id_salt("procs_scroll")
             .auto_shrink([false, false])
             .show_rows(ui, 36.0, groups.len(), |ui, range| {
                 for g in &groups[range] {
@@ -140,13 +203,26 @@ impl App {
                             ui.add_space(6.0);
                             if system::is_critical(&g.name) {
                                 ui.add_enabled(false, widgets::small("End task"))
-                                    .on_disabled_hover_text("Part of Windows. Ending it could crash your PC.");
+                                    .on_disabled_hover_text(
+                                        "Part of Windows. Ending it could crash your PC.",
+                                    );
                             } else if ui.add(widgets::small("End task")).clicked() {
                                 acts.push(MAct::AskKill(g.pids.clone(), g.name.clone(), g.mem));
                             }
-                            ui.add_sized([70.0, 20.0], Label::new(widgets::faint(format!("{:.1}% CPU", g.cpu))));
-                            ui.add_sized([84.0, 20.0], Label::new(widgets::strong(fmt_bytes(g.mem), 14.0)));
-                            widgets::bar(ui, g.mem as f32 / top, ACCENT_STRONG, egui::vec2(140.0, 6.0));
+                            ui.add_sized(
+                                [70.0, 20.0],
+                                Label::new(widgets::faint(format!("{:.1}% CPU", g.cpu))),
+                            );
+                            ui.add_sized(
+                                [84.0, 20.0],
+                                Label::new(widgets::strong(fmt_bytes(g.mem), 14.0)),
+                            );
+                            widgets::bar(
+                                ui,
+                                g.mem as f32 / top,
+                                ACCENT_STRONG,
+                                egui::vec2(140.0, 6.0),
+                            );
                             ui.add_space(8.0);
                             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                                 ui.add(Label::new(RichText::new(&g.name).color(TEXT)).truncate());

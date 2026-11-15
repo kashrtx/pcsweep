@@ -2,7 +2,7 @@ use crate::app::{App, ToastKind};
 use crate::theme::*;
 use crate::util;
 use crate::widgets::{self, ic};
-use eframe::egui::{Align, Label, Layout, RichText, ScrollArea, Ui};
+use eframe::egui::{self, Align, Label, Layout, RichText, ScrollArea, Ui};
 use std::fs;
 use std::path::PathBuf;
 use winreg::enums::{RegType, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
@@ -10,9 +10,12 @@ use winreg::{RegKey, RegValue};
 
 const RUN: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN32: &str = r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run";
-const APPROVED_RUN: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
-const APPROVED_RUN32: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32";
-const APPROVED_FOLDER: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder";
+const APPROVED_RUN: &str =
+    r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
+const APPROVED_RUN32: &str =
+    r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32";
+const APPROVED_FOLDER: &str =
+    r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Loc {
@@ -33,7 +36,10 @@ impl Loc {
         }
     }
     pub fn machine(self) -> bool {
-        matches!(self, Loc::MachineRun | Loc::MachineRun32 | Loc::CommonFolder)
+        matches!(
+            self,
+            Loc::MachineRun | Loc::MachineRun32 | Loc::CommonFolder
+        )
     }
     fn approved_key(self) -> &'static str {
         match self {
@@ -56,12 +62,18 @@ pub struct StartupItem {
 }
 
 fn root(machine: bool) -> RegKey {
-    RegKey::predef(if machine { HKEY_LOCAL_MACHINE } else { HKEY_CURRENT_USER })
+    RegKey::predef(if machine {
+        HKEY_LOCAL_MACHINE
+    } else {
+        HKEY_CURRENT_USER
+    })
 }
 
 /// Task Manager's convention: an odd first byte means "disabled".
 fn approved(machine: bool, sub: &str, name: &str) -> bool {
-    let Ok(key) = root(machine).open_subkey(sub) else { return true };
+    let Ok(key) = root(machine).open_subkey(sub) else {
+        return true;
+    };
     match key.get_raw_value(name) {
         Ok(v) => v.bytes.first().map_or(true, |b| b & 1 == 0),
         Err(_) => true,
@@ -70,9 +82,15 @@ fn approved(machine: bool, sub: &str, name: &str) -> bool {
 
 pub fn list() -> Vec<StartupItem> {
     let mut out = Vec::new();
-    for (loc, path) in [(Loc::UserRun, RUN), (Loc::MachineRun, RUN), (Loc::MachineRun32, RUN32)] {
+    for (loc, path) in [
+        (Loc::UserRun, RUN),
+        (Loc::MachineRun, RUN),
+        (Loc::MachineRun32, RUN32),
+    ] {
         let machine = loc.machine();
-        let Ok(k) = root(machine).open_subkey(path) else { continue };
+        let Ok(k) = root(machine).open_subkey(path) else {
+            continue;
+        };
         for (name, _) in k.enum_values().flatten() {
             if name.is_empty() {
                 continue;
@@ -85,9 +103,9 @@ pub fn list() -> Vec<StartupItem> {
                 enabled: approved(machine, loc.approved_key(), &name),
                 display: name.clone(),
                 key: name,
+                file: exe_from_command(&command),
                 command,
                 loc,
-                file: None,
             });
         }
     }
@@ -98,7 +116,8 @@ pub fn list() -> Vec<StartupItem> {
         ),
         (
             Loc::CommonFolder,
-            util::env("ProgramData").map(|p| p.join(r"Microsoft\Windows\Start Menu\Programs\StartUp")),
+            util::env("ProgramData")
+                .map(|p| p.join(r"Microsoft\Windows\Start Menu\Programs\StartUp")),
         ),
     ];
     for (loc, dir) in folders {
@@ -107,6 +126,10 @@ pub fn list() -> Vec<StartupItem> {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
             if name.eq_ignore_ascii_case("desktop.ini") {
+                continue;
+            }
+            // Folders here (like Autoruns' "AutorunsDisabled") don't launch anything.
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(true) {
                 continue;
             }
             let display = name
@@ -164,7 +187,7 @@ pub fn exe_from_command(cmd: &str) -> Option<PathBuf> {
     let path = if let Some(rest) = cmd.strip_prefix('"') {
         rest.split('"').next()?.to_string()
     } else {
-        let lower = cmd.to_lowercase();
+        let lower = cmd.to_ascii_lowercase();
         match lower.find(".exe") {
             Some(i) => cmd[..i + 4].to_string(),
             None => cmd.split_whitespace().next()?.to_string(),
@@ -210,17 +233,30 @@ impl App {
         for a in acts {
             match a {
                 SAct::Set(i, on) => {
-                    let Some(item) = self.startup.items.get(i).cloned() else { continue };
+                    let Some(item) = self.startup.items.get(i).cloned() else {
+                        continue;
+                    };
                     match set_enabled(&item, on) {
                         Ok(()) => {
                             self.startup.items[i].enabled = on;
-                            util::log(format!("{} startup item: {}", if on { "Enabled" } else { "Disabled" }, item.display));
+                            util::log(format!(
+                                "{} startup item: {}",
+                                if on { "Enabled" } else { "Disabled" },
+                                item.display
+                            ));
                             self.toast(
                                 ToastKind::Success,
-                                format!("{} will {}start with Windows", item.display, if on { "" } else { "no longer " }),
+                                format!(
+                                    "{} will {}start with Windows",
+                                    item.display,
+                                    if on { "" } else { "no longer " }
+                                ),
                             );
                         }
-                        Err(e) => self.toast(ToastKind::Error, format!("Couldn't change {}: {e}", item.display)),
+                        Err(e) => self.toast(
+                            ToastKind::Error,
+                            format!("Couldn't change {}: {e}", item.display),
+                        ),
                     }
                 }
                 SAct::Show(p) => util::show_in_explorer(&p),
@@ -244,22 +280,45 @@ impl App {
         });
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            ui.label(RichText::new(format!("{}", s.enabled_count())).font(widgets::light(30.0)).color(TEXT));
-            ui.label(widgets::dim(format!("of {} start automatically", s.items.len())));
+            ui.label(
+                RichText::new(format!("{}", s.enabled_count()))
+                    .font(widgets::light(30.0))
+                    .color(TEXT),
+            );
+            ui.label(widgets::dim(format!(
+                "of {} start automatically",
+                s.items.len()
+            )));
             ui.add_space(16.0);
             let mut f = s.filter.clone();
             if widgets::search_box(ui, &mut f, "Search", 200.0).changed() {
                 acts.push(SAct::Filter(f));
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.add(widgets::small(widgets::icon_text(ic::REFRESH, "Refresh", 13.0, TEXT))).clicked() {
+                if ui
+                    .add(widgets::small(widgets::icon_text(
+                        ic::REFRESH,
+                        "Refresh",
+                        13.0,
+                        TEXT,
+                    )))
+                    .clicked()
+                {
                     acts.push(SAct::Reload);
                 }
                 if ui.add(widgets::small("Windows startup settings")).clicked() {
                     acts.push(SAct::Settings);
                 }
                 if !self.is_admin && s.items.iter().any(|i| i.loc.machine()) {
-                    if ui.add(widgets::small(widgets::icon_text(ic::SHIELD, "Restart as admin", 13.0, WARN))).clicked() {
+                    if ui
+                        .add(widgets::small(widgets::icon_text(
+                            ic::SHIELD,
+                            "Restart as admin",
+                            13.0,
+                            WARN,
+                        )))
+                        .clicked()
+                    {
                         acts.push(SAct::Relaunch);
                     }
                 }
@@ -268,7 +327,7 @@ impl App {
         ui.add_space(4.0);
         let filter = s.filter.to_lowercase();
         ScrollArea::vertical()
-            .id_source("startup_scroll")
+            .id_salt("startup_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 if s.items.is_empty() {
@@ -293,18 +352,27 @@ impl App {
                         ui.add_space(8.0);
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             ui.add_space(6.0);
-                            let target = item.file.clone().or_else(|| exe_from_command(&item.command));
-                            if let Some(t) = target {
-                                if ui.add(widgets::small(widgets::icon(ic::OPEN, 13.0, TEXT_DIM))).on_hover_text("Show in Explorer").clicked() {
-                                    acts.push(SAct::Show(t));
+                            let target = item.file.clone();
+                            let open = ui.add_enabled(target.is_some(), widgets::small(widgets::icon(ic::OPEN, 13.0, TEXT_DIM)));
+                            match target {
+                                Some(t) => {
+                                    if open.on_hover_text("Show in Explorer").clicked() {
+                                        acts.push(SAct::Show(t));
+                                    }
+                                }
+                                None => {
+                                    open.on_disabled_hover_text("The program's file couldn't be found");
                                 }
                             }
-                            widgets::badge(ui, item.loc.label(), TEXT_DIM);
-                            ui.label(if item.enabled {
-                                RichText::new("On").color(GOOD)
-                            } else {
-                                RichText::new("Off").color(TEXT_FAINT)
+                            ui.allocate_ui_with_layout(egui::vec2(170.0, 20.0), Layout::right_to_left(Align::Center), |ui| {
+                                widgets::badge(ui, item.loc.label(), TEXT_DIM);
                             });
+                            widgets::cell(
+                                ui,
+                                30.0,
+                                true,
+                                if item.enabled { RichText::new("On").color(GOOD) } else { RichText::new("Off").color(TEXT_FAINT) },
+                            );
                             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                                 ui.vertical(|ui| {
                                     ui.spacing_mut().item_spacing.y = 1.0;

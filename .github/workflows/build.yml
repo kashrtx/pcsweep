@@ -1,46 +1,108 @@
-name: Build PCSweep
+name: Build and release PCSweep
 
 on:
   push:
-    branches: [ main ]
-    tags: [ 'v*' ]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
+# A branch-wide group would discard pending pushes during a burst. Only duplicate
+# runs of the same commit share a group, so every main push can release.
+concurrency:
+  group: pcsweep-${{ github.event_name }}-${{ github.sha }}
+  cancel-in-progress: false
+
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
+    name: Test and build Windows x64
     runs-on: windows-latest
+    timeout-minutes: 45
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - name: Check out code
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
 
-      - name: Build release
-        run: cargo build --release
+      - name: Check formatting
+        run: cargo fmt --all --check
 
-      - name: Package
+      - name: Test release automation
+        run: python -m unittest discover -s scripts -p "test_*.py" -v
+
+      - name: Test application
+        run: cargo test --locked
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Read package version
+        id: version
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item target/release/PCSweep.exe dist/
-          Copy-Item README.md dist/
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read Cargo metadata' }
+          $v = ($metadata.packages | Where-Object name -eq 'pcsweep').version
+          if (-not $v) { throw 'PCSweep package version is missing' }
+          "version=$v" >> $env:GITHUB_OUTPUT
 
-      - name: Upload build
+      - name: Package portable application
+        shell: pwsh
+        env:
+          APP_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force dist, pkg | Out-Null
+          Copy-Item target/release/PCSweep.exe dist/PCSweep.exe
+          Copy-Item target/release/PCSweep.exe, README.md, LICENSE, RELEASE_NOTES.md pkg/
+          Compress-Archive -Path pkg/* -DestinationPath "dist/PCSweep-$env:APP_VERSION-windows-x64.zip" -Force
+          Get-ChildItem dist -File | Sort-Object Name | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          } | Set-Content -Encoding ascii dist/SHA256SUMS.txt
+
+      - name: Upload tested build
         uses: actions/upload-artifact@v4
         with:
           name: PCSweep-windows-x64
           path: dist/
+          if-no-files-found: error
+          retention-days: 14
 
-      - name: Publish release (only for version tags like v1.0.0)
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+  release:
+    name: Publish automatic release
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Check out release automation
+        uses: actions/checkout@v4
         with:
-          files: dist/PCSweep.exe
+          persist-credentials: false
+
+      - name: Download tested build
+        uses: actions/download-artifact@v4
+        with:
+          name: PCSweep-windows-x64
+          path: dist
+
+      - name: Publish executable, portable ZIP and checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_VERSION: ${{ needs.build.outputs.version }}
+        run: python scripts/publish_release.py --version "$APP_VERSION"

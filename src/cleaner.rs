@@ -34,6 +34,8 @@ impl Group {
 pub enum Special {
     None,
     RecycleBin,
+    /// Shader caches in every Steam library folder (found from libraryfolders.vdf).
+    SteamShaders,
 }
 
 #[derive(Clone, Copy)]
@@ -52,7 +54,13 @@ pub struct Category {
 }
 
 impl Category {
-    fn new(name: &'static str, desc: &'static str, group: Group, icon: char, targets: &'static [&'static str]) -> Self {
+    fn new(
+        name: &'static str,
+        desc: &'static str,
+        group: Group,
+        icon: char,
+        targets: &'static [&'static str],
+    ) -> Self {
         Self {
             name,
             desc,
@@ -110,6 +118,26 @@ pub fn categories() -> Vec<Category> {
             System, ic::PHOTO,
             &[r"%LOCALAPPDATA%\Microsoft\Windows\Explorer\thumbcache_*.db"],
         ),
+        Category::new(
+            "Microsoft Store app temp files",
+            "Temporary files and web caches kept by Store apps. Anything used in the last 24 hours is skipped.",
+            System, ic::APPS,
+            &[
+                r"%LOCALAPPDATA%\Packages\*\AC\Temp",
+                r"%LOCALAPPDATA%\Packages\*\AC\INetCache",
+                r"%LOCALAPPDATA%\Packages\*\TempState",
+            ],
+        ).age(1),
+        Category::new(
+            "Driver installer leftovers",
+            "Setup files that AMD, NVIDIA and other driver installers extract and leave behind. Installed drivers are not affected.",
+            System, ic::CHIP,
+            &[
+                r"%SystemDrive%\AMD",
+                r"%SystemDrive%\NVIDIA",
+                r"%ProgramData%\NVIDIA Corporation\Downloader",
+            ],
+        ).admin().off().age(7).caution("Review these folders first. Only select them if they contain extracted driver installers you no longer need."),
         Category::new(
             "Internet cache",
             "Web content cached by Windows components and older apps.",
@@ -276,9 +304,33 @@ pub fn categories() -> Vec<Category> {
             Apps, ic::GAME,
             &[r"%LOCALAPPDATA%\Steam\htmlcache"],
         ).procs(&["steam.exe", "steamwebhelper.exe"]),
+        Category {
+            special: Special::SteamShaders,
+            ..Category::new(
+                "Steam shader cache",
+                "Pre-compiled shaders for your Steam games, in every Steam library. Games rebuild them, so the first launch afterwards may stutter briefly.",
+                Apps, ic::GAME,
+                &[],
+            ).off().procs(&["steam.exe"])
+        },
+        Category::new(
+            "Other app caches",
+            "Web caches inside apps built on Chromium or Electron, such as chat apps, launchers and editors. Only their cache folders are touched.",
+            Apps, ic::APPS,
+            &[
+                r"%APPDATA%\*\Cache\Cache_Data",
+                r"%APPDATA%\*\Code Cache",
+                r"%APPDATA%\*\GPUCache",
+                r"%APPDATA%\*\DawnCache",
+                r"%APPDATA%\*\DawnGraphiteCache",
+                r"%APPDATA%\*\DawnWebGPUCache",
+                r"%LOCALAPPDATA%\*\Cache\Cache_Data",
+                r"%LOCALAPPDATA%\*\GPUCache",
+            ],
+        ).age(1),
         Category::new(
             "Package manager caches",
-            "Download caches for npm, pip, Yarn, NuGet and Go. The next install or build downloads what it needs again.",
+            "Download caches for npm, pip, uv, Yarn, NuGet, Go, Gradle, Cargo and Electron. The next install or build downloads what it needs again.",
             Developer, ic::CODE,
             &[
                 r"%LOCALAPPDATA%\npm-cache\_cacache",
@@ -287,6 +339,11 @@ pub fn categories() -> Vec<Category> {
                 r"%LOCALAPPDATA%\NuGet\v3-cache",
                 r"%LOCALAPPDATA%\NuGet\plugins-cache",
                 r"%LOCALAPPDATA%\go-build",
+                r"%LOCALAPPDATA%\uv\cache",
+                r"%LOCALAPPDATA%\electron\Cache",
+                r"%LOCALAPPDATA%\electron-builder\Cache",
+                r"%USERPROFILE%\.gradle\caches",
+                r"%USERPROFILE%\.cargo\registry\cache",
             ],
         ).off(),
     ]
@@ -297,6 +354,7 @@ pub struct JunkFile {
     pub path: PathBuf,
     pub size: u64,
     pub modified: Option<SystemTime>,
+    pub created: Option<SystemTime>,
 }
 
 #[derive(Default)]
@@ -307,6 +365,7 @@ pub struct CatResult {
     pub count: u64,
     pub denied: u64,
     pub recent_skipped: u64,
+    pub dupes_skipped: u64,
     pub roots_found: usize,
 }
 
@@ -337,27 +396,28 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     pi == p.len()
 }
 
-/// Expands environment variables and `*` wildcards in a target pattern.
+/// Expands environment variables and wildcards without traversing junctions.
+/// Components preserve drive and UNC roots, including redirected temp folders.
 fn expand_pattern(pattern: &str) -> Vec<PathBuf> {
-    let expanded = util::expand_env(pattern);
-    if expanded.contains('%') {
+    use std::path::Component;
+    let expanded = util::expand_env(pattern).replace('/', "\\");
+    if expanded.contains('%') || !std::path::Path::new(&expanded).is_absolute() {
         return Vec::new();
     }
-    let parts: Vec<&str> = expanded.split('\\').filter(|s| !s.is_empty()).collect();
-    if parts.len() < 2 {
-        return Vec::new();
-    }
-    let mut current: Vec<PathBuf> = vec![PathBuf::from(format!("{}\\", parts[0]))];
-    for part in &parts[1..] {
+    let mut current = vec![PathBuf::new()];
+    for component in std::path::Path::new(&expanded).components() {
         let mut next = Vec::new();
         for base in &current {
-            if part.contains('*') {
+            let part = component.as_os_str().to_string_lossy();
+            if matches!(component, Component::Normal(_))
+                && (part.contains('*') || part.contains('?'))
+            {
                 let pat = part.to_lowercase();
                 if let Ok(rd) = fs::read_dir(base) {
                     for e in rd.flatten() {
                         let name = e.file_name().to_string_lossy().to_lowercase();
                         if glob_match(&pat, &name) {
-                            if let Ok(md) = e.metadata() {
+                            if let Ok(md) = fs::symlink_metadata(e.path()) {
                                 if !util::is_reparse(&md) {
                                     next.push(e.path());
                                 }
@@ -366,8 +426,12 @@ fn expand_pattern(pattern: &str) -> Vec<PathBuf> {
                     }
                 }
             } else {
-                let p = base.join(part);
-                if fs::symlink_metadata(&p).is_ok() {
+                let p = base.join(component.as_os_str());
+                if matches!(component, Component::Prefix(_) | Component::RootDir)
+                    || fs::symlink_metadata(&p)
+                        .map(|md| !util::is_reparse(&md))
+                        .unwrap_or(false)
+                {
                     next.push(p);
                 }
             }
@@ -390,7 +454,7 @@ fn newest_time(md: &fs::Metadata) -> Option<SystemTime> {
 }
 
 fn walk(dir: &std::path::Path, res: &mut CatResult, cutoff: Option<SystemTime>, depth: u32) {
-    if depth > 64 {
+    if depth > 64 || !util::junk_delete_allowed(dir) {
         return;
     }
     let rd = match fs::read_dir(dir) {
@@ -402,7 +466,13 @@ fn walk(dir: &std::path::Path, res: &mut CatResult, cutoff: Option<SystemTime>, 
     };
     let mut subs = Vec::new();
     for e in rd.flatten() {
-        let Ok(md) = e.metadata() else { continue };
+        let path = e.path();
+        if !util::junk_delete_allowed(&path) {
+            continue;
+        }
+        let Ok(md) = fs::symlink_metadata(&path) else {
+            continue;
+        };
         if util::is_reparse(&md) {
             continue;
         }
@@ -411,11 +481,9 @@ fn walk(dir: &std::path::Path, res: &mut CatResult, cutoff: Option<SystemTime>, 
             continue;
         }
         if let Some(cut) = cutoff {
-            if let Some(t) = newest_time(&md) {
-                if t > cut {
-                    res.recent_skipped += 1;
-                    continue;
-                }
+            if newest_time(&md).map(|t| t > cut).unwrap_or(true) {
+                res.recent_skipped += 1;
+                continue;
             }
         }
         res.bytes += md.len();
@@ -423,12 +491,39 @@ fn walk(dir: &std::path::Path, res: &mut CatResult, cutoff: Option<SystemTime>, 
             path: e.path(),
             size: md.len(),
             modified: md.modified().ok(),
+            created: md.created().ok(),
         });
     }
     for s in subs {
         walk(&s, res, cutoff, depth + 1);
         res.dirs.push(s);
     }
+}
+
+/// Every Steam library's shadercache folder, read from Steam's own library list.
+fn steam_shader_roots() -> Vec<PathBuf> {
+    let mut libs: Vec<PathBuf> = Vec::new();
+    let steam = util::env("ProgramFiles(x86)").map(|p| p.join("Steam"));
+    if let Some(steam) = steam {
+        libs.push(steam.clone());
+        let vdf = steam.join(r"steamapps\libraryfolders.vdf");
+        if let Ok(text) = fs::read_to_string(vdf) {
+            for line in text.lines() {
+                let parts: Vec<&str> = line.split('"').collect();
+                // Lines look like:   "path"    "D:\\SteamLibrary"
+                if parts.len() >= 4 && parts[1].eq_ignore_ascii_case("path") {
+                    let p = PathBuf::from(parts[3].replace("\\\\", "\\"));
+                    if !libs.iter().any(|l| util::norm(l) == util::norm(&p)) {
+                        libs.push(p);
+                    }
+                }
+            }
+        }
+    }
+    libs.into_iter()
+        .map(|l| l.join(r"steamapps\shadercache"))
+        .filter(|p| p.is_dir())
+        .collect()
 }
 
 pub fn scan_category(cat: &Category) -> CatResult {
@@ -446,8 +541,12 @@ pub fn scan_category(cat: &Category) -> CatResult {
         None
     };
     let mut seen: HashSet<String> = HashSet::new();
-    for pat in cat.targets {
-        for root in expand_pattern(pat) {
+    let mut roots: Vec<PathBuf> = cat.targets.iter().flat_map(|p| expand_pattern(p)).collect();
+    if cat.special == Special::SteamShaders {
+        roots.extend(steam_shader_roots());
+    }
+    {
+        for root in roots {
             let canon = fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
             if !seen.insert(util::norm(&canon)) {
                 continue;
@@ -456,15 +555,16 @@ pub fn scan_category(cat: &Category) -> CatResult {
             if !util::junk_delete_allowed(&root) || !util::junk_delete_allowed(&canon) {
                 continue;
             }
-            let Ok(md) = fs::symlink_metadata(&root) else { continue };
+            let Ok(md) = fs::symlink_metadata(&root) else {
+                continue;
+            };
             if util::is_reparse(&md) {
                 continue;
             }
             res.roots_found += 1;
             if md.is_file() {
                 let recent = cutoff
-                    .zip(newest_time(&md))
-                    .map(|(cut, t)| t > cut)
+                    .map(|cut| newest_time(&md).map(|t| t > cut).unwrap_or(true))
                     .unwrap_or(false);
                 if recent {
                     res.recent_skipped += 1;
@@ -474,6 +574,7 @@ pub fn scan_category(cat: &Category) -> CatResult {
                         path: root.clone(),
                         size: md.len(),
                         modified: md.modified().ok(),
+                        created: md.created().ok(),
                     });
                 }
             } else if md.is_dir() {
@@ -502,7 +603,7 @@ pub struct ScanOutput {
 
 pub struct CleanJob {
     pub name: &'static str,
-    pub files: Vec<PathBuf>,
+    pub files: Vec<JunkFile>,
     pub dirs: Vec<PathBuf>,
     pub recycle_bin: bool,
 }
@@ -535,7 +636,7 @@ pub fn run_clean(jobs: Vec<CleanJob>) -> CleanReport {
         let results: Vec<Result<u64, String>> = job
             .files
             .par_iter()
-            .map(|p| util::delete_junk_file(p))
+            .map(|f| util::delete_junk_file(&f.path, f.size, f.modified, f.created))
             .collect();
         let (mut freed, mut deleted, mut failed) = (0u64, 0u64, 0u64);
         for r in results {
@@ -582,8 +683,18 @@ impl CleanerState {
     pub fn new() -> Self {
         let cats = categories();
         let n = cats.len();
+        let saved = util::load_settings();
         Self {
-            selected: cats.iter().map(|c| c.default_on).collect(),
+            selected: cats
+                .iter()
+                .map(
+                    |c| match saved.get(&format!("clean.{}", c.name)).map(|v| v.as_str()) {
+                        Some("1") => true,
+                        Some("0") => false,
+                        _ => c.default_on,
+                    },
+                )
+                .collect(),
             results: (0..n).map(|_| None).collect(),
             excluded: vec![HashSet::new(); n],
             excluded_bytes: vec![0; n],
@@ -640,9 +751,33 @@ impl CleanerState {
             .sum()
     }
 
-    /// Top categories by size (index, bytes), for the dashboard.
+    /// Junk found in optional (off by default) categories.
+    pub fn optional_total(&self) -> u64 {
+        (0..self.cats.len())
+            .filter(|&i| !self.cats[i].default_on)
+            .map(|i| self.cat_bytes(i))
+            .sum()
+    }
+
+    pub fn save_selection(&self) {
+        let pairs: Vec<(String, String)> = self
+            .cats
+            .iter()
+            .zip(self.selected.iter())
+            .map(|(c, s)| {
+                (
+                    format!("clean.{}", c.name),
+                    if *s { "1".to_string() } else { "0".to_string() },
+                )
+            })
+            .collect();
+        util::save_settings(&pairs);
+    }
+
+    /// Top recommended categories by size (index, bytes), for the dashboard.
     pub fn top(&self, n: usize) -> Vec<(usize, u64)> {
         let mut v: Vec<(usize, u64)> = (0..self.cats.len())
+            .filter(|&i| self.cats[i].default_on)
             .map(|i| (i, self.cat_bytes(i)))
             .filter(|(_, b)| *b > 0)
             .collect();
@@ -654,6 +789,9 @@ impl CleanerState {
 
 enum CAct {
     SetSel(usize, bool),
+    SelectRecommended,
+    SelectAllFound,
+    SelectNone,
     Expand(usize),
     Toggle(usize, PathBuf, u64, bool),
     IncludeAll(usize),
@@ -672,7 +810,20 @@ impl App {
         let cats = self.cleaner.cats.clone();
         self.cleaner.scan = Task::spawn(ctx, move || {
             let names = running_process_names();
-            let results: Vec<CatResult> = cats.par_iter().map(scan_category).collect();
+            let mut results: Vec<CatResult> = cats.par_iter().map(scan_category).collect();
+            // A file can match more than one category (for example an app cache that the
+            // generic "Other app caches" also covers). Count and clean it only once.
+            let mut seen: HashSet<String> = HashSet::new();
+            for r in results.iter_mut() {
+                let before = r.files.len();
+                r.files.retain(|f| seen.insert(util::norm(&f.path)));
+                let removed = before - r.files.len();
+                if removed > 0 {
+                    r.dupes_skipped = removed as u64;
+                    r.bytes = r.files.iter().map(|f| f.size).sum();
+                    r.count = r.files.len() as u64;
+                }
+            }
             let running: Vec<Vec<String>> = cats
                 .iter()
                 .map(|c| {
@@ -711,7 +862,11 @@ impl App {
                 Ok(rep) => {
                     self.toast(
                         ToastKind::Success,
-                        format!("Freed {} ({} files deleted)", fmt_bytes(rep.freed), fmt_num(rep.deleted)),
+                        format!(
+                            "Freed {} ({} files deleted)",
+                            fmt_bytes(rep.freed),
+                            fmt_num(rep.deleted)
+                        ),
                     );
                     self.cleaner.last_report = Some(rep);
                     self.sys.refresh_drives();
@@ -765,7 +920,14 @@ impl App {
     }
 
     pub fn start_clean(&mut self, ctx: &egui::Context) {
-        if self.cleaner.clean.running() {
+        if self.cleaner.clean.running()
+            || self.analyzer.recycle.running()
+            || self.dups.recycle.running()
+        {
+            self.toast(
+                ToastKind::Info,
+                "A cleanup is already running. Wait for it to finish before cleaning more files.",
+            );
             return;
         }
         let mut jobs = Vec::new();
@@ -774,7 +936,9 @@ impl App {
                 continue;
             }
             let cat = self.cleaner.cats[i];
-            let Some(res) = &self.cleaner.results[i] else { continue };
+            let Some(res) = &self.cleaner.results[i] else {
+                continue;
+            };
             if cat.special == Special::RecycleBin {
                 if res.bytes > 0 || res.count > 0 {
                     jobs.push(CleanJob {
@@ -787,11 +951,11 @@ impl App {
                 continue;
             }
             let excl = &self.cleaner.excluded[i];
-            let files: Vec<PathBuf> = res
+            let files: Vec<JunkFile> = res
                 .files
                 .iter()
                 .filter(|f| !excl.contains(&f.path))
-                .map(|f| f.path.clone())
+                .cloned()
                 .collect();
             if files.is_empty() {
                 continue;
@@ -814,16 +978,46 @@ impl App {
         let ctx = ui.ctx().clone();
         let mut acts = Vec::new();
         self.render_cleaner(ui, &mut acts);
+        let mut selection_changed = false;
         for a in acts {
             match a {
-                CAct::SetSel(i, v) => self.cleaner.selected[i] = v,
+                CAct::SetSel(i, v) => {
+                    self.cleaner.selected[i] = v;
+                    selection_changed = true;
+                }
+                CAct::SelectRecommended => {
+                    for (i, c) in self.cleaner.cats.iter().enumerate() {
+                        self.cleaner.selected[i] = c.default_on;
+                    }
+                    selection_changed = true;
+                }
+                CAct::SelectAllFound => {
+                    for i in 0..self.cleaner.cats.len() {
+                        let cat = self.cleaner.cats[i];
+                        // Prefetch is never bulk-selected; it's a myth that it helps.
+                        let skip = cat.caution.is_some() && cat.name == "Prefetch data";
+                        self.cleaner.selected[i] = !skip && self.cleaner.cat_bytes(i) > 0;
+                    }
+                    selection_changed = true;
+                }
+                CAct::SelectNone => {
+                    for s in self.cleaner.selected.iter_mut() {
+                        *s = false;
+                    }
+                    selection_changed = true;
+                }
                 CAct::Expand(i) => {
-                    self.cleaner.expanded = if self.cleaner.expanded == Some(i) { None } else { Some(i) }
+                    self.cleaner.expanded = if self.cleaner.expanded == Some(i) {
+                        None
+                    } else {
+                        Some(i)
+                    }
                 }
                 CAct::Toggle(i, path, size, include) => {
                     if include {
                         if self.cleaner.excluded[i].remove(&path) {
-                            self.cleaner.excluded_bytes[i] = self.cleaner.excluded_bytes[i].saturating_sub(size);
+                            self.cleaner.excluded_bytes[i] =
+                                self.cleaner.excluded_bytes[i].saturating_sub(size);
                         }
                     } else if self.cleaner.excluded[i].insert(path) {
                         self.cleaner.excluded_bytes[i] += size;
@@ -844,6 +1038,9 @@ impl App {
                 CAct::Rescan => self.start_junk_scan(&ctx),
                 CAct::Relaunch => self.relaunch_admin(&ctx),
             }
+        }
+        if selection_changed {
+            self.cleaner.save_selection();
         }
     }
 
@@ -868,7 +1065,11 @@ impl App {
                             ui.label(widgets::strong("Looking for junk…", 20.0));
                         });
                     } else {
-                        ui.label(RichText::new(fmt_bytes(sel_bytes)).font(widgets::light(44.0)).color(TEXT));
+                        ui.label(
+                            RichText::new(fmt_bytes(sel_bytes))
+                                .font(widgets::light(44.0))
+                                .color(TEXT),
+                        );
                         ui.label(widgets::dim(format!(
                             "{} files in {} {}",
                             fmt_num(sel_files),
@@ -878,15 +1079,35 @@ impl App {
                     }
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let can_clean = !scanning && !cleaning && sel_n > 0;
+                    let can_clean = !scanning
+                        && !cleaning
+                        && !self.analyzer.recycle.running()
+                        && !self.dups.recycle.running()
+                        && sel_n > 0;
                     if ui
-                        .add_enabled(can_clean, widgets::primary(widgets::icon_text(ic::CLEAN, "Clean selected", 14.0, egui::Color32::WHITE)))
+                        .add_enabled(
+                            can_clean,
+                            widgets::primary(widgets::icon_text(
+                                ic::CLEAN,
+                                "Clean selected",
+                                14.0,
+                                egui::Color32::WHITE,
+                            )),
+                        )
                         .clicked()
                     {
                         acts.push(CAct::Ask);
                     }
                     if ui
-                        .add_enabled(!scanning && !cleaning, widgets::ghost(widgets::icon_text(ic::REFRESH, "Scan again", 14.0, TEXT)))
+                        .add_enabled(
+                            !scanning && !cleaning,
+                            widgets::ghost(widgets::icon_text(
+                                ic::REFRESH,
+                                "Scan again",
+                                14.0,
+                                TEXT,
+                            )),
+                        )
                         .clicked()
                     {
                         acts.push(CAct::Rescan);
@@ -928,15 +1149,36 @@ impl App {
         }
 
         ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label(widgets::dim("Select"));
+            if ui
+                .add(widgets::small("Recommended"))
+                .on_hover_text("The categories that are safe for everyone")
+                .clicked()
+            {
+                acts.push(CAct::SelectRecommended);
+            }
+            if ui
+                .add(widgets::small("Everything found"))
+                .on_hover_text("All categories with something to clean, except Prefetch")
+                .clicked()
+            {
+                acts.push(CAct::SelectAllFound);
+            }
+            if ui.add(widgets::small("None")).clicked() {
+                acts.push(CAct::SelectNone);
+            }
+            ui.label(widgets::faint("Your choices are remembered next time."));
+        });
         ScrollArea::vertical()
-            .id_source("cleaner_scroll")
+            .id_salt("cleaner_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for group in [Group::System, Group::Browsers, Group::Apps, Group::Developer] {
                     let idxs: Vec<usize> = (0..c.cats.len())
                         .filter(|&i| c.cats[i].group == group)
                         .filter(|&i| match &c.results[i] {
-                            Some(r) => r.roots_found > 0 || c.cats[i].special != Special::None,
+                            Some(r) => r.roots_found > 0 || c.cats[i].special == Special::RecycleBin,
                             None => true,
                         })
                         .collect();
@@ -967,70 +1209,78 @@ impl App {
 
         widgets::tight_frame().show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            ui.horizontal(|ui| {
+            // Fixed-width columns: name/description on the left, size and button on the right.
+            ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
                 let mut sel = c.selected[i];
                 if ui.checkbox(&mut sel, "").changed() {
                     acts.push(CAct::SetSel(i, sel));
                 }
                 ui.label(widgets::icon(cat.icon, 20.0, if sel { ACCENT } else { TEXT_FAINT }));
                 ui.add_space(4.0);
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let can_review = res.map(|r| !r.files.is_empty()).unwrap_or(false);
-                    if can_review {
-                        let label = if expanded { "Hide files" } else { "Review files" };
-                        if ui.add(widgets::small(label)).clicked() {
-                            acts.push(CAct::Expand(i));
+                let right_w = 260.0;
+                let text_w = (ui.available_width() - right_w).max(240.0);
+                ui.allocate_ui_with_layout(egui::vec2(text_w, 0.0), Layout::top_down(Align::Min), |ui| {
+                    ui.set_width(text_w);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(widgets::strong(cat.name, 15.0));
+                        if cat.admin && !self.is_admin {
+                            widgets::badge(ui, "Needs admin", WARN);
+                        }
+                        if cat.caution.is_some() {
+                            widgets::badge(ui, "Read first", WARN);
+                        }
+                        if !cat.default_on {
+                            widgets::badge(ui, "Optional", TEXT_DIM);
+                        }
+                        for p in &c.running[i] {
+                            widgets::badge(ui, &format!("{} is open", p.trim_end_matches(".exe")), WARN)
+                                .on_hover_text("Close it for the most thorough clean. Files it's using are skipped.");
+                        }
+                    });
+                    ui.label(widgets::dim(cat.desc));
+                    if let Some(text) = cat.caution {
+                        ui.label(RichText::new(text).color(WARN).size(12.5));
+                    }
+                    if let Some(r) = res {
+                        let mut parts = Vec::new();
+                        if r.recent_skipped > 0 {
+                            parts.push(format!("{} recently used files kept", fmt_num(r.recent_skipped)));
+                        }
+                        if r.denied > 0 && !self.is_admin && cat.admin {
+                            parts.push("some folders need admin to read".to_string());
+                        }
+                        if r.dupes_skipped > 0 {
+                            parts.push(format!("{} files already counted in another category", fmt_num(r.dupes_skipped)));
+                        }
+                        if !parts.is_empty() {
+                            ui.label(widgets::faint(parts.join(", ")));
                         }
                     }
-                    ui.vertical(|ui| {
-                        ui.set_width(110.0);
-                        ui.with_layout(Layout::top_down(Align::Max), |ui| {
-                            match res {
-                                None => {
-                                    ui.spinner();
-                                }
-                                Some(r) if r.bytes == 0 && r.count == 0 => {
-                                    ui.label(RichText::new("Clean").color(GOOD));
-                                }
-                                Some(_) => {
-                                    ui.label(widgets::strong(fmt_bytes(bytes), 16.0));
-                                    ui.label(widgets::faint(format!("{} files", fmt_num(files))));
-                                }
+                });
+                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                    let can_review = res.map(|r| !r.files.is_empty()).unwrap_or(false);
+                    ui.allocate_ui_with_layout(egui::vec2(110.0, 30.0), Layout::right_to_left(Align::Center), |ui| {
+                        if can_review {
+                            let label = if expanded { "Hide files" } else { "Review files" };
+                            if ui.add(widgets::small(label)).clicked() {
+                                acts.push(CAct::Expand(i));
                             }
-                        });
+                        }
                     });
-                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                        ui.vertical(|ui| {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label(widgets::strong(cat.name, 15.0));
-                                if cat.admin && !self.is_admin {
-                                    widgets::badge(ui, "Needs admin", WARN);
-                                }
-                                if let Some(text) = cat.caution {
-                                    widgets::badge(ui, "Read first", WARN).on_hover_text(text);
-                                }
-                                for p in &c.running[i] {
-                                    widgets::badge(ui, &format!("{} is open", p.trim_end_matches(".exe")), WARN)
-                                        .on_hover_text("Close it for the most thorough clean. Files it's using are skipped.");
-                                }
-                            });
-                            ui.label(widgets::dim(cat.desc));
-                            if let Some(text) = cat.caution {
-                                ui.label(RichText::new(text).color(WARN).size(12.5));
+                    ui.allocate_ui_with_layout(egui::vec2(120.0, 0.0), Layout::top_down(Align::Max), |ui| {
+                        ui.set_width(120.0);
+                        match res {
+                            None => {
+                                ui.spinner();
                             }
-                            if let Some(r) = res {
-                                if r.recent_skipped > 0 || (r.denied > 0 && !self.is_admin && cat.admin) {
-                                    let mut parts = Vec::new();
-                                    if r.recent_skipped > 0 {
-                                        parts.push(format!("{} recent files kept", fmt_num(r.recent_skipped)));
-                                    }
-                                    if r.denied > 0 && !self.is_admin && cat.admin {
-                                        parts.push("some folders need admin".to_string());
-                                    }
-                                    ui.label(widgets::faint(parts.join(", ")));
-                                }
+                            Some(r) if r.bytes == 0 && r.count == 0 => {
+                                ui.label(RichText::new("Already clean").color(GOOD));
                             }
-                        });
+                            Some(_) => {
+                                ui.label(widgets::strong(fmt_bytes(bytes), 16.0));
+                                ui.label(widgets::faint(format!("{} files", fmt_num(files))));
+                            }
+                        }
                     });
                 });
             });
@@ -1052,7 +1302,7 @@ impl App {
                     });
                     let excl = &c.excluded[i];
                     ScrollArea::vertical()
-                        .id_source(("review", i))
+                        .id_salt(("review", i))
                         .max_height(320.0)
                         .auto_shrink([false, true])
                         .show_rows(ui, 28.0, r.files.len(), |ui, range| {
@@ -1081,5 +1331,52 @@ impl App {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn target_expansion_keeps_files_and_supports_question_mark_wildcards() {
+        let root = std::env::temp_dir().join(format!("pcsweep-patterns-{}", std::process::id()));
+        fs::create_dir_all(root.join("profile1").join("Cache")).unwrap();
+        fs::create_dir_all(root.join("profile10").join("Cache")).unwrap();
+        fs::write(
+            root.join("profile1").join("Cache").join("one.dat"),
+            b"cache",
+        )
+        .unwrap();
+        let pattern = root
+            .join("profile?")
+            .join("Cache")
+            .to_string_lossy()
+            .into_owned();
+        let expanded = expand_pattern(&pattern);
+        assert_eq!(expanded.len(), 1);
+        assert_eq!(expanded[0], root.join("profile1").join("Cache"));
+        let mut res = CatResult::default();
+        walk(&expanded[0], &mut res, None, 0);
+        assert_eq!(res.files.len(), 1);
+        assert_eq!(res.bytes, 5);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn old_file_scan_skips_new_cache_files() {
+        let root = std::env::temp_dir().join(format!("pcsweep-age-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("recent.dat"), b"active cache").unwrap();
+        let mut res = CatResult::default();
+        walk(
+            &root,
+            &mut res,
+            SystemTime::now().checked_sub(Duration::from_secs(86_400)),
+            0,
+        );
+        assert!(res.files.is_empty());
+        assert_eq!(res.recent_skipped, 1);
+        fs::remove_dir_all(root).unwrap();
     }
 }

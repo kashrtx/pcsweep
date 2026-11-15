@@ -30,6 +30,7 @@ impl Drive {
 
 pub struct Proc {
     pub pid: u32,
+    pub start_time: u64,
     pub name: String,
     pub mem: u64,
     pub cpu: f32,
@@ -45,17 +46,47 @@ pub struct ProcGroup {
 
 /// Processes that must never be ended from PCSweep.
 pub const CRITICAL_PROCS: &[&str] = &[
-    "system", "registry", "smss.exe", "csrss.exe", "wininit.exe", "services.exe", "lsass.exe",
-    "lsaiso.exe", "winlogon.exe", "svchost.exe", "dwm.exe", "explorer.exe", "fontdrvhost.exe",
-    "memory compression", "msmpeng.exe", "sihost.exe", "ctfmon.exe", "audiodg.exe",
-    "system idle process", "secure system", "spoolsv.exe", "searchhost.exe", "startmenuexperiencehost.exe",
-    "shellexperiencehost.exe", "taskhostw.exe", "runtimebroker.exe", "securityhealthservice.exe",
-    "nissrv.exe", "wudfhost.exe", "conhost.exe", "dllhost.exe", "pcsweep.exe",
+    "system",
+    "registry",
+    "smss.exe",
+    "csrss.exe",
+    "wininit.exe",
+    "services.exe",
+    "lsass.exe",
+    "lsaiso.exe",
+    "winlogon.exe",
+    "svchost.exe",
+    "dwm.exe",
+    "explorer.exe",
+    "fontdrvhost.exe",
+    "memory compression",
+    "msmpeng.exe",
+    "sihost.exe",
+    "ctfmon.exe",
+    "audiodg.exe",
+    "system idle process",
+    "secure system",
+    "spoolsv.exe",
+    "searchhost.exe",
+    "startmenuexperiencehost.exe",
+    "shellexperiencehost.exe",
+    "taskhostw.exe",
+    "runtimebroker.exe",
+    "securityhealthservice.exe",
+    "nissrv.exe",
+    "wudfhost.exe",
+    "conhost.exe",
+    "dllhost.exe",
+    "pcsweep.exe",
 ];
 
 pub fn is_critical(name: &str) -> bool {
     let n = name.to_lowercase();
     CRITICAL_PROCS.iter().any(|c| *c == n)
+}
+
+fn safe_kill_target(pid: u32, expected_start: u64, actual_start: u64, name: &str) -> bool {
+    pid != std::process::id() && expected_start == actual_start && !is_critical(name)
 }
 
 pub struct SysMon {
@@ -139,6 +170,7 @@ impl SysMon {
                 .filter(|(_, p)| p.memory() > 0)
                 .map(|(pid, p)| Proc {
                     pid: pid.as_u32(),
+                    start_time: p.start_time(),
                     name: p.name().to_string(),
                     mem: p.memory(),
                     cpu: p.cpu_usage() / cores,
@@ -194,13 +226,15 @@ impl SysMon {
     pub fn groups(&self) -> Vec<ProcGroup> {
         let mut map: HashMap<String, ProcGroup> = HashMap::new();
         for p in &self.procs {
-            let g = map.entry(p.name.to_lowercase()).or_insert_with(|| ProcGroup {
-                name: p.name.clone(),
-                count: 0,
-                mem: 0,
-                cpu: 0.0,
-                pids: Vec::new(),
-            });
+            let g = map
+                .entry(p.name.to_lowercase())
+                .or_insert_with(|| ProcGroup {
+                    name: p.name.clone(),
+                    count: 0,
+                    mem: 0,
+                    cpu: 0.0,
+                    pids: Vec::new(),
+                });
             g.count += 1;
             g.mem += p.mem;
             g.cpu += p.cpu;
@@ -211,11 +245,21 @@ impl SysMon {
         v
     }
 
-    pub fn kill(&mut self, pids: &[u32]) -> usize {
+    pub fn kill(&mut self, targets: &[(u32, u64)]) -> usize {
         let mut n = 0;
-        for pid in pids {
-            if let Some(p) = self.sys.process(Pid::from_u32(*pid)) {
-                if is_critical(p.name()) {
+        let mut current = System::new();
+        for &(pid, expected_start) in targets {
+            // A process can exit while its confirmation is open, and Windows can
+            // reuse its PID for another app. Recheck its identity before killing.
+            if pid == std::process::id() {
+                continue;
+            }
+            let pid = Pid::from_u32(pid);
+            if !current.refresh_process(pid) {
+                continue;
+            }
+            if let Some(p) = current.process(pid) {
+                if !safe_kill_target(pid.as_u32(), expected_start, p.start_time(), p.name()) {
                     continue;
                 }
                 if p.kill() {
@@ -281,4 +325,18 @@ pub fn relaunch_as_admin() -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_kill_target;
+
+    #[test]
+    fn ending_apps_rejects_reused_pids_and_protected_processes() {
+        let unrelated_pid = std::process::id().wrapping_add(1);
+        assert!(safe_kill_target(unrelated_pid, 10, 10, "ordinary-app.exe"));
+        assert!(!safe_kill_target(unrelated_pid, 10, 11, "ordinary-app.exe"));
+        assert!(!safe_kill_target(unrelated_pid, 10, 10, "LSASS.EXE"));
+        assert!(!safe_kill_target(std::process::id(), 10, 10, "renamed.exe"));
+    }
 }
