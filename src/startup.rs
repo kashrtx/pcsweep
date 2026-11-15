@@ -16,6 +16,7 @@ const APPROVED_RUN32: &str =
     r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32";
 const APPROVED_FOLDER: &str =
     r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder";
+pub(crate) const STARTUP_INFO: &str = "Turning an app off only stops it launching at sign-in. It stays installed, and you can turn it back on any time. This is the same switch Task Manager uses.";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Loc {
@@ -280,10 +281,10 @@ impl App {
             "Apps that launch every time you sign in. Fewer of them means a faster boot and more free memory.",
         );
         widgets::banner(ui, ACCENT, ic::INFO, |ui| {
-            ui.label("Turning an app off only stops it launching at sign-in. It stays installed, and you can turn it back on any time. This is the same switch Task Manager uses.");
+            ui.add(Label::new(STARTUP_INFO).wrap());
         });
         ui.add_space(6.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(
                 RichText::new(format!("{}", s.enabled_count()))
                     .font(widgets::light(30.0))
@@ -298,35 +299,33 @@ impl App {
             if widgets::search_box(ui, &mut f, "Search", 200.0).changed() {
                 acts.push(SAct::Filter(f));
             }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui.add(widgets::small("Windows startup settings")).clicked() {
+                acts.push(SAct::Settings);
+            }
+            if ui
+                .add(widgets::small(widgets::icon_text(
+                    ic::REFRESH,
+                    "Refresh",
+                    13.0,
+                    TEXT,
+                )))
+                .clicked()
+            {
+                acts.push(SAct::Reload);
+            }
+            if !self.is_admin && s.items.iter().any(|i| i.loc.machine()) {
                 if ui
                     .add(widgets::small(widgets::icon_text(
-                        ic::REFRESH,
-                        "Refresh",
+                        ic::SHIELD,
+                        "Restart as admin",
                         13.0,
-                        TEXT,
+                        WARN,
                     )))
                     .clicked()
                 {
-                    acts.push(SAct::Reload);
+                    acts.push(SAct::Relaunch);
                 }
-                if ui.add(widgets::small("Windows startup settings")).clicked() {
-                    acts.push(SAct::Settings);
-                }
-                if !self.is_admin && s.items.iter().any(|i| i.loc.machine()) {
-                    if ui
-                        .add(widgets::small(widgets::icon_text(
-                            ic::SHIELD,
-                            "Restart as admin",
-                            13.0,
-                            WARN,
-                        )))
-                        .clicked()
-                    {
-                        acts.push(SAct::Relaunch);
-                    }
-                }
-            });
+            }
         });
         ui.add_space(4.0);
         let filter = s.filter.to_lowercase();

@@ -447,6 +447,11 @@ fn render_page(page: Page, size: [u32; 2], path: &Path, pending_dns: bool) {
                     "storage toolbar must not be horizontally clipped"
                 );
             }
+            if page == Page::Startup {
+                for expected in [crate::startup::STARTUP_INFO, "Windows startup settings"] {
+                    text_rect(&output, expected);
+                }
+            }
             let mut primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
             scale_primitives(&mut primitives, output.pixels_per_point);
             let image = painter.render(size, &primitives);
