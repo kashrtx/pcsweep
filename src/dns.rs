@@ -203,7 +203,7 @@ fn secure_key() -> Result<RegKey, String> {
     {
         return Err("Could not protect the DNS undo record.".into());
     }
-    let status = unsafe { RegSetKeySecurity(key.raw_handle(), 4, descriptor) };
+    let status = unsafe { RegSetKeySecurity(key.raw_handle(), 4 | 0x8000_0000, descriptor) };
     unsafe {
         windows_sys::Win32::Foundation::LocalFree(descriptor);
     }
@@ -306,8 +306,12 @@ fn static_family(guid: &str, v6: bool) -> Result<Family, String> {
         servers: s
             .split(|c: char| c.is_whitespace() || c == ',' || c == ';' || c == '\0')
             .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-            .collect(),
+            .map(|s| {
+                s.parse::<IpAddr>()
+                    .map(|ip| ip.to_string())
+                    .map_err(|_| "Windows returned an unrecognized static DNS address.".to_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?,
     };
     validate_family(&family, v6)?;
     Ok(family)

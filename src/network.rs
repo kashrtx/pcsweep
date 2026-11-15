@@ -625,7 +625,12 @@ impl App {
                 }
             });
             for finding in findings(adapter, delta) {
-                widgets::banner(ui, if finding.warning { WARN } else { ACCENT }, ic::INFO, |ui| { ui.label(widgets::strong(finding.title, 14.0)); ui.label(widgets::dim(finding.detail)); });
+                widgets::banner(ui, if finding.warning { WARN } else { ACCENT }, ic::INFO, |ui| {
+                    ui.vertical(|ui| {
+                        ui.add(Label::new(widgets::strong(finding.title, 14.0)).wrap());
+                        ui.add(Label::new(widgets::dim(finding.detail)).wrap());
+                    });
+                });
             }
             ui.horizontal_wrapped(|ui| {
                 if ui.add_enabled(adapter.connected() && !self.network.probes.running(), widgets::small("Run small connection checks…")).clicked() { check = Some(adapter.clone()); }

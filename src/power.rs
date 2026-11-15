@@ -206,7 +206,17 @@ struct Hardware {
 const HARDWARE_SCRIPT: &str = r#"
 $result=[ordered]@{plans=@();design=$null;full=$null;cycles=$null;warning=$null}
 try {$result.plans=@(Get-CimInstance -Namespace root/cimv2/power -Class Win32_PowerPlan -ErrorAction Stop|ForEach-Object { [pscustomobject]@{guid=([string]$_.InstanceID -replace '^.*\{','' -replace '\}$','').ToLowerInvariant();name=[string]$_.ElementName} })} catch {$result.warning=$_.Exception.Message}
-try {$d=@(Get-CimInstance -Namespace root/WMI -Class BatteryStaticData -ErrorAction Stop);$f=@(Get-CimInstance -Namespace root/WMI -Class BatteryFullChargedCapacity -ErrorAction Stop);if($d.Count -gt 0 -and $f.Count -gt 0){$design=($d|Measure-Object DesignedCapacity -Sum).Sum;$full=($f|Measure-Object FullChargedCapacity -Sum).Sum;if($design -gt 0 -and $full -gt 0){$result.design=[uint64]$design;$result.full=[uint64]$full}}}catch{}
+try {
+    $d=@(Get-CimInstance -Namespace root/WMI -Class BatteryStaticData -ErrorAction Stop)
+    $f=@(Get-CimInstance -Namespace root/WMI -Class BatteryFullChargedCapacity -ErrorAction Stop)
+    $design=[uint64]0;$full=[uint64]0;$complete=($d.Count -gt 0 -and $d.Count -eq $f.Count)
+    foreach($battery in $d){
+        $matched=@($f | Where-Object {$_.InstanceName -ceq $battery.InstanceName})
+        if([string]::IsNullOrEmpty($battery.InstanceName) -or $matched.Count -ne 1 -or $battery.DesignedCapacity -le 0 -or $matched[0].FullChargedCapacity -le 0){$complete=$false;break}
+        $design+=[uint64]$battery.DesignedCapacity;$full+=[uint64]$matched[0].FullChargedCapacity
+    }
+    if($complete){$result.design=$design;$result.full=$full}
+}catch{}
 try {$c=@(Get-CimInstance -Namespace root/WMI -Class BatteryCycleCount -ErrorAction Stop);if($c.Count -eq 1){$result.cycles=[uint32]$c[0].CycleCount}}catch{}
 $result|ConvertTo-Json -Depth 4 -Compress
 "#;
@@ -655,293 +665,296 @@ impl App {
 
         let s = self.power.status;
 
-        ScrollArea::vertical().id_salt("power_page").auto_shrink([false,
-false]).show(ui,
-|ui|{
+        ScrollArea::vertical()
+            .id_salt("power_page")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                widgets::page_header(ui, "Battery and power", "Use the power you need, understand battery wear, and review sleep drain without changing firmware or sleep models.");
 
-            widgets::page_header(ui,
-"Battery and power",
-"Use the power you need, understand battery wear, and review sleep drain without changing firmware or sleep models.");
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(
+                            !self.power.load.running() && !self.power.busy(),
+                            widgets::small("Refresh"),
+                        )
+                        .clicked()
+                    {
+                        refresh = true;
+                    }
+                    if self.power.load.running() || self.power.busy() {
+                        ui.spinner();
+                    }
+                    if ui.add(widgets::small("Windows Power & battery")).clicked() {
+                        util::open_uri("ms-settings:powersleep");
+                    }
+                });
 
-            ui.horizontal_wrapped(|ui|{
-if ui.add_enabled(!self.power.load.running()&&!self.power.busy(),
-widgets::small("Refresh")).clicked(){
-refresh=true;
-}
-if self.power.load.running()||self.power.busy(){
-ui.spinner();
-}
-if ui.add(widgets::small("Windows Power & battery")).clicked(){
-util::open_uri("ms-settings:powersleep");
-}
-}
-);
+                widgets::card(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(widgets::strong(
+                            match s.ac {
+                                Some(true) => "External power connected",
+                                Some(false) => "Running on battery",
+                                None => "Power source not reported",
+                            },
+                            20.0,
+                        ));
+                        if let Some(p) = s.percent {
+                            widgets::badge(
+                                ui,
+                                &format!("{p}%{}", if s.charging { " · charging" } else { "" }),
+                                GOOD,
+                            );
+                        }
+                    });
 
-            widgets::card(ui,
-|ui|{
-ui.horizontal_wrapped(|ui|{
-ui.label(widgets::strong(match s.ac{
-Some(true)=>"External power connected",
-Some(false)=>"Running on battery",
-None=>"Power source not reported"}
-,
-20.0));
-if let Some(p)=s.percent{
-widgets::badge(ui,
-&format!("{p}%{}",
-if s.charging{
-" · charging"}
-else{
-""}
-),
-GOOD);
-}
-}
-);
+                    ui.label(widgets::dim(match s.battery {
+                        Some(false) => "Windows reports no system battery. Power preferences still apply to this PC.",
+                        Some(true) => "Windows reports a battery. Runtime and capacity are estimates from the device.",
+                        None => "Windows has not reported whether a battery is available.",
+                    }));
 
-                ui.label(widgets::dim(match s.battery{
-Some(false)=>"Windows reports no system battery. Power preferences still apply to this PC.",
-Some(true)=>"Windows reports a battery. Runtime and capacity are estimates from the device.",
-None=>"Windows has not reported whether a battery is available."}
-));
+                    ui.label(widgets::faint(format!(
+                        "Windows saver state: {}",
+                        match s.saver {
+                            Some(true) => "On",
+                            Some(false) => "Off",
+                            None => "Not reported",
+                        }
+                    )));
+                    if let Some(seconds) = s.seconds {
+                        if s.ac != Some(true) {
+                            ui.label(widgets::dim(format!(
+                                "Windows runtime estimate: {}",
+                                util::fmt_duration(seconds as u64)
+                            )));
+                        }
+                    }
+                });
 
-                ui.label(widgets::faint(format!("Windows saver state: {}",
-match s.saver{
-Some(true)=>"On",
-Some(false)=>"Off",
-None=>"Not reported"}
-)));
-if let Some(seconds)=s.seconds{
-if s.ac!=Some(true){
-ui.label(widgets::dim(format!("Windows runtime estimate: {}",
-util::fmt_duration(seconds as u64))));
-}
-}
-}
-);
-
-            if let Some(e)=&self.power.error{
-ui.colored_label(WARN,
-e);
-}
-if let Some(m)=&self.power.message{
-ui.label(widgets::dim(m));
-}
-
-            if let Some(snapshot)=&self.power.snapshot{
-
-                widgets::section(ui,
-"Configured power preferences");
-
-                ui.label(widgets::dim("Balanced is a good everyday choice. Performance can increase heat and fan noise; efficiency may reduce throughput. Windows and manufacturer signals can override a configured preference."));
-
-                let modern=snapshot.ac.as_ref().ok().zip(snapshot.dc.as_ref().ok());
-
-                if let Some((ac,
-dc))=modern{
-for(setting,
-label,
-current)in[("ac",
-"Plugged in",
-ac),
-("dc",
-"On battery",
-dc)]{
-widgets::card(ui,
-|ui|{
-ui.label(widgets::strong(label,
-16.0));
-ui.label(widgets::dim(format!("Configured mode: {}",
-mode_name(current).unwrap_or("Custom / unrecognized"))));
-
-                    ui.horizontal_wrapped(|ui|{
-for(mode,
-name)in[(BALANCED,
-"Balanced"),
-(EFFICIENCY,
-"Best power efficiency"),
-(PERFORMANCE,
-"Best performance")]{
-if setting=="dc"&&mode==PERFORMANCE{
-continue;
-}
-if ui.add_enabled(!self.mutations_running()&&mode_name(current).is_some()&&current!=mode,
-widgets::small(name)).clicked(){
-chosen=Some(PowerAction::Set{
-setting:setting.into(),
-expected:current.clone(),
-value:mode.into()}
-);
-}
-}
-}
-);
-}
-);
-}
-
-                    ui.label(widgets::faint("Windows applies these separate AC/DC preferences when the power source changes. PCSweep does not need to stay open or install a service."));
-
+                if let Some(e) = &self.power.error {
+                    ui.colored_label(WARN, e);
                 }
-else{
-ui.label(widgets::dim("Modern power-mode controls are unavailable on this build. Review the supported Windows power plans below or use Windows Settings."));
+                if let Some(m) = &self.power.message {
+                    ui.label(widgets::dim(m));
+                }
 
-                    if let Ok(current)=&snapshot.plan{
-for plan in &snapshot.hardware.plans{
-if [BALANCED_PLAN,
-PERFORMANCE_PLAN,
-SAVER_PLAN].contains(&plan.guid.as_str()){
-let allowed=plan.guid!=PERFORMANCE_PLAN||s.ac==Some(true);
-if ui.add_enabled(!self.mutations_running()&&current!=&plan.guid&&allowed,
-widgets::small(format!("Use {} (power plan)",
-plan.name))).clicked(){
-chosen=Some(PowerAction::Set{
-setting:"plan".into(),
-expected:current.clone(),
-value:plan.guid.clone()}
-);
-}
-}
-}
-}
+                if let Some(snapshot) = &self.power.snapshot {
+                    widgets::section(ui, "Configured power preferences");
 
-                    ui.label(widgets::faint("A legacy power plan is different from Windows 11 Power Mode. Hidden/OEM plans are not created or forced."));
-}
+                    ui.label(widgets::dim("Balanced is a good everyday choice. Performance can increase heat and fan noise; efficiency may reduce throughput. Windows and manufacturer signals can override a configured preference."));
 
-                match &snapshot.undo{
-Ok(entries)if !entries.is_empty()=>{
-if ui.add_enabled(!self.mutations_running(),
-widgets::ghost("Undo PCSweep power changes")).clicked(){
-chosen=Some(PowerAction::Undo);
-}
-}
-,
-Err(e)=>{
-ui.colored_label(WARN,
-e);
-}
-,
-_=>{
-}
-}
+                    let modern = snapshot.ac.as_ref().ok().zip(snapshot.dc.as_ref().ok());
 
-                widgets::section(ui,
-"Battery health");
-widgets::card(ui,
-|ui|{
-match(snapshot.hardware.design,
-snapshot.hardware.full){
-(Some(design),
-Some(full))if design>0=>{
-ui.label(widgets::strong(format!("Reported full-charge capacity: {:.0}% of design",
-full as f64/design as f64*100.0),
-17.0));
-ui.label(widgets::dim(format!("Design: {design} mWh · Current full charge: {full} mWh")));
-}
-,
-_=>{
-ui.label(widgets::dim("The firmware did not provide comparable battery capacities. The Windows battery report may have more detail."));
-}
-}
-if let Some(c)=snapshot.hardware.cycles{
-ui.label(widgets::dim(format!("Reported cycle count: {c}")));
-}
-ui.label(widgets::faint("Capacity reports depend on device calibration and may exceed 100%. They are not a laboratory measurement or a guaranteed runtime."));
-}
-);
+                    if let Some((ac, dc)) = modern {
+                        for (setting, label, current) in
+                            [("ac", "Plugged in", ac), ("dc", "On battery", dc)]
+                        {
+                            widgets::card(ui, |ui| {
+                                ui.label(widgets::strong(label, 16.0));
+                                ui.label(widgets::dim(format!(
+                                    "Configured mode: {}",
+                                    mode_name(current).unwrap_or("Custom / unrecognized")
+                                )));
 
-                if let Some(w)=&snapshot.hardware.warning{
-ui.label(widgets::faint(w));
-}
+                                ui.horizontal_wrapped(|ui| {
+                                    for (mode, name) in [
+                                        (BALANCED, "Balanced"),
+                                        (EFFICIENCY, "Best power efficiency"),
+                                        (PERFORMANCE, "Best performance"),
+                                    ] {
+                                        if setting == "dc" && mode == PERFORMANCE {
+                                            continue;
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                !self.mutations_running()
+                                                    && mode_name(current).is_some()
+                                                    && current != mode,
+                                                widgets::small(name),
+                                            )
+                                            .clicked()
+                                        {
+                                            chosen = Some(PowerAction::Set {
+                                                setting: setting.into(),
+                                                expected: current.clone(),
+                                                value: mode.into(),
+                                            });
+                                        }
+                                    }
+                                });
+                            });
+                        }
 
-            }
+                        ui.label(widgets::faint("Windows applies these separate AC/DC preferences when the power source changes. PCSweep does not need to stay open or install a service."));
+                    } else {
+                        ui.label(widgets::dim("Modern power-mode controls are unavailable on this build. Review the supported Windows power plans below or use Windows Settings."));
 
-            widgets::section(ui,
-"Reports and sleep drain");
-ui.label(widgets::dim("Create local Windows reports. SleepStudy requires a supported Modern Standby device; some diagnostics require administrator rights. No sleep mode or timer is changed."));
+                        if let Ok(current) = &snapshot.plan {
+                            for plan in &snapshot.hardware.plans {
+                                if [BALANCED_PLAN, PERFORMANCE_PLAN, SAVER_PLAN]
+                                    .contains(&plan.guid.as_str())
+                                {
+                                    let allowed =
+                                        plan.guid != PERFORMANCE_PLAN || s.ac == Some(true);
+                                    if ui
+                                        .add_enabled(
+                                            !self.mutations_running()
+                                                && current != &plan.guid
+                                                && allowed,
+                                            widgets::small(format!(
+                                                "Use {} (power plan)",
+                                                plan.name
+                                            )),
+                                        )
+                                        .clicked()
+                                    {
+                                        chosen = Some(PowerAction::Set {
+                                            setting: "plan".into(),
+                                            expected: current.clone(),
+                                            value: plan.guid.clone(),
+                                        });
+                                    }
+                                }
+                            }
+                        }
 
-            ui.horizontal_wrapped(|ui|{
-for kind in[ReportKind::Battery,
-ReportKind::Sleep,
-ReportKind::Requests,
-ReportKind::LastWake,
-ReportKind::WakeTimers]{
-if ui.add_enabled(!self.mutations_running(),
-widgets::small(kind.label())).clicked(){
-chosen=Some(PowerAction::Report(kind));
-}
-}
-}
-);
+                        ui.label(widgets::faint("A legacy power plan is different from Windows 11 Power Mode. Hidden/OEM plans are not created or forced."));
+                    }
 
-            if let Some(path)=&self.power.report{
-ui.horizontal_wrapped(|ui|{
-if ui.add(widgets::primary("Open last report")).clicked(){
-util::open_path(path);
-}
-if ui.add(widgets::small("Show report folder")).clicked(){
-util::show_in_explorer(path);
-}
-}
-);
-}
+                    match &snapshot.undo {
+                        Ok(entries) if !entries.is_empty() => {
+                            if ui
+                                .add_enabled(
+                                    !self.mutations_running(),
+                                    widgets::ghost("Undo PCSweep power changes"),
+                                )
+                                .clicked()
+                            {
+                                chosen = Some(PowerAction::Undo);
+                            }
+                        }
+                        Err(e) => {
+                            ui.colored_label(WARN, e);
+                        }
+                        _ => {}
+                    }
 
-            widgets::section(ui,
-"Charging and battery saver");
-ui.label(widgets::dim("Use Energy Saver / Battery Saver and screen recommendations in Windows. Charge caps and Smart Charging depend on the manufacturer; PCSweep does not promise a universal 80% switch or change firmware."));
+                    widgets::section(ui, "Battery health");
+                    widgets::card(ui, |ui| {
+                        match (snapshot.hardware.design, snapshot.hardware.full) {
+                            (Some(design), Some(full)) if design > 0 => {
+                                ui.label(widgets::strong(
+                                    format!(
+                                        "Reported full-charge capacity: {:.0}% of design",
+                                        full as f64 / design as f64 * 100.0
+                                    ),
+                                    17.0,
+                                ));
+                                ui.label(widgets::dim(format!("Design: {design} mWh · Current full charge: {full} mWh")));
+                            }
+                            _ => {
+                                ui.label(widgets::dim("The firmware did not provide comparable battery capacities. The Windows battery report may have more detail."));
+                            }
+                        }
+                        if let Some(c) = snapshot.hardware.cycles {
+                            ui.label(widgets::dim(format!("Reported cycle count: {c}")));
+                        }
+                        ui.label(widgets::faint("Capacity reports depend on device calibration and may exceed 100%. They are not a laboratory measurement or a guaranteed runtime."));
+                    });
 
-            ui.horizontal_wrapped(|ui|{
-if ui.add(widgets::small("Energy Saver settings")).clicked(){
-util::open_uri("ms-settings:batterysaver");
-}
-if ui.add(widgets::small("Windows battery care guidance")).clicked(){
-util::open_uri("https://support.microsoft.com/en-us/windows/experience/power-battery/caring-for-your-battery-in-windows");
-}
-}
-);
+                    if let Some(w) = &snapshot.hardware.warning {
+                        ui.label(widgets::faint(w));
+                    }
+                }
 
-        }
-);
+                widgets::section(ui, "Reports and sleep drain");
+                ui.label(widgets::dim("Create local Windows reports. SleepStudy requires a supported Modern Standby device; some diagnostics require administrator rights. No sleep mode or timer is changed."));
+
+                ui.horizontal_wrapped(|ui| {
+                    for kind in [
+                        ReportKind::Battery,
+                        ReportKind::Sleep,
+                        ReportKind::Requests,
+                        ReportKind::LastWake,
+                        ReportKind::WakeTimers,
+                    ] {
+                        if ui
+                            .add_enabled(!self.mutations_running(), widgets::small(kind.label()))
+                            .clicked()
+                        {
+                            chosen = Some(PowerAction::Report(kind));
+                        }
+                    }
+                });
+
+                if let Some(path) = &self.power.report {
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.add(widgets::primary("Open last report")).clicked() {
+                            util::open_path(path);
+                        }
+                        if ui.add(widgets::small("Show report folder")).clicked() {
+                            util::show_in_explorer(path);
+                        }
+                    });
+                }
+
+                widgets::section(ui, "Charging and battery saver");
+                ui.label(widgets::dim("Use Energy Saver / Battery Saver and screen recommendations in Windows. Charge caps and Smart Charging depend on the manufacturer; PCSweep does not promise a universal 80% switch or change firmware."));
+
+                ui.horizontal_wrapped(|ui| {
+                    if ui.add(widgets::small("Energy Saver settings")).clicked() {
+                        util::open_uri("ms-settings:batterysaver");
+                    }
+                    if ui
+                        .add(widgets::small("Windows battery care guidance"))
+                        .clicked()
+                    {
+                        util::open_uri("https://support.microsoft.com/en-us/windows/experience/power-battery/caring-for-your-battery-in-windows");
+                    }
+                });
+            });
 
         if refresh {
             self.refresh_power(&ctx);
         }
 
         if let Some(action) = chosen {
-            let(title,
-body,
-confirm)=match &action{
-PowerAction::Set{
-setting,
-value,
-..}
-=>("Change this power preference?".into(),
-format!("Apply {} for {}. PCSweep saves the original setting first. Other AC/DC settings, networking, firmware and sleep models are kept.",
-mode_name(value).unwrap_or("the selected power plan"),
-match setting.as_str(){
-"ac"=>"plugged-in use",
-"dc"=>"battery use",
-_=>"this Windows session"}
-),
-"Apply preference"),
-PowerAction::Undo=>("Restore saved power preferences?".into(),
-"Restore only the preferences PCSweep changed. Values changed outside PCSweep are preserved for review.".into(),
-"Restore preferences"),
-PowerAction::Report(kind)=>(format!("Create {}?",
-kind.label()),
-"Ask Windows to create a local diagnostic report in PCSweep's reports folder. The report can contain device and usage information; nothing is uploaded or changed in the power configuration.".into(),
-"Create report")}
-;
+            let (title, body, confirm) = match &action {
+                PowerAction::Set { setting, value, .. } => (
+                    "Change this power preference?".into(),
+                    format!(
+                        "Apply {} for {}. PCSweep saves the original setting first. Other AC/DC settings, networking, firmware and sleep models are kept.",
+                        mode_name(value).unwrap_or("the selected power plan"),
+                        match setting.as_str() {
+                            "ac" => "plugged-in use",
+                            "dc" => "battery use",
+                            _ => "this Windows session",
+                        }
+                    ),
+                    "Apply preference",
+                ),
+                PowerAction::Undo => (
+                    "Restore saved power preferences?".into(),
+                    "Restore only the preferences PCSweep changed. Values changed outside PCSweep are preserved for review.".into(),
+                    "Restore preferences",
+                ),
+                PowerAction::Report(kind) => (
+                    format!("Create {}?", kind.label()),
+                    "Ask Windows to create a local diagnostic report in PCSweep's reports folder. The report can contain device and usage information; nothing is uploaded or changed in the power configuration.".into(),
+                    "Create report",
+                ),
+            };
 
-            self.modal=Some(Modal{
-title,
-body,
-details:Vec::new(),
-note:Some("Windows may refuse organization-managed or unsupported settings. PCSweep verifies applied values and reports failures.".into()),
-confirm:confirm.into(),
-danger:false,
-action:Action::Power(action)}
-);
+            self.modal = Some(Modal {
+                title,
+                body,
+                details: Vec::new(),
+                note: Some("Windows may refuse organization-managed or unsupported settings. PCSweep verifies applied values and reports failures.".into()),
+                confirm: confirm.into(),
+                danger: false,
+                action: Action::Power(action),
+            });
         }
     }
 }
@@ -1083,6 +1096,9 @@ mod tests {
     }
     #[test]
     fn native_status_and_queries_are_read_only() {
+        let data = platform::powershell(HARDWARE_SCRIPT, Duration::from_secs(30)).unwrap();
+        let hardware: Hardware = serde_json::from_str(&data).unwrap();
+        assert_eq!(hardware.design.is_some(), hardware.full.is_some());
         let _ = status();
         let _ = active_plan();
         let _ = get_setting("ac");

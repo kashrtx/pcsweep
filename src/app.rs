@@ -113,6 +113,7 @@ pub struct App {
     pub relaunch: Task<bool>,
     activity_filter: String,
     last_nav_page: Option<Page>,
+    reveal_nav_frames: u8,
 }
 
 impl App {
@@ -143,6 +144,7 @@ impl App {
             relaunch: Task::default(),
             activity_filter: String::new(),
             last_nav_page: None,
+            reveal_nav_frames: 0,
         };
         util::load_log_history();
         util::log(format!(
@@ -377,7 +379,12 @@ impl App {
                 (Page::Activity, ic::HISTORY, "Activity log"),
             ],
         ];
-        let reveal_selected = self.last_nav_page != Some(self.page);
+        if self.last_nav_page != Some(self.page) {
+            // ScrollArea settles its viewport over the first layout passes.
+            self.reveal_nav_frames = 3;
+        }
+        let reveal_selected = self.reveal_nav_frames > 0;
+        self.reveal_nav_frames = self.reveal_nav_frames.saturating_sub(1);
         self.last_nav_page = Some(self.page);
         ScrollArea::vertical()
             .id_salt("navigation_scroll")
@@ -495,6 +502,7 @@ impl App {
             relaunch: Default::default(),
             activity_filter: String::new(),
             last_nav_page: None,
+            reveal_nav_frames: 0,
         }
     }
 

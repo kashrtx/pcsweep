@@ -427,11 +427,11 @@ fn long_confirmation_content_keeps_both_actions_visible_at_supported_sizes() {
             action: Action::RunTool(usize::MAX),
         });
         let mut painter = CpuPainter::default();
-        for frame in 0..3 {
+        for frame in 0..8 {
             let output = ctx.run(
                 egui::RawInput {
                     screen_rect: Some(screen),
-                    time: Some(frame as f64 / 60.0),
+                    time: Some(frame as f64 * 0.1),
                     ..Default::default()
                 },
                 |ctx| {
@@ -451,7 +451,12 @@ fn long_confirmation_content_keeps_both_actions_visible_at_supported_sizes() {
             for (id, delta) in &output.textures_delta.set {
                 painter.set_texture(*id, delta);
             }
-            if frame == 2 {
+            if frame == 7 {
+                let primitives = ctx.tessellate(output.shapes.clone(), output.pixels_per_point);
+                painter
+                    .render(size, &primitives)
+                    .save(directory.join(format!("confirmation-{}x{}.png", size[0], size[1])))
+                    .unwrap();
                 for expected in ["Cancel", "Confirm preview change"] {
                     let mut found = Vec::new();
                     for shape in &output.shapes {
