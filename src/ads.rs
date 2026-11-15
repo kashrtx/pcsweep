@@ -211,7 +211,11 @@ fn config_label(config: &Config) -> String {
             f.servers.join(", ")
         }
     };
-    format!("Adapter IPv4: {}\nAdapter IPv6: {}", part(&config.v4), part(&config.v6))
+    format!(
+        "Adapter IPv4: {}\nAdapter IPv6: {}",
+        part(&config.v4),
+        part(&config.v6)
+    )
 }
 impl App {
     fn refresh_ads(&mut self, ctx: &egui::Context) {
