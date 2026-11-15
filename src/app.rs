@@ -426,40 +426,48 @@ impl App {
         let reveal_selected = self.reveal_nav_frames > 0;
         self.reveal_nav_frames = self.reveal_nav_frames.saturating_sub(1);
         self.last_nav_page = Some(self.page);
-        ScrollArea::vertical()
+        let nav_height = (ui.available_height() - 100.0).max(100.0);
+        let mut navigation = ScrollArea::vertical()
             .id_salt("navigation_scroll")
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-            .max_height((ui.available_height() - 100.0).max(100.0))
-            .auto_shrink([false, true])
-            .show(ui, |ui| {
-                for group in nav {
-                    for &(page, icon_char, label) in group {
-                        let badge = match page {
-                            Page::Cleaner => junk_badge.as_deref(),
-                            Page::Startup => startup_badge.as_deref(),
-                            _ => None,
-                        };
-                        let response =
-                            widgets::nav_item(ui, icon_char, label, self.page == page, badge);
-                        if reveal_selected && self.page == page {
-                            if !ui.clip_rect().contains_rect(response.rect) {
-                                ui.scroll_with_delta_animation(
-                                    vec2(0.0, ui.clip_rect().center().y - response.rect.center().y),
-                                    egui::style::ScrollAnimation::none(),
-                                );
-                            }
-                        }
-                        if response.clicked() {
-                            if page == Page::Startup {
-                                self.startup.reload();
-                            }
-                            self.page = page;
-                        }
-                        ui.add_space(1.0);
+            .max_height(nav_height)
+            .auto_shrink([false, true]);
+        if reveal_selected {
+            let row_height = 38.0 + ui.spacing().item_spacing.y + 1.0;
+            let mut top = 0.0;
+            let mut selected = 0.0;
+            for group in nav {
+                for &(page, _, _) in group {
+                    if self.page == page {
+                        selected = top + 19.0;
                     }
-                    ui.add_space(14.0);
+                    top += row_height;
                 }
-            });
+                top += 14.0;
+            }
+            navigation = navigation.vertical_scroll_offset((selected - nav_height / 2.0).max(0.0));
+        }
+        navigation.show(ui, |ui| {
+            for group in nav {
+                for &(page, icon_char, label) in group {
+                    let badge = match page {
+                        Page::Cleaner => junk_badge.as_deref(),
+                        Page::Startup => startup_badge.as_deref(),
+                        _ => None,
+                    };
+                    let response =
+                        widgets::nav_item(ui, icon_char, label, self.page == page, badge);
+                    if response.clicked() {
+                        if page == Page::Startup {
+                            self.startup.reload();
+                        }
+                        self.page = page;
+                    }
+                    ui.add_space(1.0);
+                }
+                ui.add_space(14.0);
+            }
+        });
 
         let mut want_relaunch = false;
         let busy = self.relaunch.running();
