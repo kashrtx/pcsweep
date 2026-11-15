@@ -531,7 +531,6 @@ fn policy_guard(environment: &Environment) -> Result<(), String> {
     }
     if environment.domain != Some(false)
         || present_key(r"SOFTWARE\Microsoft\Provisioning\OMADM\Accounts")?
-        || present_key(r"SOFTWARE\Microsoft\PolicyManager\Providers")?
     {
         return Err(
             "Windows may be organization-managed. PCSweep keeps administrator policy unchanged."
@@ -628,7 +627,7 @@ try {
  if($count -gt 0){$events+=@($searcher.QueryHistory(0,$count)|ForEach-Object{[pscustomobject]@{time=$_.Date.ToString('yyyy-MM-dd HH:mm:ss');source='Windows Update';description=([string]$_.Title)+' | '+[string]$outcomes[[int]$_.ResultCode]}})}
 }catch{$warnings+='Windows Update history: '+$_.Exception.Message}
 try {
- $events+=@(Get-CimInstance Win32_ReliabilityRecords -Filter "TimeGenerated >= '$((Get-Date).AddDays(-30).ToString('yyyyMMddHHmmss.000000-000'))'" -ErrorAction Stop|Sort-Object TimeGenerated -Descending|Select-Object -First 40|ForEach-Object{[pscustomobject]@{time=$_.TimeGenerated.ToString('yyyy-MM-dd HH:mm:ss');source=[string]$_.SourceName;description=([string]$_.ProductName)+' | '+[string]$_.Message}})
+ $events+=@(Get-CimInstance Win32_ReliabilityRecords -Filter "TimeGenerated >= '$((Get-Date).ToUniversalTime().AddDays(-30).ToString('yyyyMMddHHmmss.000000+000'))'" -ErrorAction Stop|Sort-Object TimeGenerated -Descending|Select-Object -First 40|ForEach-Object{[pscustomobject]@{time=$_.TimeGenerated.ToString('yyyy-MM-dd HH:mm:ss');source=[string]$_.SourceName;description=([string]$_.ProductName)+' | '+[string]$_.Message}})
 }catch{$warnings+='Windows reliability history: '+$_.Exception.Message}
 [pscustomobject]@{events=@($events|Sort-Object time -Descending);warnings=@($warnings)}|ConvertTo-Json -Depth 4 -Compress
 "#;
@@ -644,6 +643,25 @@ fn timeline() -> Result<Timeline, String> {
 pub enum WindowsControlsAction {
     Set { control: String, expected: String },
     Undo { system: bool },
+    Discard { system: bool, expected: String },
+}
+fn entries_fingerprint(entries: &[Entry]) -> Result<String, String> {
+    if entries.is_empty() {
+        return Err("There is no saved Windows Undo to dismiss.".into());
+    }
+    validate_entries(entries, machine(&entries[0].id))?;
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(entries).map_err(|e| e.to_string())?)
+    ))
+}
+fn discard_transaction(backend: &mut impl Backend, expected: &str) -> Result<String, String> {
+    let entries = backend.load()?;
+    if entries_fingerprint(&entries)? != expected {
+        return Err("Windows Undo changed after review. Refresh before dismissing it.".into());
+    }
+    backend.save(&[])?;
+    Ok("Saved Windows Undo dismissed. No Windows preference was changed.".into())
 }
 fn execute(action: WindowsControlsAction) -> Result<String, String> {
     let _lock = Lock::take()?;
@@ -655,6 +673,9 @@ fn execute(action: WindowsControlsAction) -> Result<String, String> {
                 policy_guard(&environment()?)?;
             }
             transaction(&mut WindowsBackend(system), &changes, &expected)
+        }
+        WindowsControlsAction::Discard { system, expected } => {
+            discard_transaction(&mut WindowsBackend(system), &expected)
         }
         WindowsControlsAction::Undo { system } => {
             if system {
@@ -873,7 +894,7 @@ impl App {
                     undo_controls(
                         ui,
                         &snapshot.machine_undo,
-                        !busy && self.is_admin && snapshot.policy_guard.is_ok(),
+                        !busy && self.is_admin,
                         true,
                         &mut action,
                     );
@@ -1022,6 +1043,7 @@ impl App {
                 WindowsControlsAction::Set { .. } => {
                     ("Change this animation preference?", "Windows will update the reviewed animation preference for this account using its supported system API. Existing values are saved for Undo. This changes visual transitions, not application throughput.", false)
                 }
+                WindowsControlsAction::Discard { .. } => ("Dismiss saved Windows Undo?", "Keep the current Windows values and dismiss the saved original preferences. They will no longer be offered as Undo. This does not change Windows settings.", true),
                 WindowsControlsAction::Undo { .. } => {
                     ("Restore saved Windows preferences?", "Restore only the values PCSweep changed. Changes made outside PCSweep are kept for review, and unrelated preferences stay as they are.", false)
                 }
@@ -1031,7 +1053,7 @@ impl App {
                 body: body.into(),
                 details: Vec::new(),
                 note: Some("Configured policy readback does not prove immediate effective enforcement. Managed or unsupported Windows configurations are protected.".into()),
-                confirm: if matches!(action, WindowsControlsAction::Undo { .. }) {
+                confirm: if matches!(action, WindowsControlsAction::Discard { .. }) { "Keep current and dismiss Undo".into() } else if matches!(action, WindowsControlsAction::Undo { .. }) {
                     "Restore preferences".into()
                 } else {
                     "Apply reviewed change".into()
@@ -1063,6 +1085,14 @@ fn undo_controls(
                 .clicked()
             {
                 *action = Some(WindowsControlsAction::Undo { system });
+            }
+            if let Ok(expected) = entries_fingerprint(entries) {
+                if ui
+                    .add_enabled(enabled, widgets::small("Dismiss saved Undo…"))
+                    .clicked()
+                {
+                    *action = Some(WindowsControlsAction::Discard { system, expected });
+                }
             }
         }
         Err(e) => {
@@ -1120,6 +1150,20 @@ mod tests {
                 .collect::<Vec<_>>(),
         )
         .unwrap()
+    }
+    #[test]
+    fn dismiss_undo_preserves_values_and_refuses_changed_record() {
+        let mut fake = Fake::default();
+        let changes = desired("manual").unwrap();
+        let reviewed = expected(&mut fake, &changes);
+        transaction(&mut fake, &changes, &reviewed).unwrap();
+        let reviewed = entries_fingerprint(&fake.load().unwrap()).unwrap();
+        let writes = fake.writes;
+        assert!(discard_transaction(&mut fake, "wrong").is_err());
+        discard_transaction(&mut fake, &reviewed).unwrap();
+        assert!(fake.load().unwrap().is_empty());
+        assert_eq!(fake.writes, writes);
+        assert_eq!(fake.read("no_auto").unwrap(), Some(Value::dword(1)));
     }
     #[test]
     fn durable_undo_precedes_writes_and_partial_policy_change_is_recoverable() {

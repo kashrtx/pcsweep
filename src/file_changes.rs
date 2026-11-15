@@ -340,30 +340,33 @@ impl App {
     pub fn page_file_changes(&mut self, ui: &mut Ui) {
         widgets::page_header(ui,"Windows file changes","Inspect existing Windows records to understand changes beyond PCSweep's own cleanup history.");
         ui.label(widgets::dim("Windows File History is an optional backup feature. The NTFS journal is a separate, partial change record; it does not identify which program made a change."));
+        let selected_before = (self.file_changes.audit, self.file_changes.drive.clone());
         let mut read = false;
         let mut resume_read = None;
         ui.horizontal_wrapped(|ui| {
-            ui.selectable_value(&mut self.file_changes.audit, false, "Filesystem changes");
-            ui.selectable_value(
-                &mut self.file_changes.audit,
-                true,
-                "Existing audit evidence",
-            );
-            if self.file_changes.drive.is_empty() {
-                self.file_changes.drive = "C:".into();
-            }
-            if !self.file_changes.audit {
-                egui::ComboBox::from_id_salt("changes_drive")
-                    .selected_text(&self.file_changes.drive)
-                    .show_ui(ui, |ui| {
-                        for d in &self.sys.drives {
-                            let s = d.letter();
-                            if volume_letter(&s).is_ok() {
-                                ui.selectable_value(&mut self.file_changes.drive, s.clone(), s);
+            ui.add_enabled_ui(!self.file_changes.job.running(), |ui| {
+                ui.selectable_value(&mut self.file_changes.audit, false, "Filesystem changes");
+                ui.selectable_value(
+                    &mut self.file_changes.audit,
+                    true,
+                    "Existing audit evidence",
+                );
+                if self.file_changes.drive.is_empty() {
+                    self.file_changes.drive = "C:".into();
+                }
+                if !self.file_changes.audit {
+                    egui::ComboBox::from_id_salt("changes_drive")
+                        .selected_text(&self.file_changes.drive)
+                        .show_ui(ui, |ui| {
+                            for d in &self.sys.drives {
+                                let s = d.letter();
+                                if volume_letter(&s).is_ok() {
+                                    ui.selectable_value(&mut self.file_changes.drive, s.clone(), s);
+                                }
                             }
-                        }
-                    });
-            }
+                        });
+                }
+            });
             read = ui
                 .add_enabled(
                     !self.file_changes.job.running(),
@@ -383,6 +386,10 @@ impl App {
                 ui.label("Reading a bounded sample…");
             }
         });
+        if selected_before != (self.file_changes.audit, self.file_changes.drive.clone()) {
+            self.file_changes.evidence = None;
+            self.file_changes.error = None;
+        }
         if let Some(e) = &self.file_changes.error {
             ui.colored_label(WARN, e);
             ui.label(widgets::dim("Unavailable records are not proof that no files changed. Auditing must already have been enabled for access evidence."));
