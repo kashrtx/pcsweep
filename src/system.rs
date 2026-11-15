@@ -1,5 +1,6 @@
 use crate::util;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use sysinfo::{DiskKind, Disks, System};
 
@@ -172,13 +173,205 @@ pub fn memory_pressure(total: u64, available: u64, commit: u64, limit: u64) -> M
     }
 }
 
+/// Runs a slow OS query on its own thread. Requests coalesce and the UI only polls
+/// for a finished result, so a sleeping disk or a busy process table can't stall a frame.
+struct Worker<T> {
+    request: mpsc::Sender<()>,
+    results: mpsc::Receiver<T>,
+    pending: bool,
+}
+
+impl<T: Send + 'static> Worker<T> {
+    fn spawn(name: &str, mut job: impl FnMut() -> T + Send + 'static) -> Option<Self> {
+        let (request, requests) = mpsc::channel::<()>();
+        let (sender, results) = mpsc::channel();
+        std::thread::Builder::new()
+            .name(name.to_string())
+            .spawn(move || {
+                while requests.recv().is_ok() {
+                    while requests.try_recv().is_ok() {}
+                    if sender.send(job()).is_err() {
+                        break;
+                    }
+                }
+            })
+            .ok()?;
+        Some(Self {
+            request,
+            results,
+            pending: false,
+        })
+    }
+
+    /// Asks for a fresh result. Returns false if the worker has stopped.
+    fn request(&mut self) -> bool {
+        if !self.pending {
+            self.pending = self.request.send(()).is_ok();
+        }
+        self.pending
+    }
+
+    /// The newest finished result, if one arrived since the last poll.
+    fn latest(&mut self) -> Option<T> {
+        let mut latest = None;
+        loop {
+            match self.results.try_recv() {
+                Ok(value) => latest = Some(value),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.pending = false;
+                    break;
+                }
+            }
+        }
+        if latest.is_some() {
+            self.pending = false;
+        }
+        latest
+    }
+}
+
+struct ProcSnapshot {
+    procs: Vec<Proc>,
+    groups: Vec<ProcGroup>,
+}
+
+fn filetime_to_unix(time: &windows_sys::Win32::Foundation::FILETIME) -> u64 {
+    let ticks = ((time.dwHighDateTime as u64) << 32) | time.dwLowDateTime as u64;
+    (ticks / 10_000_000).saturating_sub(11_644_473_600)
+}
+
+/// Private commit (PrivateUsage) for this exact process lifetime, or None when
+/// Windows can't report it. sysinfo's `virtual_memory()` silently falls back to the
+/// virtual address-space size for processes it can't open, which on 64-bit Windows
+/// is often terabytes; mixing the two produced impossible "-2 TB" growth.
+fn private_usage(pid: u32, start: u64) -> Option<u64> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    if pid == 0 || start == 0 {
+        return None;
+    }
+    let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if raw == 0 {
+        return None;
+    }
+    let handle = ProcessHandle(raw);
+    let mut created: FILETIME = unsafe { std::mem::zeroed() };
+    let mut exited = created;
+    let mut kernel = created;
+    let mut user = created;
+    if unsafe { GetProcessTimes(handle.0, &mut created, &mut exited, &mut kernel, &mut user) } == 0
+    {
+        return None;
+    }
+    if filetime_to_unix(&created) != start {
+        return None;
+    }
+    let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+    let mut counters: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
+    counters.cb = size;
+    let pointer = (&mut counters as *mut PROCESS_MEMORY_COUNTERS_EX).cast();
+    if unsafe { GetProcessMemoryInfo(handle.0, pointer, size) } == 0 {
+        return None;
+    }
+    Some(counters.PrivateUsage as u64)
+}
+
+/// One process sample, used only by the background worker.
+fn sample_processes(sys: &mut System, history: &mut MemoryHistory, cores: f32) -> ProcSnapshot {
+    sys.refresh_processes();
+    let mut procs: Vec<Proc> = sys
+        .processes()
+        .iter()
+        .filter(|(_, p)| p.memory() > 0)
+        .map(|(pid, p)| Proc {
+            pid: pid.as_u32(),
+            start_time: p.start_time(),
+            name: p.name().to_string(),
+            mem: p.memory(),
+            private_bytes: private_usage(pid.as_u32(), p.start_time()),
+            growth: 0,
+            observed_secs: 0,
+            cpu: p.cpu_usage() / cores,
+        })
+        .collect();
+    procs.sort_unstable_by_key(|p| std::cmp::Reverse(p.mem));
+    history.observe(&mut procs, Instant::now());
+    let groups = group_processes(&procs);
+    ProcSnapshot { procs, groups }
+}
+
+fn group_processes(procs: &[Proc]) -> Vec<ProcGroup> {
+    let mut map: HashMap<String, ProcGroup> = HashMap::new();
+    for p in procs {
+        let g = map
+            .entry(p.name.to_lowercase())
+            .or_insert_with(|| ProcGroup {
+                name: p.name.clone(),
+                count: 0,
+                mem: 0,
+                cpu: 0.0,
+                private_bytes: 0,
+                private_known: 0,
+                growth: 0,
+                observed_secs: 0,
+                pids: Vec::new(),
+            });
+        g.count += 1;
+        g.mem += p.mem;
+        g.cpu += p.cpu;
+        if let Some(private) = p.private_bytes {
+            g.private_bytes = g.private_bytes.saturating_add(private);
+            g.private_known += 1;
+            g.growth = g.growth.saturating_add(p.growth);
+            g.observed_secs = g.observed_secs.max(p.observed_secs);
+        }
+        g.pids.push(p.pid);
+    }
+    let mut v: Vec<ProcGroup> = map.into_values().collect();
+    v.sort_by(|a, b| b.mem.cmp(&a.mem));
+    v
+}
+
+/// Drive discovery can block on sleeping or unreachable drives; it runs on a worker.
+fn read_drives() -> Vec<Drive> {
+    let disks = Disks::new_with_refreshed_list();
+    let mut v: Vec<Drive> = disks
+        .list()
+        .iter()
+        .filter(|d| d.total_space() > 0)
+        .map(|d| Drive {
+            mount: d.mount_point().to_string_lossy().to_string(),
+            label: d.name().to_string_lossy().to_string(),
+            total: d.total_space(),
+            free: d.available_space(),
+            kind: match d.kind() {
+                DiskKind::SSD => "SSD",
+                DiskKind::HDD => "HDD",
+                _ => "Drive",
+            },
+            removable: d.is_removable(),
+        })
+        .collect();
+    v.sort_by(|a, b| a.mount.cmp(&b.mount));
+    v.dedup_by(|a, b| a.mount == b.mount);
+    v
+}
+
 pub struct SysMon {
     sys: System,
     last_fast: Option<Instant>,
     last_disks: Option<Instant>,
     last_procs: Option<Instant>,
-    memory_history: MemoryHistory,
     proc_groups: Vec<ProcGroup>,
+    pub process_warning: Option<String>,
+    proc_worker: Option<Worker<ProcSnapshot>>,
+    drive_worker: Option<Worker<Vec<Drive>>>,
     pub drives: Vec<Drive>,
     pub mem_total: u64,
     pub mem_used: u64,
@@ -213,13 +406,21 @@ impl SysMon {
             .map(|c| c.brand().trim().to_string())
             .unwrap_or_default();
         let cores = sys.cpus().len().max(1);
+        let mut worker_sys = System::new();
+        let mut worker_history = MemoryHistory::default();
+        let proc_worker = Worker::spawn("pcsweep-processes", move || {
+            sample_processes(&mut worker_sys, &mut worker_history, cores as f32)
+        });
+        let drive_worker = Worker::spawn("pcsweep-drives", read_drives);
         let mut s = Self {
             sys,
             last_fast: None,
             last_disks: None,
             last_procs: None,
-            memory_history: MemoryHistory::default(),
             proc_groups: Vec::new(),
+            process_warning: None,
+            proc_worker,
+            drive_worker,
             drives: Vec::new(),
             mem_total: 0,
             mem_used: 0,
@@ -255,34 +456,43 @@ impl SysMon {
             self.refresh_memory_counters();
             self.last_fast = Some(Instant::now());
         }
+        if let Some(drives) = self.drive_worker.as_mut().and_then(|w| w.latest()) {
+            self.drives = drives;
+        }
         if due(&self.last_disks, Duration::from_secs(5)) {
-            self.refresh_drives();
+            self.last_disks = Some(Instant::now());
+            if !self.drive_worker.as_mut().is_some_and(|w| w.request()) {
+                // Never move a slow query back to the UI when a worker stops.
+                // Retry on the next scheduled refresh while retaining the last
+                // completed snapshot.
+                self.drive_worker = Worker::spawn("pcsweep-drives", read_drives);
+                if let Some(worker) = &mut self.drive_worker {
+                    worker.request();
+                }
+            }
+        }
+        if let Some(snapshot) = self.proc_worker.as_mut().and_then(|w| w.latest()) {
+            self.procs = snapshot.procs;
+            self.proc_groups = snapshot.groups;
+            self.process_warning = None;
         }
         if want_procs && due(&self.last_procs, Duration::from_secs(3)) {
-            self.sys.refresh_processes();
-            let cores = self.cores as f32;
-            self.procs = self
-                .sys
-                .processes()
-                .iter()
-                .filter(|(_, p)| p.memory() > 0)
-                .map(|(pid, p)| Proc {
-                    pid: pid.as_u32(),
-                    start_time: p.start_time(),
-                    name: p.name().to_string(),
-                    mem: p.memory(),
-                    // On Windows sysinfo's virtual_memory is PROCESS_MEMORY_COUNTERS_EX.PrivateUsage.
-                    private_bytes: (p.virtual_memory() > 0).then_some(p.virtual_memory()),
-                    growth: 0,
-                    observed_secs: 0,
-                    cpu: p.cpu_usage() / cores,
-                })
-                .collect();
-            self.procs
-                .sort_unstable_by_key(|p| std::cmp::Reverse(p.mem));
-            self.memory_history.observe(&mut self.procs, Instant::now());
-            self.proc_groups = self.build_groups();
             self.last_procs = Some(Instant::now());
+            if !self.proc_worker.as_mut().is_some_and(|w| w.request()) {
+                self.process_warning = Some(
+                    "The process sampler is restarting. Displayed app values may be out of date."
+                        .into(),
+                );
+                let cores = self.cores as f32;
+                let mut sys = System::new();
+                let mut history = MemoryHistory::default();
+                self.proc_worker = Worker::spawn("pcsweep-processes", move || {
+                    sample_processes(&mut sys, &mut history, cores)
+                });
+                if let Some(worker) = &mut self.proc_worker {
+                    worker.request();
+                }
+            }
         }
     }
 
@@ -315,8 +525,10 @@ impl SysMon {
             last_fast: Some(Instant::now()),
             last_disks: Some(Instant::now()),
             last_procs: Some(Instant::now()),
-            memory_history: MemoryHistory::default(),
             proc_groups: Vec::new(),
+            process_warning: None,
+            proc_worker: None,
+            drive_worker: None,
             drives: vec![Drive {
                 mount: r"C:\".into(),
                 label: "Windows".into(),
@@ -387,29 +599,9 @@ impl SysMon {
         monitor
     }
 
+    /// Requests fresh drive totals on the next frame without blocking this one.
     pub fn refresh_drives(&mut self) {
-        let disks = Disks::new_with_refreshed_list();
-        let mut v: Vec<Drive> = disks
-            .list()
-            .iter()
-            .filter(|d| d.total_space() > 0)
-            .map(|d| Drive {
-                mount: d.mount_point().to_string_lossy().to_string(),
-                label: d.name().to_string_lossy().to_string(),
-                total: d.total_space(),
-                free: d.available_space(),
-                kind: match d.kind() {
-                    DiskKind::SSD => "SSD",
-                    DiskKind::HDD => "HDD",
-                    _ => "Drive",
-                },
-                removable: d.is_removable(),
-            })
-            .collect();
-        v.sort_by(|a, b| a.mount.cmp(&b.mount));
-        v.dedup_by(|a, b| a.mount == b.mount);
-        self.drives = v;
-        self.last_disks = Some(Instant::now());
+        self.last_disks = None;
     }
 
     pub fn system_drive(&self) -> Option<&Drive> {
@@ -434,36 +626,9 @@ impl SysMon {
         self.proc_groups.clone()
     }
 
+    #[cfg(test)]
     fn build_groups(&self) -> Vec<ProcGroup> {
-        let mut map: HashMap<String, ProcGroup> = HashMap::new();
-        for p in &self.procs {
-            let g = map
-                .entry(p.name.to_lowercase())
-                .or_insert_with(|| ProcGroup {
-                    name: p.name.clone(),
-                    count: 0,
-                    mem: 0,
-                    cpu: 0.0,
-                    private_bytes: 0,
-                    private_known: 0,
-                    growth: 0,
-                    observed_secs: 0,
-                    pids: Vec::new(),
-                });
-            g.count += 1;
-            g.mem += p.mem;
-            g.cpu += p.cpu;
-            if let Some(private) = p.private_bytes {
-                g.private_bytes = g.private_bytes.saturating_add(private);
-                g.private_known += 1;
-                g.growth = g.growth.saturating_add(p.growth);
-                g.observed_secs = g.observed_secs.max(p.observed_secs);
-            }
-            g.pids.push(p.pid);
-        }
-        let mut v: Vec<ProcGroup> = map.into_values().collect();
-        v.sort_by(|a, b| b.mem.cmp(&a.mem));
-        v
+        group_processes(&self.procs)
     }
 
     pub fn kill(&mut self, targets: &[(u32, u64)]) -> usize {
@@ -613,7 +778,7 @@ fn ensure_background(pid: u32) -> Result<(), String> {
 /// Posts the normal close-window request; never terminates or waits on the UI.
 pub fn request_app_close(pid: u32, start: u64) -> Result<usize, String> {
     use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM};
-    use windows_sys::Win32::System::Threading::GetExitCodeProcess;
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GetWindowThreadProcessId, IsWindowVisible, PostMessageW, WM_CLOSE,
     };
@@ -627,11 +792,9 @@ pub fn request_app_close(pid: u32, start: u64) -> Result<usize, String> {
         let mut pid = 0;
         GetWindowThreadProcessId(window, &mut pid);
         if pid == request.pid && IsWindowVisible(window) != 0 {
-            let mut exit = 0;
             // Holding the old handle and checking its lifetime avoids sending a
             // close request to a window whose PID was reused after confirmation.
-            if GetExitCodeProcess(request.handle, &mut exit) != 0
-                && exit == 259
+            if WaitForSingleObject(request.handle, 0) == 258
                 && PostMessageW(window, WM_CLOSE, 0, 0) != 0
             {
                 request.sent += 1;
@@ -639,7 +802,7 @@ pub fn request_app_close(pid: u32, start: u64) -> Result<usize, String> {
         }
         1
     }
-    let handle = checked_process(pid, start, 0)?;
+    let handle = checked_process(pid, start, 0x0010_0000)?;
     let mut request = Request {
         pid,
         handle: handle.0,
@@ -653,6 +816,39 @@ pub fn request_app_close(pid: u32, start: u64) -> Result<usize, String> {
     } else {
         Ok(request.sent)
     }
+}
+
+/// True once this exact process lifetime has ended, including when its PID has
+/// since been reused by another process. A protected process that can't be opened
+/// is never reported as exited.
+pub fn process_exited(pid: u32, start: u64) -> bool {
+    if pid == 0 || start == 0 {
+        return false;
+    }
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | 0x0010_0000, 0, pid) };
+    if raw == 0 {
+        // ERROR_INVALID_PARAMETER: no process has this ID any more.
+        return std::io::Error::last_os_error().raw_os_error() == Some(87);
+    }
+    let handle = ProcessHandle(raw);
+    let mut created: FILETIME = unsafe { std::mem::zeroed() };
+    let mut exited = created;
+    let mut kernel = created;
+    let mut user = created;
+    if unsafe { GetProcessTimes(handle.0, &mut created, &mut exited, &mut kernel, &mut user) } == 0
+    {
+        return false;
+    }
+    if filetime_to_unix(&created) != start {
+        return true;
+    }
+    // A signaled process handle proves termination, even if its actual exit
+    // code happens to equal STILL_ACTIVE (259).
+    unsafe { WaitForSingleObject(handle.0, 0) == 0 }
 }
 
 fn resident_memory(handle: &ProcessHandle) -> Option<u64> {
@@ -773,6 +969,72 @@ pub fn restore_app_efficiency(pid: u32, start: u64, original: PowerPolicy) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slow_worker_requests_coalesce_without_waiting_for_results() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let (release, wait) = mpsc::channel();
+        let (started, start) = mpsc::channel();
+        let mut worker = Worker::spawn("pcsweep-test-query", move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            started.send(()).unwrap();
+            wait.recv().unwrap();
+            42u32
+        })
+        .unwrap();
+        assert!(worker.request());
+        start.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(worker.request());
+        assert!(worker.latest().is_none());
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(value) = worker.latest() {
+                assert_eq!(value, 42);
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!worker.pending);
+    }
+
+    #[test]
+    fn native_private_counter_is_for_the_exact_current_process() {
+        use windows_sys::Win32::{
+            Foundation::FILETIME,
+            System::Threading::{GetCurrentProcess, GetProcessTimes},
+        };
+        let mut created: FILETIME = unsafe { std::mem::zeroed() };
+        let mut exit = created;
+        let mut kernel = created;
+        let mut user = created;
+        assert_ne!(
+            unsafe {
+                GetProcessTimes(
+                    GetCurrentProcess(),
+                    &mut created,
+                    &mut exit,
+                    &mut kernel,
+                    &mut user,
+                )
+            },
+            0
+        );
+        let start = filetime_to_unix(&created);
+        assert!(private_usage(std::process::id(), start).is_some_and(|n| n > 0));
+        assert_eq!(
+            private_usage(std::process::id(), start.saturating_sub(1)),
+            None
+        );
+        assert!(!process_exited(std::process::id(), start));
+    }
 
     #[test]
     fn ending_apps_rejects_reused_pids_and_protected_processes() {

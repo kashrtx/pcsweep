@@ -1,50 +1,45 @@
-# PCSweep 1.3.0
+# PCSweep 1.5.0
 
-This update adds three pages: **Ads and tracking**, **Connection health**, and **Battery and power**. Each explains what Windows reports and lets you review supported changes before applying them.
+This release improves responsiveness, file review, memory accuracy and multi-app closing; adds cleanup history, Windows change evidence, disk health, Windows controls, and an optional native internet speed test.
 
-## Download
+## Review and responsiveness
 
-Download **PCSweep.exe** for the portable app, or **PCSweep-1.3.0-windows-x64.zip** with the README, license and release notes. Requires 64-bit Windows 10 or 11 and an OpenGL-capable graphics driver. Releases are currently unsigned, so Windows may show an unrecognized-app warning. Administrator rights are optional; DNS changes and some Windows diagnostics require elevation.
+- Cleaner file review fills the page, with search, sorting, clear filtered selection actions and remembered choices.
+- Memory has compact summaries and multi-selection. Normal close requests preserve save prompts; results distinguish verified exits, still-running apps and failed requests. Reviewed process identity is rechecked.
+- Private committed memory comes from the exact Windows process instance. Unavailable readings remain unavailable, preventing virtual-address-space values being misreported as negative-terabyte growth.
+- Drive and process polling runs in background workers, including failure/retry paths. Scans use bounded worker pools and nonblocking progress reads. Cancellation acknowledges stopping, and large results are released away from the window thread.
+- Shared scrollbars reserve an edge gutter; confirmation dialogs have one content scroll and persistent Cancel/Confirm actions. Short arming delays protect destructive confirmations. Compact viewports fit the interface without changing normal-size layouts.
 
-## Ads and tracking
+## Cleanup history and Windows evidence
 
-- Open the official **uBlock Origin** page for Firefox, or **uBlock Origin Lite** for Chrome and Edge. Installation and permissions stay with the browser; PCSweep does not force extensions or report browser detection as proof of active blocking.
-- Review optional classic DNS filtering with **AdGuard Public DNS**, or enter the IP addresses of an existing local resolver such as AdGuard Home/Pi-hole. PCSweep does not install a DNS service or change the router.
-- Review the physical adapter, current settings and proposed IPv4/IPv6 servers before starting a **90-second trial**. An administrator-protected recovery record saves the original automatic/manual configuration before any change.
-- Check resolver results, then choose **Keep** or **Restore now**. A separate temporary recovery process restores the original configuration if the trial is not kept, including when PCSweep closes. Kept changes retain Undo.
-- Protect managed/encrypted DNS, VPN routes, remote sessions and domain-managed networks. Restore checks adapter identity and preserves DNS changes made outside PCSweep for review.
+- File removals, recycling, empty folders and Recycle Bin batches record intentions before work and outcomes afterward. Failed journal persistence stops further removals; interrupted outcomes remain uncertain.
+- Guarded journal paths, exclusive writers, bounded streaming reads and fail-closed rotation protect local history. Search/filter and CSV/JSON export are available through Activity log → Cleanup history.
+- Windows file changes reads existing NTFS records in bounded batches and existing file-access audit events. It does not enable auditing, create a journal, recover file contents, or promise a complete history. NTFS does not record the responsible program; audit access evidence is labeled separately. Parent paths are best-effort current paths.
+- Windows File History is an optional backup feature, distinct from change journals and PCSweep's own history. Permanent cache deletion cannot be undone by a restore point.
 
-DNS filtering reduces requests to blocked domains; it cannot block every ad or guarantee anonymous browsing. Secure DNS in a browser, VPN routing and ads served from the same domain as content can bypass it. The chosen DNS provider receives DNS requests under its own privacy policy.
+## Disk health and maintenance
 
-## Connection health
+- Overview links to a detailed storage page: mapped volumes/disks, reported health and available temperature, wear/error counters, free space, and native schedule information.
+- Unsupported health data stays unknown. Free space is not physical-health proof. OS TRIM notification policy is separate from device support and successful retrim.
+- Review Analyze or Windows-managed Optimize for a supported, revalidated volume. Critical warnings, unsupported/ambiguous mappings and offline/read-only volumes lead to native/vendor review. No universal SSD defrag or guessed overdue badge.
 
-- Review physical adapters, negotiated send/receive rates, addresses, gateways and driver information. Available Wi-Fi details show signal quality and current link rates.
-- Compare packet errors and discards across refreshes instead of treating lifetime counters as a current fault. Missing counters or driver details are reported as unavailable.
-- Run small, optional gateway, DNS and HTTPS checks. A blocked ping is not automatically treated as a broken connection, and local link rates are not advertised as internet speed.
-- Inspect driver-reported options and open Windows network tools. Adapter capabilities vary: PCSweep does not blindly disable IPv6, offloads, power management or other driver features.
+## Windows controls and change timeline
 
-## Battery and power
+- Supported animation preferences have persistent exact Undo.
+- Unmanaged supported editions can review manual/notify update policy and driver-update exclusion with protected machine Undo. Existing unowned policy is preserved.
+- Current policy values and legacy Windows Update API reports are read back, with explicit limits: they do not prove immediate modern Windows enforcement. Native pause/active-hours/settings links remain available on unsupported editions.
+- The local What changed timeline reads recorded Windows Update and reliability events; events are not proof of causation and missing sources are explained.
 
-- See Windows-reported power source, charge, saver state and runtime estimate, plus reported capacity and cycle count where the device exposes them. Missing or unknown data stays unknown.
-- On supported Windows builds, choose separate **plugged-in** and **on-battery** power preferences. Windows switches between those preferences when the power source changes; PCSweep need not remain open.
-- On older builds, choose recognized power plans already advertised by Windows. Hidden/OEM plans are not created or forced, and legacy performance changes require external power.
-- Save original preferences before changes, verify the configured result, and retain **Undo** across restarts. Preferences changed outside PCSweep are preserved for review. Windows policy and manufacturer signals can still affect the effective mode.
-- Create local **battery health** and **SleepStudy** reports, or inspect sleep blockers, the last wake event and wake timers. SleepStudy needs a compatible Modern Standby device; some diagnostics need administrator rights. These reports do not change sleep modes or timers.
-- Open Windows Energy Saver and battery-care guidance. Charging limits and Smart Charging depend on the manufacturer; no universal firmware charge cap is promised.
+## Optional internet speed test
 
-Performance preferences can increase heat, fan noise and battery use; efficiency can reduce throughput. Reported battery capacity depends on device calibration and is not a guaranteed runtime.
+- Native M-Lab NDT7 download/upload testing uses synthetic traffic, quick/longer data caps, cancellation and live progress. Idle timing uses TCP connects; loaded timing uses server TCP estimates. Packet loss is not measured.
+- M-Lab publishes results including the public IP address and retains measurement data indefinitely. Every run requires consent. PCSweep sends its version identifier but no inventory, history or user files. See PRIVACY.md and the provider privacy/usage links.
+- History is optional and limited to this app session. PCSweep limits this account to 20 runs per UTC day across restarts and waits between runs; other clients sharing the IP also count toward provider limits. No speed tests run automatically.
 
-## Reliability and validation
+## Licensing, validation and download
 
-- Keep new work off the UI thread, serialize confirmed changes with existing system operations, and retain the cleaner's Downloads and personal-folder protections.
-- Recheck reviewed identities and values, use persistent recovery records and readback, and show actionable partial-failure states.
-- Keep long confirmation content scrollable while its action buttons remain reachable. New pages use the existing cards, spacing and navigation.
-- The Windows workflow runs regression tests, read-only native API checks, PowerShell parser checks, and UI rendering at 1040×680 and 1320×860 before building and packaging the release. Mutation tests use fake state or disposable resources; they do not change real DNS, power or security settings.
+Apache License 2.0; copyright 2026 Kaushal Bhingaradia (kashrtx). LICENSE and NOTICE are included with downloads. Earlier releases retain their original license.
 
-Existing cleaning, disk analysis, duplicate detection, reviewed app removal, Defender checks, privacy controls, memory tools and verified in-app updates remain available. Update checks are manual by default, with optional daily checks while PCSweep is open.
+The release workflow checks formatting, runs Windows application and publisher tests, renders reviewable UI previews, then builds and packages the optimized x64 executable. Mutation tests use fake state or disposable resources; they do not change the runner's real update/security preferences or optimize its system disk. Home/Pro physical-machine enforcement and every hardware/controller combination have not been certified by Windows Server CI.
 
-## Automatic release and local data
-
-Pushing a commit to `main` publishes only after Windows tests, the optimized build and packaging checks pass. The release includes the EXE, portable ZIP, **SHA256SUMS.txt** and **update.json**. Hash verification trusts the official GitHub release; independent code-signing verification is not claimed.
-
-Logs, settings and staged updates live in `%LOCALAPPDATA%\PCSweep`; local power reports are in its `reports` folder and can include device/usage details. Power Undo lives in `HKEY_CURRENT_USER\Software\PCSweep\PowerUndo`, privacy Undo in `HKEY_CURRENT_USER\Software\PCSweep\PrivacyUndo`, and DNS recovery in `HKEY_LOCAL_MACHINE\SOFTWARE\PCSweep\DnsUndo`. No background service is installed and PCSweep does not upload diagnostic reports. Source is available under the MIT license.
+Download PCSweep.exe or the portable ZIP. Requires 64-bit Windows 10/11 and an OpenGL-capable graphics driver. Releases are unsigned. Only a passing main push publishes the release, with SHA256SUMS.txt and the update manifest; no manual tagging is required.

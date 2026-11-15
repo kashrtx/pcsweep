@@ -21,8 +21,11 @@ fn main() {
             "FileDescription",
             "PCSweep: safe cleanup and PC health for Windows",
         )
-        .set("CompanyName", "kashrtx")
-        .set("LegalCopyright", "MIT License");
+        .set("CompanyName", "Kaushal Bhingaradia")
+        .set(
+            "LegalCopyright",
+            "Copyright 2026 Kaushal Bhingaradia. Apache License 2.0",
+        );
     if let Err(e) = res.compile() {
         if std::env::var("TARGET").is_ok_and(|target| target.ends_with("windows-msvc")) {
             panic!("Could not embed Windows app resources: {e}");

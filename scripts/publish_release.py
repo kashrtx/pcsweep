@@ -68,15 +68,21 @@ def validate_package(dist, version):
     archive = dist / f"PCSweep-{version}-windows-x64.zip"
     if not executable.is_file() or not archive.is_file():
         raise RuntimeError("The tested executable or portable ZIP is missing")
+    for name in ["LICENSE", "NOTICE"]:
+        if not (dist / name).is_file():
+            raise RuntimeError(f"Required attribution file is missing: {name}")
     with executable.open("rb") as source:
         if source.read(2) != b"MZ":
             raise RuntimeError("PCSweep.exe is not a Windows executable")
     with zipfile.ZipFile(archive) as package:
-        required = {"PCSweep.exe", "README.md", "LICENSE", "RELEASE_NOTES.md"}
+        required = {"PCSweep.exe", "README.md", "LICENSE", "NOTICE", "PRIVACY.md", "RELEASE_NOTES.md"}
         if not required.issubset(package.namelist()) or package.testzip() is not None:
             raise RuntimeError("Portable ZIP is incomplete or corrupt")
         if hashlib.sha256(package.read("PCSweep.exe")).hexdigest() != digest(executable):
             raise RuntimeError("The ZIP executable differs from the tested executable")
+        for name in ["LICENSE", "NOTICE"]:
+            if package.read(name) != (dist / name).read_bytes():
+                raise RuntimeError(f"ZIP attribution differs from the release file: {name}")
 
 
 def release_assets(dist, version, tag, commit, run_number):
@@ -93,7 +99,7 @@ def release_assets(dist, version, tag, commit, run_number):
         "commit": commit, "arch": "windows-x64", "asset": "PCSweep.exe",
         "size": executable.stat().st_size, "sha256": digest(executable),
     }, indent=2) + "\n", encoding="utf-8")
-    assets = [executable, archive, manifest]
+    assets = [executable, archive, manifest, dist / "LICENSE", dist / "NOTICE"]
     checksums = dist / "SHA256SUMS.txt"
     checksums.write_text(
         "".join(f"{digest(path)}  {path.name}\n" for path in assets), encoding="ascii"
@@ -119,7 +125,11 @@ def verify_published(repo, release):
     # Rebuilding the same commit may change ZIP timestamps. Verify the existing
     # published downloads against their own checksums instead of replacing them.
     archive = f"PCSweep-{release['tag_name'].removeprefix('v')}-windows-x64.zip"
-    names = ["PCSweep.exe", archive, "update.json", "SHA256SUMS.txt"]
+    names = ["PCSweep.exe", archive, "update.json"]
+    remote_names = {item["name"] for item in pages(f"repos/{repo}/releases/{release['id']}/assets?per_page=100")}
+    if {"LICENSE", "NOTICE"}.issubset(remote_names):
+        names.extend(["LICENSE", "NOTICE"])
+    names.append("SHA256SUMS.txt")
     with tempfile.TemporaryDirectory(prefix="pcsweep-release-") as folder:
         args = ["release", "download", release["tag_name"], "--repo", repo, "--dir", folder]
         for name in names:
@@ -127,8 +137,8 @@ def verify_published(repo, release):
         gh(*args)
         paths = [Path(folder) / name for name in names]
         verify_assets(repo, release, paths)
-        expected = "".join(f"{digest(path)}  {path.name}\n" for path in paths[:3])
-        if paths[3].read_text(encoding="ascii") != expected:
+        expected = "".join(f"{digest(path)}  {path.name}\n" for path in paths[:-1])
+        if paths[-1].read_text(encoding="ascii") != expected:
             raise RuntimeError("Published SHA256SUMS.txt does not match release downloads")
 
 

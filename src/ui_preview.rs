@@ -1,5 +1,6 @@
 //! Headless layout regression checks and reviewable CPU-rendered UI previews.
-//! These tests send no input events, poll no workers, and invoke no system changes.
+//! Rendering fixtures poll no workers and invoke no system changes. Interaction
+//! checks exercise only local selection state or cancel an inert confirmation.
 use crate::app::{Action, App, Modal, Page};
 use crate::theme;
 use eframe::egui::{self, Color32, Frame, ImageData, Margin, Pos2, Rect, TextureId};
@@ -221,6 +222,135 @@ fn sample(texture: &Texture, uv: [f32; 2]) -> [f32; 4] {
     output
 }
 
+fn navigation_label(page: Page) -> Option<&'static str> {
+    Some(match page {
+        Page::Dashboard => "Overview",
+        Page::Cleaner => "Junk cleaner",
+        Page::Analyzer => "Space analyzer",
+        Page::Duplicates => "Duplicates",
+        Page::Apps => "Installed apps",
+        Page::Startup => "Startup apps",
+        Page::Memory => "Memory and apps",
+        Page::Privacy => "Privacy and ads",
+        Page::Security => "Security check",
+        Page::Background => "Background activity",
+        Page::Ads => "Ads and tracking",
+        Page::Network => "Connection health",
+        Page::Power => "Battery and power",
+        Page::Updates => "Updates",
+        Page::Tools => "Tools",
+        Page::Activity => "Activity log",
+        Page::Storage => "Disk health",
+        Page::WindowsControls => "Windows controls",
+        Page::Speed => "Internet speed test",
+        Page::FileChanges => "Windows file changes",
+    })
+}
+
+/// Populate pages that previously only had empty/loading preview states. No
+/// workers are polled and these paths are never read from or written to disk.
+fn populate_page_fixture(app: &mut App, page: Page) {
+    use crate::analyzer::{FileCat, FileRec, Node, NodeKind, ScanResult};
+    use crate::duplicates::{DupFile, DupGroup};
+    use crate::startup::{Loc, StartupItem};
+    use std::time::Duration;
+    app.cleaner.scanned_once = true;
+    for result in &mut app.cleaner.results {
+        *result = Some(Default::default());
+    }
+    for (i, size) in [220_000_000u64, 810_000_000, 76_000_000]
+        .into_iter()
+        .enumerate()
+    {
+        app.cleaner.results[i] = Some(crate::cleaner::CatResult {
+            files: vec![crate::cleaner::JunkFile {
+                path: format!(r"C:\Users\Preview\AppData\Local\Temp\review-{i}.tmp").into(),
+                size,
+                modified: None,
+                created: None,
+            }],
+            bytes: size,
+            count: 1,
+            roots_found: 1,
+            ..Default::default()
+        });
+    }
+    if page == Page::Analyzer {
+        let gb = 1024u64.pow(3);
+        let children: Vec<Node> = [
+            ("Users", 208),
+            ("Program Files", 48),
+            ("Windows", 41),
+            ("ProgramData", 31),
+            ("Program Files (x86)", 22),
+        ]
+        .into_iter()
+        .map(|(name, size)| Node {
+            name: name.into(),
+            size: size * gb,
+            files: size * 1000,
+            kind: NodeKind::Dir,
+            modified: None,
+            children: Vec::new(),
+        })
+        .collect();
+        app.analyzer.result = Some(ScanResult {
+            root_path: r"C:\".into(),
+            root: Node {
+                name: "C:".into(),
+                size: 350 * gb,
+                files: 2_202_656,
+                kind: NodeKind::Dir,
+                modified: None,
+                children,
+            },
+            big: vec![FileRec {
+                path: r"C:\Users\Preview\Videos\recording.mp4".into(),
+                lower: r"c:\users\preview\videos\recording.mp4".into(),
+                size: gb,
+                modified: None,
+                block: None,
+            }],
+            exts: Vec::new(),
+            cats: vec![(FileCat::Video, gb, 1)],
+            elapsed: Duration::from_millis(97_500),
+            denied: 23,
+            dirs: 343_873,
+            cancelled: false,
+        });
+    }
+    if page == Page::Duplicates {
+        app.dups.roots = vec![r"C:\Users\Preview\Videos".into()];
+        app.dups.groups = Some(vec![DupGroup {
+            size: 124_000_000,
+            files: ["original.mp4", "backup-copy.mp4", "another-copy.mp4"]
+                .into_iter()
+                .map(|name| DupFile {
+                    path: format!(r"C:\Users\Preview\Videos\{name}").into(),
+                    modified: None,
+                    block: None,
+                })
+                .collect(),
+        }]);
+    }
+    if page == Page::Startup {
+        app.startup.items = [
+            ("Music app", "music.exe", true),
+            ("Project sync", "sync.exe --background", false),
+        ]
+        .into_iter()
+        .map(|(name, command, enabled)| StartupItem {
+            key: name.into(),
+            display: name.into(),
+            command: command.into(),
+            loc: Loc::UserRun,
+            enabled,
+            file: None,
+        })
+        .collect();
+    }
+}
+
 fn render_page(page: Page, size: [u32; 2], path: &Path, pending_dns: bool) {
     let ctx = egui::Context::default();
     theme::setup_fonts(&ctx);
@@ -229,6 +359,7 @@ fn render_page(page: Page, size: [u32; 2], path: &Path, pending_dns: bool) {
     // only, so rendering cannot start scans, execute commands or alter settings.
     let mut app = App::test_fixture();
     app.page = page;
+    populate_page_fixture(&mut app, page);
     if pending_dns {
         app.ads = crate::ads::trial_preview_fixture();
     }
@@ -237,12 +368,13 @@ fn render_page(page: Page, size: [u32; 2], path: &Path, pending_dns: bool) {
         let input = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(
                 Pos2::ZERO,
-                egui::vec2(size[0] as f32, size[1] as f32),
+                egui::vec2(size[0] as f32, size[1] as f32) / ctx.zoom_factor(),
             )),
             time: Some(frame as f64 * 0.1),
             ..egui::RawInput::default()
         };
         let output = ctx.run(input, |ctx| {
+            theme::fit_to_viewport(ctx);
             egui::SidePanel::left("nav")
                 .exact_width(236.0)
                 .resizable(false)
@@ -288,12 +420,7 @@ fn render_page(page: Page, size: [u32; 2], path: &Path, pending_dns: bool) {
                     );
                 }
             }
-            if let Some(selected) = match page {
-                Page::Ads => Some("Ads and tracking"),
-                Page::Network => Some("Connection health"),
-                Page::Power => Some("Battery and power"),
-                _ => None,
-            } {
+            if let Some(selected) = navigation_label(page) {
                 let mut found = Vec::new();
                 for shape in &output.shapes {
                     matching_text_rects(&shape.shape, shape.clip_rect, selected, &mut found);
@@ -305,7 +432,8 @@ fn render_page(page: Page, size: [u32; 2], path: &Path, pending_dns: bool) {
                     "selected navigation item {selected} must be visible"
                 );
             }
-            let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
+            let mut primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
+            scale_primitives(&mut primitives, output.pixels_per_point);
             let image = painter.render(size, &primitives);
             let background = theme::BG.to_array();
             let content_pixels = image.pixels().filter(|p| p.0 != background).count();
@@ -330,6 +458,17 @@ fn all_management_pages_render_at_minimum_and_default_window_sizes() {
         .join("ui-previews");
     std::fs::create_dir_all(&directory).unwrap();
     for (name, page) in [
+        ("overview", Page::Dashboard),
+        ("cleaner", Page::Cleaner),
+        ("analyzer", Page::Analyzer),
+        ("duplicates", Page::Duplicates),
+        ("startup", Page::Startup),
+        ("tools", Page::Tools),
+        ("activity", Page::Activity),
+        ("storage", Page::Storage),
+        ("windows-controls", Page::WindowsControls),
+        ("internet-speed", Page::Speed),
+        ("file-changes", Page::FileChanges),
         ("privacy", Page::Privacy),
         ("security", Page::Security),
         ("background", Page::Background),
@@ -340,7 +479,7 @@ fn all_management_pages_render_at_minimum_and_default_window_sizes() {
         ("network", Page::Network),
         ("power", Page::Power),
     ] {
-        for size in [[1040, 680], [1320, 860]] {
+        for size in [[900, 520], [1040, 680], [1320, 860], [1920, 1080]] {
             let path = directory.join(format!("{name}-{}x{}.png", size[0], size[1]));
             render_page(page, size, &path, false);
         }
@@ -440,6 +579,203 @@ fn matching_text_rects(shape: &Shape, clip: Rect, expected: &str, found: &mut Ve
     }
 }
 
+fn collect_visible_file_labels(shape: &Shape, clip: Rect, found: &mut Vec<String>) {
+    match shape {
+        Shape::Text(text) if text.galley.job.text.starts_with("file-") => {
+            let rect = text.galley.rect.translate(text.pos.to_vec2());
+            if clip.contains_rect(rect) {
+                found.push(text.galley.job.text.clone());
+            }
+        }
+        Shape::Vec(shapes) => {
+            for shape in shapes {
+                collect_visible_file_labels(shape, clip, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn text_rect(output: &egui::FullOutput, expected: &str) -> Rect {
+    let mut found = Vec::new();
+    for clipped in &output.shapes {
+        matching_text_rects(&clipped.shape, clipped.clip_rect, expected, &mut found);
+    }
+    let (text, clip) = found
+        .into_iter()
+        .find(|(text, clip)| clip.contains_rect(*text))
+        .unwrap_or_else(|| panic!("{expected} must be fully visible"));
+    assert!(clip.contains_rect(text));
+    text
+}
+
+fn scale_primitives(primitives: &mut [ClippedPrimitive], scale: f32) {
+    for primitive in primitives {
+        primitive.clip_rect = Rect::from_min_max(
+            primitive.clip_rect.min * scale,
+            primitive.clip_rect.max * scale,
+        );
+        if let Primitive::Mesh(mesh) = &mut primitive.primitive {
+            for vertex in &mut mesh.vertices {
+                vertex.pos = egui::pos2(vertex.pos.x * scale, vertex.pos.y * scale);
+            }
+        }
+    }
+}
+
+fn click_at(position: Pos2) -> Vec<egui::Event> {
+    vec![
+        egui::Event::PointerMoved(position),
+        egui::Event::PointerButton {
+            pos: position,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        },
+        egui::Event::PointerButton {
+            pos: position,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        },
+    ]
+}
+
+#[test]
+fn bulk_memory_actions_stay_reachable_and_clear_only_selection_at_scaled_sizes() {
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/ui-previews");
+    std::fs::create_dir_all(&directory).unwrap();
+    for scale in [1.0f32, 1.25, 1.5, 2.0] {
+        let ctx = egui::Context::default();
+        theme::setup_fonts(&ctx);
+        theme::apply(&ctx);
+        ctx.set_pixels_per_point(scale);
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1040.0, 680.0));
+        let mut app = App::test_fixture();
+        app.page = Page::Memory;
+        app.mem = crate::processes::bulk_preview_fixture();
+        let mut painter = CpuPainter::default();
+        let mut clear = None;
+        for frame in 0..8 {
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    time: Some(frame as f64 * 0.1),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::SidePanel::left("memory_navigation")
+                        .exact_width(236.0)
+                        .resizable(false)
+                        .show(ctx, |ui| app.sidebar(ui));
+                    egui::CentralPanel::default()
+                        .frame(
+                            Frame::none()
+                                .fill(theme::BG)
+                                .inner_margin(Margin::symmetric(30.0, 22.0)),
+                        )
+                        .show(ctx, |ui| app.render_page(ui));
+                },
+            );
+            assert!(app.modal.is_none());
+            assert!(
+                !app.mutations_running(),
+                "previews cannot start app-close operations"
+            );
+            for (id, delta) in &output.textures_delta.set {
+                painter.set_texture(*id, delta);
+            }
+            if frame == 7 {
+                for expected in ["2 apps selected", "Close selected…", "Clear"] {
+                    assert!(
+                        screen.contains_rect(text_rect(&output, expected)),
+                        "{expected} must stay on screen at {scale}x DPI"
+                    );
+                }
+                clear = Some(text_rect(&output, "Clear").center());
+                let mut primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
+                for primitive in &mut primitives {
+                    primitive.clip_rect = Rect::from_min_max(
+                        primitive.clip_rect.min * scale,
+                        primitive.clip_rect.max * scale,
+                    );
+                    if let Primitive::Mesh(mesh) = &mut primitive.primitive {
+                        for vertex in &mut mesh.vertices {
+                            vertex.pos = egui::pos2(vertex.pos.x * scale, vertex.pos.y * scale);
+                        }
+                    }
+                }
+                painter
+                    .render(
+                        [(1040.0 * scale) as u32, (680.0 * scale) as u32],
+                        &primitives,
+                    )
+                    .save(directory.join(format!("memory-bulk-dpi-{}.png", (scale * 100.0) as u32)))
+                    .unwrap();
+            }
+            for id in output.textures_delta.free {
+                painter.textures.remove(&id);
+            }
+        }
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: click_at(clear.unwrap()),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::SidePanel::left("memory_navigation")
+                    .exact_width(236.0)
+                    .resizable(false)
+                    .show(ctx, |ui| app.sidebar(ui));
+                egui::CentralPanel::default()
+                    .frame(
+                        Frame::none()
+                            .fill(theme::BG)
+                            .inner_margin(Margin::symmetric(30.0, 22.0)),
+                    )
+                    .show(ctx, |ui| app.render_page(ui));
+            },
+        );
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::SidePanel::left("memory_navigation")
+                    .exact_width(236.0)
+                    .resizable(false)
+                    .show(ctx, |ui| app.sidebar(ui));
+                egui::CentralPanel::default()
+                    .frame(
+                        Frame::none()
+                            .fill(theme::BG)
+                            .inner_margin(Margin::symmetric(30.0, 22.0)),
+                    )
+                    .show(ctx, |ui| app.render_page(ui));
+            },
+        );
+        let mut selected = Vec::new();
+        for clipped in &output.shapes {
+            matching_text_rects(
+                &clipped.shape,
+                clipped.clip_rect,
+                "Close selected…",
+                &mut selected,
+            );
+        }
+        assert!(
+            selected.is_empty(),
+            "Clear must remove the bulk selection bar"
+        );
+        assert!(
+            app.modal.is_none() && !app.mutations_running(),
+            "clearing selection must not close any app"
+        );
+    }
+}
+
 #[test]
 fn long_confirmation_content_keeps_both_actions_visible_at_supported_sizes() {
     let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -517,5 +853,318 @@ fn long_confirmation_content_keeps_both_actions_visible_at_supported_sizes() {
                 painter.textures.remove(&id);
             }
         }
+    }
+}
+
+#[test]
+fn cleanup_confirmation_details_scroll_at_the_dialog_edge() {
+    // Mirrors a real cleanup confirmation: 21 short category lines. A nested scroll
+    // area used to shrink to the text width while its panel filled the dialog,
+    // which left the scrollbar partway across the details.
+    let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1040.0, 680.0));
+    let ctx = egui::Context::default();
+    theme::setup_fonts(&ctx);
+    theme::apply(&ctx);
+    let mut app = App::test_fixture();
+    let details: Vec<String> = (1..=21)
+        .map(|i| format!("Category {i}: {i}.0 MB ({i} files)"))
+        .collect();
+    app.modal = Some(Modal {
+        title: "Clean 8.07 GB?".into(),
+        body: "59,645 files from 21 categories will be permanently deleted.".into(),
+        details: details.clone(),
+        note: Some(r"Includes C:\Users\Example\AppData\Local\Temp and similar folders.".into()),
+        confirm: "Delete permanently".into(),
+        danger: true,
+        action: Action::RunTool(usize::MAX),
+    });
+    let mut last = None;
+    let mut painter = CpuPainter::default();
+    for frame in 0..6 {
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(frame as f64 * 0.1),
+                ..Default::default()
+            },
+            |ctx| app.modal_ui(ctx),
+        );
+        for (id, delta) in &output.textures_delta.set {
+            painter.set_texture(*id, delta);
+        }
+        last = Some(output);
+    }
+    let output = last.expect("frames were rendered");
+    assert!(
+        app.modal.is_some(),
+        "rendering alone must not confirm or cancel"
+    );
+    let panel = output
+        .shapes
+        .iter()
+        .filter_map(|clipped| match &clipped.shape {
+            Shape::Rect(rect) if rect.fill == theme::BG => Some(rect.rect),
+            _ => None,
+        })
+        .max_by(|a, b| a.width().total_cmp(&b.width()))
+        .expect("the details panel is drawn");
+    let mut checked = 0;
+    for line in &details {
+        let mut found = Vec::new();
+        for clipped in &output.shapes {
+            matching_text_rects(&clipped.shape, clipped.clip_rect, line, &mut found);
+        }
+        for (text, clip) in found {
+            if !clip.intersects(text) {
+                continue;
+            }
+            assert!(
+                clip.right() >= panel.right() - 1.0,
+                "{line} is clipped narrower than its panel: {clip:?} vs {panel:?}"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "at least one details line must be visible");
+    let bars: Vec<_> = output
+        .shapes
+        .iter()
+        .filter_map(|clipped| match &clipped.shape {
+            Shape::Rect(rect)
+                if rect.rect.width() >= 5.0
+                    && rect.rect.width() <= 12.0
+                    && rect.rect.height() > 32.0 =>
+            {
+                Some(rect.rect)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !bars.is_empty(),
+        "overflowing confirmation must expose a scrollbar"
+    );
+    for bar in bars {
+        assert!(bar.left() >= panel.right() - 2.0 && bar.right() <= panel.right() + 20.0,
+            "scrollbar must occupy the right gutter, not the middle of the panel: {bar:?}, panel={panel:?}");
+    }
+    let primitives = ctx.tessellate(output.shapes.clone(), output.pixels_per_point);
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/ui-previews");
+    std::fs::create_dir_all(&directory).unwrap();
+    painter
+        .render([1040, 680], &primitives)
+        .save(directory.join("cleanup-confirmation-scrollbar.png"))
+        .unwrap();
+
+    let pointer = egui::pos2(panel.center().x, 340.0);
+    let mut last = None;
+    for frame in 0..8 {
+        let events = if frame == 0 {
+            vec![
+                egui::Event::PointerMoved(pointer),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -10_000.0),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        } else {
+            Vec::new()
+        };
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(1.0 + frame as f64 * 0.1),
+                events,
+                ..Default::default()
+            },
+            |ctx| app.modal_ui(ctx),
+        );
+        last = Some(output);
+    }
+    let output = last.unwrap();
+    text_rect(&output, "Category 21: 21.0 MB (21 files)");
+    let cancel = text_rect(&output, "Cancel").center();
+    text_rect(&output, "Delete permanently");
+    let _ = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(screen),
+            events: click_at(cancel),
+            ..Default::default()
+        },
+        |ctx| app.modal_ui(ctx),
+    );
+    assert!(
+        app.modal.is_none(),
+        "Cancel must remain reachable after scrolling to the end"
+    );
+    assert!(
+        !app.mutations_running(),
+        "canceling an inert confirmation cannot execute its action"
+    );
+}
+
+#[test]
+fn full_page_file_review_fills_the_window_and_filters_without_rebuilding_rows() {
+    let size = [1040u32, 680u32];
+    let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(size[0] as f32, size[1] as f32));
+    let ctx = egui::Context::default();
+    theme::setup_fonts(&ctx);
+    theme::apply(&ctx);
+    let mut app = App::test_fixture();
+    let file_count = 80_768u64;
+    let files: Vec<crate::cleaner::JunkFile> = (0..file_count)
+        .map(|i| crate::cleaner::JunkFile {
+            path: format!(
+                r"C:\Users\Example\AppData\Local\Temp\folder-{}\file-{i}.tmp",
+                i % 7
+            )
+            .into(),
+            size: 1024 * (i + 1),
+            modified: None,
+            created: None,
+        })
+        .collect();
+    let bytes = files.iter().map(|f| f.size).sum();
+    app.cleaner.results[0] = Some(crate::cleaner::CatResult {
+        files,
+        bytes,
+        count: file_count,
+        roots_found: 1,
+        ..Default::default()
+    });
+    app.cleaner.review = Some(crate::cleaner::FileReview::new(0));
+    app.page = Page::Cleaner;
+    let mut painter = CpuPainter::default();
+    for (pass, filter) in ["", "folder-3"].into_iter().enumerate() {
+        if let Some(review) = app.cleaner.review.as_mut() {
+            review.filter = filter.to_string();
+        }
+        for frame in 0..6 {
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    time: Some(frame as f64 * 0.1),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::SidePanel::left("review_navigation")
+                        .exact_width(236.0)
+                        .resizable(false)
+                        .show(ctx, |ui| {
+                            ui.label("PCSweep");
+                        });
+                    egui::CentralPanel::default()
+                        .frame(Frame::none().fill(theme::BG))
+                        .show(ctx, |ui| app.render_page(ui));
+                },
+            );
+            assert!(
+                app.cleaner.review.is_some(),
+                "rendering must not close the review"
+            );
+            assert!(
+                app.modal.is_none(),
+                "rendering must not open a confirmation"
+            );
+            for (id, delta) in &output.textures_delta.set {
+                painter.set_texture(*id, delta);
+            }
+            if frame == 5 {
+                let visible = |expected: &str| {
+                    let mut found = Vec::new();
+                    for shape in &output.shapes {
+                        matching_text_rects(&shape.shape, shape.clip_rect, expected, &mut found);
+                    }
+                    found.iter().any(|(text, clip)| clip.contains_rect(*text))
+                };
+                assert!(
+                    visible("All categories"),
+                    "the Back control must stay visible"
+                );
+                if pass == 0 {
+                    assert!(
+                        visible("file-80767.tmp"),
+                        "the largest file is listed first"
+                    );
+                } else {
+                    assert!(visible("file-80762.tmp"), "matching files are listed");
+                    assert!(!visible("file-80767.tmp"), "the filter hides other folders");
+                }
+                let mut rows = Vec::new();
+                for shape in &output.shapes {
+                    collect_visible_file_labels(&shape.shape, shape.clip_rect, &mut rows);
+                }
+                assert!(
+                    rows.len() >= 5,
+                    "the review must show substantially more than two rows; rendered {}",
+                    rows.len()
+                );
+                assert!(
+                    rows.len() < 80,
+                    "the list must virtualize 80,768 files instead of painting them all"
+                );
+                let primitives = ctx.tessellate(output.shapes.clone(), output.pixels_per_point);
+                let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("target")
+                    .join("ui-previews");
+                std::fs::create_dir_all(&directory).unwrap();
+                painter
+                    .render(size, &primitives)
+                    .save(directory.join(format!("cleaner-review-{pass}.png")))
+                    .unwrap();
+            }
+            for id in output.textures_delta.free {
+                painter.textures.remove(&id);
+            }
+        }
+    }
+}
+
+#[test]
+fn cleanup_history_page_lists_every_outcome_from_a_fixture() {
+    let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1040.0, 680.0));
+    let ctx = egui::Context::default();
+    theme::setup_fonts(&ctx);
+    theme::apply(&ctx);
+    let mut app = App::test_fixture();
+    app.history = crate::journal::preview_fixture();
+    app.page = Page::Activity;
+    let mut last = None;
+    for frame in 0..6 {
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(frame as f64 * 0.1),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(Frame::none().fill(theme::BG))
+                    .show(ctx, |ui| app.render_page(ui));
+            },
+        );
+        last = Some(output);
+    }
+    let output = last.expect("frames were rendered");
+    assert!(
+        app.history.open,
+        "rendering must not leave the history view"
+    );
+    for expected in [
+        "Cleanup history",
+        "setup.log",
+        "locked.tmp",
+        "Not deleted",
+        "Uncertain",
+    ] {
+        let mut found = Vec::new();
+        for shape in &output.shapes {
+            matching_text_rects(&shape.shape, shape.clip_rect, expected, &mut found);
+        }
+        assert!(
+            found.iter().any(|(text, clip)| clip.contains_rect(*text)),
+            "{expected} must be visible"
+        );
     }
 }

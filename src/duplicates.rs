@@ -357,9 +357,10 @@ pub(crate) fn recycle_verified(
         done: Vec::new(),
         failed: Vec::new(),
         bytes: 0,
+        journal_error: None,
     };
     let cancel = AtomicBool::new(false);
-    for group in groups {
+    'groups: for group in groups {
         let targets: Vec<_> = group
             .files
             .iter()
@@ -406,18 +407,25 @@ pub(crate) fn recycle_verified(
                 ));
                 continue;
             }
-            let result = util::recycle(vec![(target.path.clone(), group.size)]);
+            let item = vec![(target.path.clone(), group.size)];
+            let result = util::recycle(item, "Duplicate files");
             report.bytes += result.bytes;
             report.done.extend(result.done);
             report.failed.extend(result.failed);
+            if result.journal_error.is_some() {
+                report.journal_error = result.journal_error;
+                break 'groups;
+            }
         }
     }
-    report.failed.extend(pending.into_keys().map(|p| {
-        (
-            p,
-            "File is no longer in these duplicate results. Scan again.".into(),
-        )
-    }));
+    let reason = if report.journal_error.is_some() {
+        "Not moved because cleanup history could not be persisted."
+    } else {
+        "File is no longer in these duplicate results. Scan again."
+    };
+    report
+        .failed
+        .extend(pending.into_keys().map(|p| (p, reason.into())));
     report
 }
 
@@ -496,6 +504,9 @@ impl App {
         if let Some(r) = self.dups.recycle.poll() {
             match r {
                 Ok(rep) => {
+                    if let Some(error) = &rep.journal_error {
+                        self.toast(ToastKind::Error,format!("Further recycling stopped because cleanup history could not be saved: {error}. Some completed results may be uncertain."));
+                    }
                     let n = rep.done.len();
                     for p in rep.done {
                         self.dups.selected.remove(&p);

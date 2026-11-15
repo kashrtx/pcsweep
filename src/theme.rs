@@ -42,6 +42,48 @@ pub fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
     Color32::from_rgb(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()))
 }
 
+fn fitted_zoom(native_points: egui::Vec2) -> f32 {
+    (native_points.x / 1040.0)
+        .min(native_points.y / 680.0)
+        .clamp(0.65, 1.0)
+}
+
+/// A high-DPI desktop can offer fewer logical points than the ordinary layout's
+/// minimum. Fit the whole layout to that work area without shrinking normal
+/// windows. Multiplying out the current zoom prevents resize feedback loops.
+pub fn fit_to_viewport(ctx: &egui::Context) {
+    let zoom = fitted_zoom(ctx.screen_rect().size() * ctx.zoom_factor());
+    if (ctx.zoom_factor() - zoom).abs() > 0.005 {
+        ctx.set_zoom_factor(zoom);
+    }
+}
+
+#[cfg(test)]
+mod responsive_tests {
+    use super::*;
+    #[test]
+    fn compact_fit_is_stable_and_normal_windows_keep_their_size() {
+        for native in [
+            egui::vec2(900.0, 520.0),
+            egui::vec2(960.0, 540.0),
+            egui::vec2(1040.0, 680.0),
+            egui::vec2(1920.0, 1080.0),
+        ] {
+            let target = fitted_zoom(native);
+            let logical = native / target;
+            assert!(logical.x >= 1040.0 - 0.1 && logical.y >= 680.0 - 0.1);
+            assert_eq!(
+                fitted_zoom(logical * target),
+                target,
+                "rescaling must not oscillate"
+            );
+            if native.x >= 1040.0 && native.y >= 680.0 {
+                assert_eq!(target, 1.0);
+            }
+        }
+    }
+}
+
 /// Loads Windows' own Segoe UI family so the app feels native on Windows 11,
 /// plus the Segoe Fluent Icons font for crisp system icons.
 pub fn setup_fonts(ctx: &egui::Context) {
@@ -132,6 +174,13 @@ pub fn apply(ctx: &egui::Context) {
     style.spacing.icon_width = 18.0;
     style.spacing.icon_width_inner = 10.0;
     style.spacing.icon_spacing = 6.0;
+    // Reserve a real gutter consistently, rather than drawing an expanding
+    // floating thumb over file names or placing it against content-width text.
+    style.spacing.scroll = egui::style::ScrollStyle {
+        bar_width: 10.0,
+        handle_min_length: 24.0,
+        ..egui::style::ScrollStyle::solid()
+    };
 
     let mut v = Visuals::dark();
     v.dark_mode = true;

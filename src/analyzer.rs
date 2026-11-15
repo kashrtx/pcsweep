@@ -161,6 +161,7 @@ struct Shared<'a> {
     big: Mutex<Vec<FileRec>>,
     ext: Mutex<HashMap<String, (u64, u64)>>,
     denied: AtomicU64,
+    parallel: bool,
 }
 
 fn scan_dir(path: &Path, name: String, sh: &Shared<'_>, depth: u32) -> Node {
@@ -184,6 +185,9 @@ fn scan_dir(path: &Path, name: String, sh: &Shared<'_>, depth: u32) -> Node {
         node.kind = NodeKind::Denied;
         return node;
     }
+    if let Ok(mut current) = sh.progress.current.try_lock() {
+        *current = path.display().to_string();
+    }
     let rd = match fs::read_dir(path) {
         Ok(r) => r,
         Err(_) => {
@@ -197,6 +201,8 @@ fn scan_dir(path: &Path, name: String, sh: &Shared<'_>, depth: u32) -> Node {
     let mut small_count = 0u64;
     let mut local_ext: HashMap<String, (u64, u64)> = HashMap::new();
     let mut local_big: Vec<FileRec> = Vec::new();
+    let mut reported_files = 0;
+    let mut reported_bytes = 0;
     for entry in rd.flatten() {
         if sh.progress.cancel.load(Ordering::Relaxed) {
             break;
@@ -226,6 +232,18 @@ fn scan_dir(path: &Path, name: String, sh: &Shared<'_>, depth: u32) -> Node {
         node.modified = node.modified.max(modified);
         node.files += 1;
         node.size += size;
+        if node.files % 256 == 0 {
+            // A single flat directory can contain hundreds of thousands of
+            // entries. Publish bounded updates before it finishes, too.
+            sh.progress
+                .files
+                .fetch_add(node.files - reported_files, Ordering::Relaxed);
+            sh.progress
+                .bytes
+                .fetch_add(node.size - reported_bytes, Ordering::Relaxed);
+            reported_files = node.files;
+            reported_bytes = node.size;
+        }
         let e = local_ext.entry(ext_of(&fname)).or_insert((0, 0));
         e.0 += size;
         e.1 += 1;
@@ -255,8 +273,10 @@ fn scan_dir(path: &Path, name: String, sh: &Shared<'_>, depth: u32) -> Node {
     }
 
     let p = sh.progress;
-    p.files.fetch_add(node.files, Ordering::Relaxed);
-    p.bytes.fetch_add(node.size, Ordering::Relaxed);
+    p.files
+        .fetch_add(node.files - reported_files, Ordering::Relaxed);
+    p.bytes
+        .fetch_add(node.size - reported_bytes, Ordering::Relaxed);
     p.dirs.fetch_add(1, Ordering::Relaxed);
     if let Ok(mut c) = p.current.try_lock() {
         *c = path.display().to_string();
@@ -286,10 +306,12 @@ fn scan_dir(path: &Path, name: String, sh: &Shared<'_>, depth: u32) -> Node {
         });
     }
 
-    let subs: Vec<Node> = subdirs
-        .into_par_iter()
-        .map(|(p, n)| scan_dir(&p, n, sh, depth + 1))
-        .collect();
+    let visit = |(p, n): (PathBuf, String)| scan_dir(&p, n, sh, depth + 1);
+    let subs: Vec<Node> = if sh.parallel {
+        subdirs.into_par_iter().map(visit).collect()
+    } else {
+        subdirs.into_iter().map(visit).collect()
+    };
     for s in subs {
         node.size += s.size;
         node.files += s.files;
@@ -300,13 +322,41 @@ fn scan_dir(path: &Path, name: String, sh: &Shared<'_>, depth: u32) -> Node {
     node
 }
 
+/// Scans on a dedicated, bounded pool so a whole-drive scan can't take every core
+/// from the window, and so hard drives aren't thrashed by dozens of parallel seeks.
+pub fn scan_bounded(root_path: PathBuf, progress: Arc<Progress>, threads: usize) -> ScanResult {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads.clamp(1, 8))
+        .stack_size(16 * 1024 * 1024)
+        .thread_name(|i| format!("pcsweep-scan-{i}"))
+        .build();
+    match pool {
+        Ok(pool) => pool.install(|| scan(root_path, progress)),
+        // Resource pressure must not silently switch to the unbounded global pool.
+        Err(_) => scan_internal(root_path, progress, false),
+    }
+}
+
+/// Worker count for a scan: two for spinning disks, otherwise leave a core free.
+pub fn scan_threads(root_is_hdd: bool, cores: usize) -> usize {
+    cores
+        .saturating_sub(1)
+        .max(1)
+        .min(if root_is_hdd { 2 } else { 8 })
+}
+
 pub fn scan(root_path: PathBuf, progress: Arc<Progress>) -> ScanResult {
+    scan_internal(root_path, progress, true)
+}
+
+fn scan_internal(root_path: PathBuf, progress: Arc<Progress>, parallel: bool) -> ScanResult {
     let start = Instant::now();
     let sh = Shared {
         progress: &*progress,
         big: Mutex::new(Vec::new()),
         ext: Mutex::new(HashMap::new()),
         denied: AtomicU64::new(0),
+        parallel,
     };
     let root = scan_dir(&root_path, root_path.display().to_string(), &sh, 0);
     let denied = sh.denied.load(Ordering::Relaxed);
@@ -586,6 +636,7 @@ pub struct AnalyzerState {
     pub old_months: u32,
     pub old_min: u64,
     pub recycle: Task<util::RecycleReport>,
+    pub journal_error: Option<String>,
 }
 
 impl Default for AnalyzerState {
@@ -604,11 +655,14 @@ impl Default for AnalyzerState {
             old_months: 12,
             old_min: 100 * 1024 * 1024,
             recycle: Task::default(),
+            journal_error: None,
         }
     }
 }
 
 enum AAct {
+    Go(Page),
+    DismissJournalError,
     Scan(PathBuf),
     PickFolder,
     Cancel,
@@ -641,11 +695,23 @@ impl App {
         let progress = Arc::new(Progress::default());
         let p2 = progress.clone();
         let root = path.clone();
-        self.analyzer.scan = Task::spawn(ctx, move || scan(root, p2));
+        let root_norm = util::norm(&path);
+        let hdd = self.sys.drives.iter().any(|d| {
+            d.kind == "HDD" && util::is_within(&root_norm, &util::norm(Path::new(&d.mount)))
+        });
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let threads = scan_threads(hdd, cores);
+        self.analyzer.scan = Task::spawn(ctx, move || scan_bounded(root, p2, threads));
         self.analyzer.progress = Some(progress);
         self.analyzer.scan_root = Some(path.clone());
         self.analyzer.started = Some(Instant::now());
-        self.analyzer.result = None;
+        // Freeing a multi-million-file tree takes a noticeable moment, so the
+        // previous result is released on a background thread instead of this frame.
+        if let Some(old) = self.analyzer.result.take() {
+            let _ = std::thread::Builder::new()
+                .name("pcsweep-release-scan".into())
+                .spawn(move || drop(old));
+        }
         self.analyzer.nav.clear();
         self.analyzer.selected.clear();
         self.analyzer.removed.clear();
@@ -672,6 +738,11 @@ impl App {
         if let Some(r) = self.analyzer.recycle.poll() {
             match r {
                 Ok(rep) => {
+                    self.analyzer.journal_error = rep.journal_error.clone();
+                    if let Some(error) = &rep.journal_error {
+                        util::log(format!("Analyzer cleanup history: {error}"));
+                        self.toast(ToastKind::Error, error.clone());
+                    }
                     let n = rep.done.len();
                     for p in rep.done {
                         self.analyzer.selected.remove(&p);
@@ -682,7 +753,11 @@ impl App {
                         .retain(|p| !path_removed(p, &self.analyzer.removed));
                     if n > 0 {
                         self.toast(
-                            ToastKind::Success,
+                            if rep.journal_error.is_some() {
+                                ToastKind::Info
+                            } else {
+                                ToastKind::Success
+                            },
                             format!(
                                 "Moved {} item(s), {}, to the Recycle Bin",
                                 n,
@@ -714,6 +789,8 @@ impl App {
         self.render_analyzer(ui, &mut acts);
         for a in acts {
             match a {
+                AAct::Go(page) => self.page = page,
+                AAct::DismissJournalError => self.analyzer.journal_error = None,
                 AAct::Scan(p) => self.start_analyze(p, &ctx),
                 AAct::PickFolder => {
                     if let Some(p) = rfd::FileDialog::new()
@@ -821,6 +898,23 @@ impl App {
             "Space analyzer",
             "Map your disk space, find large files, and review files that have not changed in a long time.",
         );
+        if ui
+            .add(widgets::small("Disk health and maintenance"))
+            .clicked()
+        {
+            acts.push(AAct::Go(Page::Storage));
+        }
+        if let Some(error) = &a.journal_error {
+            ui.colored_label(WARN, format!("Cleanup history needs review: {error}. Cleanup stopped; check uncertain outcomes in Cleanup history."));
+            ui.horizontal_wrapped(|ui| {
+                if ui.add(widgets::small("Activity log")).clicked() {
+                    acts.push(AAct::Go(Page::Activity));
+                }
+                if ui.add(widgets::small("Dismiss message")).clicked() {
+                    acts.push(AAct::DismissJournalError);
+                }
+            });
+        }
         let scanning = a.scan.running();
 
         // Source picker
@@ -886,7 +980,9 @@ impl App {
                             .unwrap_or_default();
                         ui.label(widgets::strong(format!("Mapping {root}"), 17.0));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.add(widgets::ghost("Stop")).clicked() {
+                            if p.cancel.load(Ordering::Relaxed) {
+                                ui.add_enabled(false, widgets::ghost("Stopping…"));
+                            } else if ui.add(widgets::ghost("Stop")).clicked() {
                                 acts.push(AAct::Cancel);
                             }
                         });
@@ -903,8 +999,15 @@ impl App {
                         fmt_num(p.dirs.load(Ordering::Relaxed)),
                         secs
                     )));
-                    let cur = p.current.lock().map(|s| s.clone()).unwrap_or_default();
-                    ui.add(Label::new(widgets::faint(cur)).truncate());
+                    if p.cancel.load(Ordering::Relaxed) {
+                        ui.label(widgets::faint(
+                            "Stopping: finishing the folders already being read. Results so far will be kept and marked partial.",
+                        ));
+                    } else {
+                        // Never wait on a scan worker: skip this frame's path if it's busy.
+                        let cur = p.current.try_lock().map(|s| s.clone()).unwrap_or_default();
+                        ui.add(Label::new(widgets::faint(cur)).truncate());
+                    }
                 });
             }
             return;
@@ -1452,6 +1555,39 @@ mod tests {
         for (_, cell) in cells {
             assert!(bounds.contains_rect(cell));
         }
+    }
+
+    #[test]
+    fn scans_leave_a_core_free_and_spare_spinning_disks() {
+        assert_eq!(scan_threads(true, 16), 2);
+        assert_eq!(scan_threads(false, 16), 8);
+        assert_eq!(scan_threads(false, 4), 3);
+        assert_eq!(scan_threads(false, 1), 1);
+        assert_eq!(scan_threads(true, 1), 1);
+        assert_eq!(scan_threads(false, 2), 1);
+    }
+
+    #[test]
+    fn bounded_scan_honours_cancellation() {
+        let progress = Arc::new(Progress::default());
+        progress.cancel.store(true, Ordering::Relaxed);
+        let result = scan_bounded(std::env::temp_dir(), progress, 2);
+        assert!(result.cancelled);
+        assert_eq!(result.dirs, 0);
+    }
+
+    #[test]
+    fn sequential_fallback_keeps_the_same_scan_totals() {
+        let root =
+            std::env::temp_dir().join(format!("pcsweep-scan-sequential-{}", std::process::id()));
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::write(root.join("one.txt"), b"123").unwrap();
+        fs::write(root.join("nested").join("two.txt"), b"4567").unwrap();
+        let result = scan_internal(root.clone(), Arc::new(Progress::default()), false);
+        assert_eq!(result.root.files, 2);
+        assert_eq!(result.root.size, 7);
+        assert_eq!(result.dirs, 2);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

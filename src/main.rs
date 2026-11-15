@@ -11,13 +11,17 @@ mod cleaner;
 mod dashboard;
 mod dns;
 mod duplicates;
+mod file_changes;
+mod journal;
 mod network;
 mod platform;
 mod power;
 mod privacy;
 mod processes;
 mod security;
+mod speed;
 mod startup;
+mod storage;
 mod system;
 mod task;
 mod theme;
@@ -27,6 +31,7 @@ mod ui_preview;
 mod updates;
 mod util;
 mod widgets;
+mod windows_controls;
 
 use eframe::egui;
 
@@ -47,7 +52,7 @@ fn main() -> Result<(), eframe::Error> {
         viewport: egui::ViewportBuilder::default()
             .with_title("PCSweep")
             .with_inner_size([1320.0, 860.0])
-            .with_min_inner_size([1040.0, 680.0])
+            .with_min_inner_size([900.0, 520.0])
             .with_clamp_size_to_monitor_size(true)
             .with_icon(app_icon()),
         ..Default::default()

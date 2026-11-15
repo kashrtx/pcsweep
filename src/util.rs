@@ -433,57 +433,111 @@ pub fn delete_junk_file(
     }
 }
 
-/// Removes folders that became empty after cleaning (deepest first). Never removes non-empty folders.
-pub fn remove_empty_dirs(mut dirs: Vec<PathBuf>) {
-    dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
-    for d in dirs {
-        if !junk_delete_allowed(&d) || has_reparse_ancestor(&d) != Ok(false) {
-            continue;
-        }
-        let Ok(resolved) = fs::canonicalize(&d) else {
-            continue;
-        };
-        if !junk_delete_allowed(&resolved) {
-            continue;
-        }
-        if let Ok(md) = fs::symlink_metadata(&resolved) {
-            if md.is_dir() && !is_reparse(&md) {
-                let _ = fs::remove_dir(&resolved);
-            }
-        }
+/// Removes one reviewed empty cache folder. The caller must persist its intent first.
+pub fn remove_empty_dir(path: &Path) -> Result<(), String> {
+    if !path.is_absolute() || !junk_delete_allowed(path) || has_reparse_ancestor(path)? {
+        return Err("Folder is protected or could not be checked".into());
     }
+    let resolved = fs::canonicalize(path).map_err(|e| e.to_string())?;
+    if !junk_delete_allowed(&resolved) {
+        return Err("Folder is protected".into());
+    }
+    let md = fs::symlink_metadata(&resolved).map_err(|e| e.to_string())?;
+    if !md.is_dir() || is_reparse(&md) {
+        return Err("Links and non-folders are protected".into());
+    }
+    fs::remove_dir(resolved).map_err(|e| format!("Folder was kept: {e}"))
 }
 
 pub struct RecycleReport {
     pub done: Vec<PathBuf>,
     pub failed: Vec<(PathBuf, String)>,
     pub bytes: u64,
+    pub journal_error: Option<String>,
 }
 
 /// Moves user-chosen items to the Recycle Bin (restorable). Protected paths are refused.
-pub fn recycle(items: Vec<(PathBuf, u64)>) -> RecycleReport {
+/// Each item is recorded in the cleanup journal first; if it can't be, nothing moves.
+pub fn recycle(items: Vec<(PathBuf, u64)>, source: &str) -> RecycleReport {
+    use crate::journal::{Act, Outcome, Session};
     let mut rep = RecycleReport {
         done: Vec::new(),
         failed: Vec::new(),
         bytes: 0,
+        journal_error: None,
+    };
+    let mut session = match Session::begin(source) {
+        Ok(session) => session,
+        Err(e) => {
+            rep.journal_error = Some(e.clone());
+            rep.failed = items
+                .into_iter()
+                .map(|(p, _)| {
+                    (
+                        p,
+                        format!("Nothing moved: cleanup history unavailable: {e}"),
+                    )
+                })
+                .collect();
+            return rep;
+        }
     };
     let mut lines = Vec::new();
-    for (p, size) in items {
-        if let Some(reason) = block_reason(&p) {
-            rep.failed.push((p, reason.to_string()));
-            continue;
-        }
-        match trash::delete(&p) {
-            Ok(()) => {
-                lines.push(format!(
-                    "  moved to Recycle Bin: {} ({})",
-                    p.display(),
-                    fmt_bytes(size)
-                ));
-                rep.bytes += size;
-                rep.done.push(p);
+    for (batch_number, batch) in items.chunks(128).enumerate() {
+        let ids = match session.intend(source, Act::Recycle, batch) {
+            Ok(ids) => ids,
+            Err(e) => {
+                rep.journal_error = Some(e.clone());
+                rep.failed
+                    .extend(items[batch_number * 128..].iter().map(|(p, _)| {
+                        (
+                            p.clone(),
+                            format!("Not moved: cleanup history unavailable: {e}"),
+                        )
+                    }));
+                break;
             }
-            Err(e) => rep.failed.push((p, e.to_string())),
+        };
+        let mut outcomes = Vec::with_capacity(batch.len());
+        for ((path, size), id) in batch.iter().zip(ids) {
+            if let Some(reason) = block_reason(path) {
+                outcomes.push((id, Outcome::Skipped, Some(reason.into())));
+                rep.failed.push((path.clone(), reason.into()));
+                continue;
+            }
+            match trash::delete(path) {
+                Ok(()) => {
+                    rep.bytes += size;
+                    rep.done.push(path.clone());
+                    outcomes.push((id, Outcome::Recycled, None));
+                    lines.push(format!(
+                        "  moved to Recycle Bin: {} ({})",
+                        path.display(),
+                        fmt_bytes(*size)
+                    ));
+                }
+                Err(e) => {
+                    outcomes.push((id, Outcome::Failed, Some(e.to_string())));
+                    rep.failed.push((path.clone(), e.to_string()));
+                }
+            }
+        }
+        if let Err(e) = session.finish(&outcomes) {
+            rep.journal_error = Some(e.clone());
+            log(format!(
+                "Cleanup history failed after this batch; completed results may be uncertain: {e}"
+            ));
+            rep.failed.extend(
+                items[((batch_number + 1) * 128).min(items.len())..]
+                    .iter()
+                    .map(|(p, _)| {
+                        (
+                            p.clone(),
+                            format!("Not moved: cleanup history unavailable: {e}"),
+                        )
+                    }),
+            );
+            break;
         }
     }
     log(format!(

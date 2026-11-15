@@ -35,6 +35,10 @@ pub enum Page {
     Updates,
     Tools,
     Activity,
+    Storage,
+    WindowsControls,
+    Speed,
+    FileChanges,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -78,6 +82,9 @@ pub enum Action {
     Ads(crate::ads::AdsAction),
     Network(crate::network::NetworkAction),
     Power(crate::power::PowerAction),
+    Storage(crate::storage::StorageAction),
+    WindowsControls(crate::windows_controls::WindowsControlsAction),
+    Speed(crate::speed::SpeedAction),
 }
 
 pub struct Modal {
@@ -108,13 +115,24 @@ pub struct App {
     pub ads: crate::ads::AdsState,
     pub network: crate::network::NetworkState,
     pub power: crate::power::PowerState,
+    pub history: crate::journal::HistoryState,
+    pub storage: crate::storage::StorageState,
+    pub windows_controls: crate::windows_controls::WindowsControlsState,
+    pub speed: crate::speed::SpeedState,
+    pub file_changes: crate::file_changes::FileChangesState,
     pub modal: Option<Modal>,
     pub toasts: Vec<Toast>,
     pub relaunch: Task<bool>,
     activity_filter: String,
     last_nav_page: Option<Page>,
     reveal_nav_frames: u8,
+    /// When the current confirmation first appeared; its action stays disarmed
+    /// briefly so a click or key press meant for the page can't confirm it.
+    modal_since: Option<Instant>,
 }
+
+/// How long a new confirmation ignores its confirm button.
+const MODAL_ARMING: Duration = Duration::from_millis(400);
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
@@ -139,12 +157,18 @@ impl App {
             ads: Default::default(),
             network: Default::default(),
             power: Default::default(),
+            history: Default::default(),
+            storage: Default::default(),
+            windows_controls: Default::default(),
+            speed: Default::default(),
+            file_changes: Default::default(),
             modal: None,
             toasts: Vec::new(),
             relaunch: Task::default(),
             activity_filter: String::new(),
             last_nav_page: None,
             reveal_nav_frames: 0,
+            modal_since: None,
         };
         util::load_log_history();
         util::log(format!(
@@ -195,7 +219,8 @@ impl App {
         }
         match origin {
             Origin::Analyzer => {
-                self.analyzer.recycle = Task::spawn(ctx, move || util::recycle(items));
+                self.analyzer.recycle =
+                    Task::spawn(ctx, move || util::recycle(items, "Space analyzer"));
             }
             Origin::Duplicates => {
                 let groups = self.dups.groups.clone().unwrap_or_default();
@@ -246,10 +271,14 @@ impl App {
             Action::Ads(action) => self.execute_ads(action, ctx),
             Action::Network(action) => self.execute_network(action, ctx),
             Action::Power(action) => self.execute_power(action, ctx),
+            Action::Storage(action) => self.execute_storage(action, ctx),
+            Action::WindowsControls(action) => self.execute_windows_controls(action, ctx),
+            Action::Speed(action) => self.execute_speed(action, ctx),
         }
     }
 
     fn poll(&mut self, ctx: &egui::Context) {
+        self.poll_history();
         self.poll_cleaner(ctx);
         self.poll_analyzer();
         self.poll_duplicates();
@@ -263,6 +292,10 @@ impl App {
         self.poll_ads(ctx);
         self.poll_network(ctx);
         self.poll_power(ctx);
+        self.poll_storage(ctx);
+        self.poll_windows_controls(ctx);
+        self.poll_speed(ctx);
+        self.poll_file_changes();
         if let Some(r) = self.relaunch.poll() {
             match r {
                 Ok(true) => {
@@ -286,6 +319,9 @@ impl App {
             || self.ads.busy()
             || self.network.busy()
             || self.power.busy()
+            || self.storage.busy()
+            || self.windows_controls.busy()
+            || self.speed.busy()
             || self.updates.installing()
             || self.relaunch.running()
             || self.tools.run.as_ref().is_some_and(|run| !run.is_done())
@@ -360,6 +396,7 @@ impl App {
             &[
                 (Page::Cleaner, ic::CLEAN, "Junk cleaner"),
                 (Page::Analyzer, ic::PIE, "Space analyzer"),
+                (Page::Storage, ic::DRIVE, "Disk health"),
                 (Page::Duplicates, ic::COPY, "Duplicates"),
                 (Page::Apps, ic::APPS, "Installed apps"),
             ],
@@ -371,9 +408,12 @@ impl App {
                 (Page::Background, ic::BOLT, "Background activity"),
                 (Page::Memory, ic::SPEED, "Memory and apps"),
                 (Page::Network, ic::GLOBE, "Connection health"),
+                (Page::Speed, ic::SPEED, "Internet speed test"),
                 (Page::Power, ic::POWER, "Battery and power"),
             ],
             &[
+                (Page::WindowsControls, ic::TOOLS, "Windows controls"),
+                (Page::FileChanges, ic::HISTORY, "Windows file changes"),
                 (Page::Tools, ic::TOOLS, "Tools"),
                 (Page::Updates, ic::UPDATE, "Updates"),
                 (Page::Activity, ic::HISTORY, "Activity log"),
@@ -474,6 +514,10 @@ impl App {
             Page::Updates => self.page_updates(ui),
             Page::Tools => self.page_tools(ui),
             Page::Activity => self.page_activity(ui),
+            Page::Storage => self.page_storage(ui),
+            Page::WindowsControls => self.page_windows_controls(ui),
+            Page::Speed => self.page_speed(ui),
+            Page::FileChanges => self.page_file_changes(ui),
         }
     }
 
@@ -497,16 +541,26 @@ impl App {
             ads: crate::ads::preview_fixture(),
             network: crate::network::preview_fixture(),
             power: crate::power::preview_fixture(),
+            history: Default::default(),
+            storage: crate::storage::preview_fixture(),
+            windows_controls: crate::windows_controls::preview_fixture(),
+            speed: crate::speed::preview_fixture(),
+            file_changes: crate::file_changes::preview_fixture(),
             modal: None,
             toasts: Vec::new(),
             relaunch: Default::default(),
             activity_filter: String::new(),
             last_nav_page: None,
             reveal_nav_frames: 0,
+            modal_since: None,
         }
     }
 
     fn page_activity(&mut self, ui: &mut Ui) {
+        if self.history.open {
+            self.page_history(ui);
+            return;
+        }
         widgets::page_header(
             ui,
             "Activity log",
@@ -514,12 +568,20 @@ impl App {
         );
         let path = util::log_path();
         let lines = util::log_lines();
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            if ui.add(widgets::small("Windows file changes")).clicked() {
+                self.page = Page::FileChanges;
+            }
             if ui.add(widgets::small("Open log file")).clicked() {
                 util::open_path(&path);
             }
             if ui.add(widgets::small("Show in Explorer")).clicked() {
                 util::show_in_explorer(&path);
+            }
+            let history = widgets::icon_text(ic::HISTORY, "Cleanup history", 13.0, TEXT);
+            if ui.add(widgets::small(history)).clicked() {
+                self.history.open = true;
+                self.history.refresh(ui.ctx());
             }
             ui.label(widgets::faint(path.display().to_string()));
         });
@@ -574,7 +636,15 @@ impl App {
     // ------------------------------------------------------------ overlays
 
     pub(crate) fn modal_ui(&mut self, ctx: &egui::Context) {
-        let Some(modal) = &self.modal else { return };
+        let Some(modal) = &self.modal else {
+            self.modal_since = None;
+            return;
+        };
+        let since = *self.modal_since.get_or_insert_with(Instant::now);
+        let armed = since.elapsed() >= MODAL_ARMING;
+        if !armed {
+            ctx.request_repaint_after(MODAL_ARMING);
+        }
         ctx.layer_painter(LayerId::new(Order::PanelResizeLine, Id::new("modal_dim")))
             .rect_filled(
                 ctx.screen_rect(),
@@ -615,21 +685,18 @@ impl App {
                         ui.label(RichText::new(&modal.body).color(TEXT_DIM));
                         if !modal.details.is_empty() {
                             ui.add_space(4.0);
+                            // One scroll region per dialog: the details grow inside the
+                            // content scroll, so its scrollbar sits at the dialog's edge.
                             Frame::none()
                                 .fill(BG)
                                 .rounding(Rounding::same(8.0))
                                 .inner_margin(Margin::same(10.0))
                                 .show(ui, |ui| {
                                     ui.set_min_width(ui.available_width());
-                                    ScrollArea::vertical()
-                                        .id_salt("modal_details")
-                                        .max_height(180.0)
-                                        .show(ui, |ui| {
-                                            for d in &modal.details {
-                                                ui.add(Label::new(widgets::faint(d)).wrap())
-                                                    .on_hover_text(d);
-                                            }
-                                        });
+                                    for d in &modal.details {
+                                        ui.add(Label::new(widgets::faint(d)).wrap())
+                                            .on_hover_text(d);
+                                    }
                                 });
                         }
                         if let Some(n) = &modal.note {
@@ -648,7 +715,7 @@ impl App {
                         } else {
                             widgets::primary(modal.confirm.clone())
                         };
-                        if ui.add(btn).clicked() {
+                        if ui.add_enabled(armed, btn).clicked() {
                             decision = Some(true);
                         }
                         if ui.add(widgets::ghost("Cancel")).clicked() {
@@ -661,6 +728,7 @@ impl App {
             decision = Some(false);
         }
         if let Some(confirmed) = decision {
+            self.modal_since = None;
             if let Some(m) = self.modal.take() {
                 if confirmed {
                     self.execute(m.action, ctx);
@@ -706,6 +774,7 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        theme::fit_to_viewport(ctx);
         // Re-apply the theme if Windows switches light/dark mode underneath us.
         if ctx.style().visuals.panel_fill != theme::BG {
             theme::apply(ctx);

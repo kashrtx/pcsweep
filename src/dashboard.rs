@@ -39,7 +39,7 @@ impl App {
                 score -= 25;
                 recs.push(Rec {
                     sev: Sev::High,
-                    text: format!("{} is almost full ({} free). Windows slows down and updates fail when space runs out.", d.letter(), fmt_bytes(d.free)),
+                    text: format!("{} is almost full ({} free). Low storage headroom can affect updates and app workloads.", d.letter(), fmt_bytes(d.free)),
                     go: Some(Page::Analyzer),
                     action: "Find space",
                 });
@@ -48,7 +48,7 @@ impl App {
                 recs.push(Rec {
                     sev: Sev::Medium,
                     text: format!(
-                        "{} has {} free. Keeping at least 20% free helps performance.",
+                        "{} has {} free. Review storage headroom if updates or apps need more space.",
                         d.letter(),
                         fmt_bytes(d.free)
                     ),
@@ -194,6 +194,18 @@ impl App {
             .id_salt("dash_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                widgets::card(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(widgets::strong("Storage status", 17.0));
+                        if ui.add(widgets::small("Disk health and maintenance")).clicked() {
+                            acts.push(DAct::Go(Page::Storage));
+                        }
+                    });
+                    ui.add(Label::new(RichText::new(self.storage.overview_summary())
+                        .color(if self.storage.has_warning() { WARN } else { TEXT_DIM })).wrap());
+                    ui.label(widgets::faint("Capacity, physical-disk reports and optimization are separate checks. Missing telemetry stays unknown."));
+                });
+                ui.add_space(8.0);
                 let (score, recs) = self.health();
                 let scanning = !self.cleaner.scanned_once;
                 ui.columns(2, |cols| {
@@ -205,7 +217,7 @@ impl App {
                             let word = if scanning {
                                 "checking"
                             } else if score >= 85 {
-                                "healthy"
+                                "checks clear"
                             } else if score >= 65 {
                                 "could be better"
                             } else {

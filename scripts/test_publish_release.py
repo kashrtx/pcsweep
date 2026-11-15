@@ -17,8 +17,10 @@ class ReleaseTests(unittest.TestCase):
         self.exe.write_bytes(b"MZtested-Windows-binary")
         with zipfile.ZipFile(self.dist / "PCSweep-1.1.0-windows-x64.zip", "w") as package:
             package.write(self.exe, self.exe.name)
-            for name in ["README.md", "LICENSE", "RELEASE_NOTES.md"]:
+            for name in ["README.md", "LICENSE", "NOTICE", "PRIVACY.md", "RELEASE_NOTES.md"]:
                 package.writestr(name, "Documentation")
+        for name in ["LICENSE", "NOTICE"]:
+            (self.dist / name).write_text("Documentation")
         self.commit = "a" * 40
         self.created = []
         self.gh_calls = []
@@ -62,7 +64,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(self.created[0]["target_commitish"], self.commit)
         checksums = (self.dist / "SHA256SUMS.txt").read_text()
         self.assertIn(f"{release.digest(self.exe)}  PCSweep.exe", checksums)
-        self.assertEqual(len(checksums.splitlines()), 3)
+        self.assertEqual(len(checksums.splitlines()), 5)
         manifest = json.loads((self.dist / "update.json").read_text())
         self.assertEqual(manifest, {
             "schema": 1, "version": "1.1.0", "revision": 42,
@@ -103,6 +105,29 @@ class ReleaseTests(unittest.TestCase):
     def test_corrupt_package_prevents_release_creation(self):
         self.exe.write_bytes(b"MZchanged-after-build")
         with self.assertRaisesRegex(RuntimeError, "differs"):
+            self.publish()
+        self.assertFalse(self.created)
+
+    def test_missing_attribution_prevents_release_creation(self):
+        (self.dist / "NOTICE").unlink()
+        with self.assertRaisesRegex(RuntimeError, "attribution file is missing"):
+            self.publish()
+        self.assertFalse(self.created)
+
+    def test_zip_without_notice_prevents_release_creation(self):
+        archive = self.dist / "PCSweep-1.1.0-windows-x64.zip"
+        with zipfile.ZipFile(archive) as package:
+            entries = {name: package.read(name) for name in package.namelist() if name != "NOTICE"}
+        with zipfile.ZipFile(archive, "w") as package:
+            for name, content in entries.items():
+                package.writestr(name, content)
+        with self.assertRaisesRegex(RuntimeError, "incomplete or corrupt"):
+            self.publish()
+        self.assertFalse(self.created)
+
+    def test_mismatched_notice_prevents_release_creation(self):
+        (self.dist / "NOTICE").write_text("Unexpected notice")
+        with self.assertRaisesRegex(RuntimeError, "attribution differs"):
             self.publish()
         self.assertFalse(self.created)
 

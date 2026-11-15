@@ -32,17 +32,19 @@ The first release of a Cargo version uses its usual tag, such as `v1.1.0`. Furth
 - **Background activity:** review scheduled tasks, publishers and triggers. Supported third-party tasks can be enabled/disabled with persistent Undo. Windows/security tasks are protected. Browser background, Startup boost and extension shortcuts open the browser's own settings.
 - **PCSweep updates:** manually check the official GitHub release, or opt into daily checking while the app is open. Downloads are checked by size and SHA-256. Normal user sessions in writable portable locations support update-and-restart with a backup and startup acknowledgement; administrator sessions and protected folders get a verified download instead.
 - **Overview:** a health score based on things that genuinely affect speed (free space, junk, memory pressure, startup load, uptime), with one-click fixes.
-- **Junk cleaner:** about 25 categories covering user and Windows temp, Store app temp, thumbnail cache, crash dumps and error reports, Delivery Optimization, Windows Update downloads, old logs, shader caches, driver installer leftovers, browser caches (Chrome, Edge, Firefox, Brave, Opera, Vivaldi), Discord, Teams, Slack, VS Code, Steam (including shader caches in every library), other Chromium/Electron app caches, and developer package caches. Expand any category to review every file and uncheck what you want to keep. Your selections are remembered, and a file that matches two categories is only counted once.
+- **Junk cleaner:** about 25 categories covering user and Windows temp, Store app temp, thumbnail cache, crash dumps and error reports, Delivery Optimization, Windows Update downloads, old logs, shader caches, driver installer leftovers, browser caches (Chrome, Edge, Firefox, Brave, Opera, Vivaldi), Discord, Teams, Slack, VS Code, Steam (including shader caches in every library), other Chromium/Electron app caches, and developer package caches. **Review files** opens a full-page list for any category: search by name or folder, sort by size, date or folder, untick anything to keep, and use bulk Keep/Include actions that clearly say whether they apply to all files or only the filtered ones. Your selections are remembered, and a file that matches two categories is only counted once.
 - **Space analyzer:** a parallel scan drawn as a clickable map you can drill into. Tabs for the largest files, old and unused files (filter by age and size), and a breakdown by file type.
 - **Duplicates:** byte-for-byte duplicate detection. One copy of each file is always kept.
 - **Installed apps:** sorted by size or install date, with each app's own uninstaller.
 - **Startup apps:** on/off switches that work exactly like Task Manager's.
-- **Memory and apps:** available RAM, committed memory and limit, cache context, private-memory growth and grouped app usage. Ask selected apps to close gracefully, use reversible efficiency mode for eligible background processes, or explicitly trim an app's working set under Advanced. Core/critical processes, reused PIDs and foreground processes are guarded. Trimming is temporary and may make an app reload pages; it does not fix a leak.
+- **Memory and apps:** a compact summary of available RAM, committed memory and CPU (with more detail on demand), private-memory growth and grouped app usage in a list that uses the whole window. Tick several apps and use **Close selected** to ask them all to close normally; PCSweep then checks which apps actually exited and reports closed, still-open and unreachable apps separately, never force-closing. Private memory is read directly from Windows and shown as unavailable when Windows won't report it. You can also ask one app to close gracefully, use reversible efficiency mode for eligible background processes, or explicitly trim an app's working set under Advanced. Core/critical processes, reused PIDs and foreground processes are guarded. Trimming is temporary and may make an app reload pages; it does not fix a leak.
 - **Tools:** restore point, component store cleanup (WinSxS), turn hibernation off/on, System File Checker, DISM repair, drive error check, TRIM/optimize, power plans and DNS flush, with live output.
 - **Activity log:** searchable history of what PCSweep changed, including earlier sessions, with a button to copy matching entries. Saved to `%LOCALAPPDATA%\PCSweep\activity.log`.
+- **Cleanup history:** a searchable record of every file PCSweep deletes or moves to the Recycle Bin, saved before anything is touched. Each entry shows the original path, size, category, when it happened and the result: deleted, moved to the Recycle Bin, removed empty folder, not deleted (with the reason) or uncertain if PCSweep was interrupted. Filter by result or the latest cleanup and export CSV or JSON. Stored in `%LOCALAPPDATA%\PCSweep\journal` with bounded size.
 
 ## Safety rules (built into the code, not just the UI)
 
+- Nothing is deleted or moved unless it was first recorded in the cleanup journal; if the journal can't be written, the cleanup stops before changing anything.
 - Changes are reviewed first. Cleanup, app/package actions, privacy changes and update installation are serialized so they cannot interrupt each other.
 - Privacy Undo restores the saved value and refuses to overwrite a preference changed outside PCSweep. Undo for settings does not restore deleted files or app data.
 - DNS changes are limited to the reviewed physical adapter and preserve the original IPv4/IPv6 automatic/manual sources. Managed/encrypted DNS, active VPN routes, domain-managed connections and remote sessions are guarded. The recovery record is protected for administrator writes; an outside DNS change is preserved for review. DNS filtering cannot remove every ad: browser secure DNS, VPNs and same-domain advertising can bypass it.
@@ -82,8 +84,20 @@ No background service is installed. A DNS trial starts a temporary recovery proc
 
 Updater hashes protect download integrity using the official GitHub release as the trust source. Releases are currently unsigned; independent publisher signature verification is not claimed.
 
+## New in 1.5.0
+
+- **Responsive review:** full-page cleaner file review with search, sorting and retained selections; compact Memory page with multi-app checkboxes and normal-close results verified against the reviewed process instances.
+- **Cleanup history:** local pre-operation intentions and per-item outcomes, searchable/exportable history, guarded storage and stop-on-journal-failure behavior. History has bounded retention; missing outcomes are uncertain.
+- **Windows file changes:** a bounded, paged read of an existing NTFS journal and existing Security audit evidence. Windows File History is a separate optional backup feature. NTFS records do not identify the responsible app, old records expire, and resolved paths use current parent locations. Existing audit evidence requires prior auditing and does not by itself prove deletion.
+- **Disk health:** cached storage status on Overview, physical-disk/volume mapping, reported health and available counters, separate OS TRIM notification policy, scheduled maintenance information and reviewed Windows-native Analyze/Optimize actions. Unknown counters and missing per-volume history stay unknown.
+- **Windows controls:** reversible supported animation controls, edition/management-gated manual/notify Windows Update policy and driver-update exclusion. Configured readback and legacy Update API reports are shown separately from effective Windows 11 enforcement. Pause, active hours, transparency and indexing use the native Settings pages where direct controls are not verified. Local update/reliability history provides a What changed timeline without attributing causes automatically.
+- **Internet speed test:** optional native M-Lab NDT7 download/upload measurements, data caps, cancellation, TCP timing context and optional session-local result history. M-Lab publishes test results including public IP addresses and retains them indefinitely. Tests require consent; see [PRIVACY.md](PRIVACY.md).
+- **Consistent layouts:** reserved scrollbar gutters, one scroll region per confirmation, footer actions outside scrolling content, responsive lists and compact-window fitting. Native Windows tests include small, default and wide previews, high-DPI cases and interaction checks.
+
 ## License
 
-MIT. See `LICENSE`.
+Copyright 2026 Kaushal Bhingaradia.
+
+Licensed under the [Apache License, Version 2.0](LICENSE). See `LICENSE` and `NOTICE`. Contributions are accepted under the same license.
 
 The workflow only publishes after all tests, build and packaging checks pass. A failed run leaves existing releases available.

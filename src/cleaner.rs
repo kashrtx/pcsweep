@@ -1,4 +1,5 @@
 use crate::app::{Action, App, Modal, ToastKind};
+use crate::journal::{self, Act, Outcome};
 use crate::system;
 use crate::task::Task;
 use crate::theme::*;
@@ -613,42 +614,124 @@ pub struct CleanReport {
     pub freed: u64,
     pub deleted: u64,
     pub failed: u64,
+    /// Set when the cleanup journal couldn't be written, so cleaning stopped first.
+    pub journal_error: Option<String>,
 }
 
 pub fn run_clean(jobs: Vec<CleanJob>) -> CleanReport {
     let mut rep = CleanReport::default();
+    let mut journal = match journal::Session::begin("Junk cleaner") {
+        Ok(session) => session,
+        Err(error) => {
+            rep.journal_error = Some(error);
+            return rep;
+        }
+    };
     for job in jobs {
         if job.recycle_bin {
-            let (b, n) = system::recycle_bin_info();
-            if b == 0 && n == 0 {
+            let (bytes, count) = system::recycle_bin_info();
+            if bytes == 0 && count == 0 {
                 continue;
             }
-            if system::empty_recycle_bin() {
-                rep.freed += b;
-                rep.deleted += n;
-                util::log(format!("Emptied the Recycle Bin ({})", fmt_bytes(b)));
+            let ids = match journal.intend(
+                "Recycle Bin",
+                Act::EmptyRecycleBin,
+                &[(
+                    PathBuf::from(format!("{} items (batch)", fmt_num(count))),
+                    bytes,
+                )],
+            ) {
+                Ok(ids) => ids,
+                Err(e) => {
+                    rep.journal_error = Some(e);
+                    return rep;
+                }
+            };
+            let success = system::empty_recycle_bin();
+            if success {
+                rep.freed += bytes;
+                rep.deleted += count;
             } else {
-                rep.failed += n.max(1);
-                util::log("Could not empty the Recycle Bin");
+                rep.failed += count.max(1);
             }
+            let result = if success {
+                Outcome::Deleted
+            } else {
+                Outcome::Failed
+            };
+            if let Err(e) = journal.finish(&[(ids[0], result, None)]) {
+                rep.journal_error = Some(e);
+                return rep;
+            }
+            util::log(if success {
+                format!("Emptied the Recycle Bin ({})", fmt_bytes(bytes))
+            } else {
+                "Could not empty the Recycle Bin".into()
+            });
             continue;
         }
-        let results: Vec<Result<u64, String>> = job
-            .files
-            .par_iter()
-            .map(|f| util::delete_junk_file(&f.path, f.size, f.modified, f.created))
-            .collect();
-        let (mut freed, mut deleted, mut failed) = (0u64, 0u64, 0u64);
-        for r in results {
-            match r {
-                Ok(sz) => {
-                    freed += sz;
-                    deleted += 1;
+        let (mut freed, mut deleted, mut failed) = (0, 0, 0);
+        for batch in job.files.chunks(128) {
+            let items: Vec<_> = batch.iter().map(|f| (f.path.clone(), f.size)).collect();
+            let ids = match journal.intend(job.name, Act::Delete, &items) {
+                Ok(ids) => ids,
+                Err(e) => {
+                    rep.journal_error = Some(e);
+                    return rep;
                 }
-                Err(_) => failed += 1,
+            };
+            let results: Vec<_> = batch
+                .par_iter()
+                .map(|f| util::delete_junk_file(&f.path, f.size, f.modified, f.created))
+                .collect();
+            let mut outcomes = Vec::with_capacity(batch.len());
+            for (result, id) in results.into_iter().zip(ids) {
+                match result {
+                    Ok(bytes) => {
+                        freed += bytes;
+                        deleted += 1;
+                        rep.freed += bytes;
+                        rep.deleted += 1;
+                        outcomes.push((id, Outcome::Deleted, None));
+                    }
+                    Err(reason) => {
+                        failed += 1;
+                        rep.failed += 1;
+                        outcomes.push((id, Outcome::Skipped, Some(reason)));
+                    }
+                }
+            }
+            if let Err(e) = journal.finish(&outcomes) {
+                rep.journal_error = Some(e);
+                return rep;
             }
         }
-        util::remove_empty_dirs(job.dirs);
+        // Folder removal is also destructive: record intentions BEFORE trying it.
+        let mut dirs = job.dirs;
+        dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+        dirs.dedup();
+        for batch in dirs.chunks(128) {
+            let items: Vec<_> = batch.iter().map(|p| (p.clone(), 0)).collect();
+            let ids = match journal.intend(job.name, Act::RemoveFolder, &items) {
+                Ok(ids) => ids,
+                Err(e) => {
+                    rep.journal_error = Some(e);
+                    return rep;
+                }
+            };
+            let outcomes: Vec<_> = batch
+                .iter()
+                .zip(ids)
+                .map(|(path, id)| match util::remove_empty_dir(path) {
+                    Ok(()) => (id, Outcome::Removed, None),
+                    Err(reason) => (id, Outcome::Skipped, Some(reason)),
+                })
+                .collect();
+            if let Err(e) = journal.finish(&outcomes) {
+                rep.journal_error = Some(e);
+                return rep;
+            }
+        }
         util::log(format!(
             "Cleaned {}: freed {}, {} files deleted, {} skipped (in use or protected)",
             job.name,
@@ -656,14 +739,48 @@ pub fn run_clean(jobs: Vec<CleanJob>) -> CleanReport {
             fmt_num(deleted),
             fmt_num(failed)
         ));
-        rep.freed += freed;
-        rep.deleted += deleted;
-        rep.failed += failed;
     }
     rep
 }
 
 // ====================================================================== state
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum ReviewSort {
+    #[default]
+    Largest,
+    Newest,
+    Oldest,
+    Path,
+}
+
+/// The full-page review of one category's files.
+pub struct FileReview {
+    pub category: usize,
+    pub filter: String,
+    pub sort: ReviewSort,
+    /// Indexes into the category's files after filtering and sorting.
+    view: Vec<usize>,
+    /// What `view` was built from; it's rebuilt only when this changes.
+    key: Option<(String, ReviewSort, u64)>,
+    /// Lower-case paths for fast filtering, built once per scan result.
+    lower: Vec<String>,
+    lower_for: Option<u64>,
+}
+
+impl FileReview {
+    pub fn new(category: usize) -> Self {
+        Self {
+            category,
+            filter: String::new(),
+            sort: ReviewSort::Largest,
+            view: Vec::new(),
+            key: None,
+            lower: Vec::new(),
+            lower_for: None,
+        }
+    }
+}
 
 pub struct CleanerState {
     pub cats: Vec<Category>,
@@ -674,7 +791,9 @@ pub struct CleanerState {
     pub running: Vec<Vec<String>>,
     pub scan: Task<ScanOutput>,
     pub clean: Task<CleanReport>,
-    pub expanded: Option<usize>,
+    pub review: Option<FileReview>,
+    /// Bumped whenever scan results are replaced, so cached review views rebuild.
+    pub generation: u64,
     pub last_report: Option<CleanReport>,
     pub scanned_once: bool,
 }
@@ -702,9 +821,69 @@ impl CleanerState {
             cats,
             scan: Task::default(),
             clean: Task::default(),
-            expanded: None,
+            review: None,
+            generation: 0,
             last_report: None,
             scanned_once: false,
+        }
+    }
+
+    /// Rebuilds the review list only when its filter, sort or data changed, so a
+    /// category with tens of thousands of files never re-sorts every frame.
+    fn prepare_review(&mut self) {
+        let generation = self.generation;
+        let Some(review) = self.review.as_mut() else {
+            return;
+        };
+        let Some(Some(result)) = self.results.get(review.category) else {
+            return;
+        };
+        let key = (review.filter.trim().to_lowercase(), review.sort, generation);
+        if review.key.as_ref() == Some(&key) {
+            return;
+        }
+        if review.lower_for != Some(generation) {
+            review.lower = result
+                .files
+                .iter()
+                .map(|f| f.path.to_string_lossy().to_lowercase())
+                .collect();
+            review.lower_for = Some(generation);
+        }
+        let needle = key.0.as_str();
+        let lower = &review.lower;
+        let files = &result.files;
+        let mut view: Vec<usize> = (0..files.len())
+            .filter(|&i| needle.is_empty() || lower[i].contains(needle))
+            .collect();
+        match key.1 {
+            ReviewSort::Largest => view.sort_by(|&a, &b| files[b].size.cmp(&files[a].size)),
+            ReviewSort::Newest => view.sort_by(|&a, &b| files[b].modified.cmp(&files[a].modified)),
+            ReviewSort::Oldest => view.sort_by(|&a, &b| files[a].modified.cmp(&files[b].modified)),
+            ReviewSort::Path => view.sort_by(|&a, &b| lower[a].cmp(&lower[b])),
+        }
+        review.view = view;
+        review.key = Some(key);
+    }
+
+    /// Includes or keeps every file currently shown in the review (respecting the filter).
+    fn set_shown(&mut self, include: bool) {
+        let Some(review) = self.review.as_ref() else {
+            return;
+        };
+        let i = review.category;
+        let Some(Some(result)) = self.results.get(i) else {
+            return;
+        };
+        for &index in &review.view {
+            let file = &result.files[index];
+            if include {
+                if self.excluded[i].remove(&file.path) {
+                    self.excluded_bytes[i] = self.excluded_bytes[i].saturating_sub(file.size);
+                }
+            } else if self.excluded[i].insert(file.path.clone()) {
+                self.excluded_bytes[i] += file.size;
+            }
         }
     }
 
@@ -793,9 +972,13 @@ enum CAct {
     SelectAllFound,
     SelectNone,
     Expand(usize),
+    CloseReview,
+    ReviewFilter(String),
+    ReviewSort(ReviewSort),
+    KeepShown,
+    IncludeShown,
+    CopyPath(String),
     Toggle(usize, PathBuf, u64, bool),
-    IncludeAll(usize),
-    ExcludeAll(usize),
     Show(PathBuf),
     Ask,
     Rescan,
@@ -853,6 +1036,7 @@ impl App {
                         *b = 0;
                     }
                     self.cleaner.scanned_once = true;
+                    self.cleaner.generation += 1;
                 }
                 Err(e) => self.toast(ToastKind::Error, format!("Junk scan failed: {e}")),
             }
@@ -860,14 +1044,21 @@ impl App {
         if let Some(r) = self.cleaner.clean.poll() {
             match r {
                 Ok(rep) => {
-                    self.toast(
-                        ToastKind::Success,
-                        format!(
-                            "Freed {} ({} files deleted)",
-                            fmt_bytes(rep.freed),
-                            fmt_num(rep.deleted)
-                        ),
-                    );
+                    if let Some(error) = &rep.journal_error {
+                        self.toast(
+                            ToastKind::Error,
+                            format!("Cleaning stopped: {error}. Completed actions with an unsaved result remain uncertain in history."),
+                        );
+                    } else {
+                        self.toast(
+                            ToastKind::Success,
+                            format!(
+                                "Freed {} ({} files deleted)",
+                                fmt_bytes(rep.freed),
+                                fmt_num(rep.deleted)
+                            ),
+                        );
+                    }
                     self.cleaner.last_report = Some(rep);
                     self.sys.refresh_drives();
                     self.start_junk_scan(ctx);
@@ -970,14 +1161,22 @@ impl App {
         if jobs.is_empty() {
             return;
         }
-        self.cleaner.expanded = None;
+        self.cleaner.review = None;
         self.cleaner.clean = Task::spawn(ctx, move || run_clean(jobs));
     }
 
     pub fn page_cleaner(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
         let mut acts = Vec::new();
-        self.render_cleaner(ui, &mut acts);
+        if self.cleaner.review.is_some() {
+            self.cleaner.prepare_review();
+            self.render_review(ui, &mut acts);
+            if self.modal.is_none() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                acts.push(CAct::CloseReview);
+            }
+        } else {
+            self.render_cleaner(ui, &mut acts);
+        }
         let mut selection_changed = false;
         for a in acts {
             match a {
@@ -1006,13 +1205,21 @@ impl App {
                     }
                     selection_changed = true;
                 }
-                CAct::Expand(i) => {
-                    self.cleaner.expanded = if self.cleaner.expanded == Some(i) {
-                        None
-                    } else {
-                        Some(i)
+                CAct::Expand(i) => self.cleaner.review = Some(FileReview::new(i)),
+                CAct::CloseReview => self.cleaner.review = None,
+                CAct::ReviewFilter(value) => {
+                    if let Some(review) = self.cleaner.review.as_mut() {
+                        review.filter = value;
                     }
                 }
+                CAct::ReviewSort(sort) => {
+                    if let Some(review) = self.cleaner.review.as_mut() {
+                        review.sort = sort;
+                    }
+                }
+                CAct::KeepShown => self.cleaner.set_shown(false),
+                CAct::IncludeShown => self.cleaner.set_shown(true),
+                CAct::CopyPath(text) => ctx.output_mut(|o| o.copied_text = text),
                 CAct::Toggle(i, path, size, include) => {
                     if include {
                         if self.cleaner.excluded[i].remove(&path) {
@@ -1021,16 +1228,6 @@ impl App {
                         }
                     } else if self.cleaner.excluded[i].insert(path) {
                         self.cleaner.excluded_bytes[i] += size;
-                    }
-                }
-                CAct::IncludeAll(i) => {
-                    self.cleaner.excluded[i].clear();
-                    self.cleaner.excluded_bytes[i] = 0;
-                }
-                CAct::ExcludeAll(i) => {
-                    if let Some(r) = &self.cleaner.results[i] {
-                        self.cleaner.excluded[i] = r.files.iter().map(|f| f.path.clone()).collect();
-                        self.cleaner.excluded_bytes[i] = r.bytes;
                     }
                 }
                 CAct::Show(p) => util::show_in_explorer(&p),
@@ -1123,18 +1320,34 @@ impl App {
             });
             if let Some(rep) = &c.last_report {
                 ui.add_space(6.0);
-                widgets::banner(ui, GOOD, ic::CHECK, |ui| {
-                    ui.label(format!(
+                widgets::banner(
+                    ui,
+                    if rep.journal_error.is_some() {
+                        WARN
+                    } else {
+                        GOOD
+                    },
+                    if rep.journal_error.is_some() {
+                        ic::WARN
+                    } else {
+                        ic::CHECK
+                    },
+                    |ui| {
+                        ui.vertical(|ui| {
+                    ui.add(Label::new(format!(
                         "Last clean freed {}. {} files deleted{}.",
                         fmt_bytes(rep.freed),
                         fmt_num(rep.deleted),
                         if rep.failed > 0 {
-                            format!(", {} skipped because they were in use", fmt_num(rep.failed))
+                            format!(", {} skipped (in use, changed, protected or unavailable)", fmt_num(rep.failed))
                         } else {
                             String::new()
                         }
-                    ));
-                });
+                    )).wrap());
+                    if let Some(error)=&rep.journal_error {ui.add(Label::new(widgets::dim(format!("Cleanup stopped: {error}. Check Cleanup history for uncertain results."))).wrap());}
+                    });
+                    },
+                );
             }
         });
 
@@ -1205,7 +1418,6 @@ impl App {
         let res = c.results[i].as_ref();
         let bytes = c.cat_bytes(i);
         let files = c.cat_files(i);
-        let expanded = c.expanded == Some(i);
 
         widgets::tight_frame().show(ui, |ui| {
             ui.set_min_width(ui.available_width());
@@ -1260,11 +1472,8 @@ impl App {
                 ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
                     let can_review = res.map(|r| !r.files.is_empty()).unwrap_or(false);
                     ui.allocate_ui_with_layout(egui::vec2(110.0, 30.0), Layout::right_to_left(Align::Center), |ui| {
-                        if can_review {
-                            let label = if expanded { "Hide files" } else { "Review files" };
-                            if ui.add(widgets::small(label)).clicked() {
-                                acts.push(CAct::Expand(i));
-                            }
+                        if can_review && ui.add(widgets::small("Review files")).clicked() {
+                            acts.push(CAct::Expand(i));
                         }
                     });
                     ui.allocate_ui_with_layout(egui::vec2(120.0, 0.0), Layout::top_down(Align::Max), |ui| {
@@ -1285,52 +1494,180 @@ impl App {
                 });
             });
 
-            if expanded {
-                if let Some(r) = res {
-                    ui.add_space(6.0);
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.label(widgets::faint("Uncheck anything you want to keep. Largest files first."));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.add(widgets::small("Keep all")).clicked() {
-                                acts.push(CAct::ExcludeAll(i));
-                            }
-                            if ui.add(widgets::small("Include all")).clicked() {
-                                acts.push(CAct::IncludeAll(i));
-                            }
-                        });
-                    });
-                    let excl = &c.excluded[i];
-                    ScrollArea::vertical()
-                        .id_salt(("review", i))
-                        .max_height(320.0)
-                        .auto_shrink([false, true])
-                        .show_rows(ui, 28.0, r.files.len(), |ui, range| {
-                            for f in &r.files[range] {
-                                widgets::row(ui, 28.0, |ui| {
-                                    let mut inc = !excl.contains(&f.path);
-                                    if ui.checkbox(&mut inc, "").changed() {
-                                        acts.push(CAct::Toggle(i, f.path.clone(), f.size, inc));
-                                    }
-                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        ui.add_space(6.0);
-                                        if ui.add(widgets::small("Show")).clicked() {
-                                            acts.push(CAct::Show(f.path.clone()));
-                                        }
-                                        ui.add_sized([92.0, 20.0], Label::new(widgets::faint(fmt_age(f.modified))));
-                                        ui.add_sized([76.0, 20.0], Label::new(fmt_bytes(f.size)));
-                                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                                            let text = f.path.display().to_string();
-                                            let rt = if inc { RichText::new(text).color(TEXT_DIM) } else { RichText::new(text).color(TEXT_FAINT).strikethrough() };
-                                            ui.add(Label::new(rt).truncate());
-                                        });
-                                    });
-                                });
-                            }
-                        });
+        });
+    }
+
+    /// Full-page review: a fixed summary and toolbar, with the list using all the
+    /// remaining height instead of a small box nested in the category page.
+    fn render_review(&self, ui: &mut Ui, acts: &mut Vec<CAct>) {
+        let c = &self.cleaner;
+        let Some(review) = c.review.as_ref() else {
+            return;
+        };
+        let i = review.category;
+        let cat = c.cats[i];
+        let Some(Some(result)) = c.results.get(i) else {
+            ui.label(widgets::dim(
+                "These results are no longer available. Scan again.",
+            ));
+            if ui.add(widgets::ghost("Back to categories")).clicked() {
+                acts.push(CAct::CloseReview);
+            }
+            return;
+        };
+        let excluded = &c.excluded[i];
+        ui.horizontal(|ui| {
+            if ui
+                .add(widgets::ghost(widgets::icon_text(
+                    ic::BACK,
+                    "All categories",
+                    14.0,
+                    TEXT,
+                )))
+                .on_hover_text("Back to the category list (Esc). Your choices are kept.")
+                .clicked()
+            {
+                acts.push(CAct::CloseReview);
+            }
+            ui.label(widgets::strong(format!("Review: {}", cat.name), 22.0));
+        });
+        ui.add_space(4.0);
+        widgets::card(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                let mut sel = c.selected[i];
+                if ui.checkbox(&mut sel, "Clean this category").changed() {
+                    acts.push(CAct::SetSel(i, sel));
+                }
+                ui.label(widgets::strong(fmt_bytes(c.cat_bytes(i)), 16.0));
+                ui.label(widgets::dim(format!(
+                    "in {} of {} files will be cleaned. {} kept.",
+                    fmt_num(c.cat_files(i)),
+                    fmt_num(result.count),
+                    fmt_num(excluded.len() as u64)
+                )));
+            });
+            ui.label(widgets::faint(cat.desc));
+        });
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            let mut filter = review.filter.clone();
+            if widgets::search_box(ui, &mut filter, "Filter by name or folder", 240.0).changed() {
+                acts.push(CAct::ReviewFilter(filter));
+            }
+            ui.label(widgets::dim("Sort"));
+            for (sort, label) in [
+                (ReviewSort::Largest, "Largest"),
+                (ReviewSort::Newest, "Newest"),
+                (ReviewSort::Oldest, "Oldest"),
+                (ReviewSort::Path, "Folder"),
+            ] {
+                if ui.add(widgets::chip(label, review.sort == sort)).clicked() {
+                    acts.push(CAct::ReviewSort(sort));
                 }
             }
         });
+        let shown = review.view.len();
+        let filtered = !review.filter.trim().is_empty();
+        ui.horizontal_wrapped(|ui| {
+            let scope = if filtered {
+                format!("the {} shown", fmt_num(shown as u64))
+            } else {
+                "all".to_string()
+            };
+            if ui
+                .add_enabled(shown > 0, widgets::small(format!("Keep {scope}")))
+                .on_hover_text("Kept files are skipped when you clean.")
+                .clicked()
+            {
+                acts.push(CAct::KeepShown);
+            }
+            if ui
+                .add_enabled(shown > 0, widgets::small(format!("Include {scope}")))
+                .clicked()
+            {
+                acts.push(CAct::IncludeShown);
+            }
+            if filtered {
+                ui.label(widgets::faint(format!(
+                    "{} of {} files match the filter. Bulk actions only affect matching files.",
+                    fmt_num(shown as u64),
+                    fmt_num(result.count)
+                )));
+            } else {
+                ui.label(widgets::faint("Untick anything you want to keep."));
+            }
+        });
+        ui.add_space(2.0);
+        if shown == 0 {
+            ui.add_space(20.0);
+            ui.vertical_centered(|ui| ui.label(widgets::dim("No files match this filter.")));
+            return;
+        }
+        ScrollArea::vertical()
+            .id_salt(("review_list", i))
+            .auto_shrink([false, false])
+            .show_rows(ui, 44.0, shown, |ui, range| {
+                for &index in &review.view[range] {
+                    let f = &result.files[index];
+                    widgets::row(ui, 44.0, |ui| {
+                        let mut inc = !excluded.contains(&f.path);
+                        if ui.checkbox(&mut inc, "").changed() {
+                            acts.push(CAct::Toggle(i, f.path.clone(), f.size, inc));
+                        }
+                        let icon_color = if inc { ACCENT } else { TEXT_FAINT };
+                        ui.label(widgets::icon(ic::FILE, 16.0, icon_color));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.add_space(6.0);
+                            if ui
+                                .add(widgets::small(widgets::icon(ic::OPEN, 13.0, TEXT_DIM)))
+                                .on_hover_text("Show in Explorer")
+                                .clicked()
+                            {
+                                acts.push(CAct::Show(f.path.clone()));
+                            }
+                            widgets::cell(ui, 110.0, true, widgets::faint(fmt_age(f.modified)));
+                            widgets::cell(ui, 84.0, true, widgets::strong(fmt_bytes(f.size), 14.0));
+                            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                let name = f
+                                    .path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_default();
+                                let folder = f
+                                    .path
+                                    .parent()
+                                    .map(|p| p.display().to_string())
+                                    .unwrap_or_default();
+                                let full = f.path.display().to_string();
+                                let response = ui
+                                    .vertical(|ui| {
+                                        ui.spacing_mut().item_spacing.y = 1.0;
+                                        let text = if inc {
+                                            RichText::new(&name).color(TEXT)
+                                        } else {
+                                            RichText::new(&name).color(TEXT_FAINT).strikethrough()
+                                        };
+                                        ui.add(Label::new(text).truncate());
+                                        ui.add(Label::new(widgets::faint(folder)).truncate());
+                                    })
+                                    .response
+                                    .interact(egui::Sense::click())
+                                    .on_hover_text(&full);
+                                response.context_menu(|ui| {
+                                    if ui.button("Copy full path").clicked() {
+                                        acts.push(CAct::CopyPath(full.clone()));
+                                        ui.close_menu();
+                                    }
+                                    if ui.button("Show in Explorer").clicked() {
+                                        acts.push(CAct::Show(f.path.clone()));
+                                        ui.close_menu();
+                                    }
+                                });
+                            });
+                        });
+                    });
+                }
+            });
     }
 }
 
