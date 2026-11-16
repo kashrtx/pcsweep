@@ -39,6 +39,7 @@ pub enum TrayEvent {
 #[derive(Default)]
 struct Shared {
     hwnd: AtomicIsize,
+    main_hwnd: AtomicIsize,
     ready: AtomicBool,
     stop: AtomicBool,
 }
@@ -46,10 +47,21 @@ struct Shared {
 struct Notifier {
     events: Sender<TrayEvent>,
     ctx: egui::Context,
+    shared: Arc<Shared>,
 }
 impl Notifier {
     fn send(&self, event: TrayEvent) {
+        let wake_window = matches!(
+            event,
+            TrayEvent::Show | TrayEvent::CheckUpdates | TrayEvent::Quit | TrayEvent::Failed(_)
+        );
         if self.events.send(event).is_ok() {
+            if wake_window {
+                // Hidden/occluded winit windows may not receive RedrawRequested.
+                // Restore natively first; merely requesting an egui repaint can
+                // leave every tray command waiting for a frame that never runs.
+                wake_main(self.shared.main_hwnd.load(Ordering::Acquire));
+            }
             self.ctx.request_repaint();
         }
     }
@@ -69,6 +81,7 @@ impl Tray {
         let notifier = Notifier {
             events,
             ctx: ctx.clone(),
+            shared: shared.clone(),
         };
         let thread_notifier = notifier.clone();
         let thread_shared = Arc::clone(&shared);
@@ -99,6 +112,9 @@ impl Tray {
             finished,
             worker,
         }
+    }
+    pub fn bind_window(&self, hwnd: HWND) {
+        self.shared.main_hwnd.store(hwnd, Ordering::Release);
     }
     pub fn available(&self) -> bool {
         self.shared.ready.load(Ordering::Acquire) && self.shared.hwnd.load(Ordering::Acquire) != 0
@@ -382,6 +398,10 @@ unsafe fn handle_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARA
         return DefWindowProcW(hwnd, message, wparam, lparam);
     }
     let state = &*pointer;
+    if message == crate::instance::activate_message() {
+        state.notifier.send(TrayEvent::Show);
+        return 0;
+    }
     if message == state.taskbar_created && state.publish_icon {
         // Explorer has discarded all old icons. Re-add this instance with the
         // same callback protocol, or signal failure so a hidden app can re-open.
@@ -498,7 +518,7 @@ fn run_window(shared: Arc<Shared>, notifier: &Notifier, publish_icon: bool) -> R
         CreateWindowExW(
             WS_EX_TOOLWINDOW,
             class.name.as_ptr(),
-            wide("PCSweep notification area").as_ptr(),
+            wide(&crate::instance::activation_title()).as_ptr(),
             WS_OVERLAPPED,
             0,
             0,
@@ -531,6 +551,14 @@ fn run_window(shared: Arc<Shared>, notifier: &Notifier, publish_icon: bool) -> R
         }
         shared.hwnd.store(0, Ordering::Release);
         return Err(error);
+    }
+    unsafe {
+        ChangeWindowMessageFilterEx(
+            hwnd,
+            crate::instance::activate_message(),
+            MSGFLT_ALLOW,
+            std::ptr::null_mut(),
+        );
     }
     if !shared.stop.load(Ordering::Acquire) && publish_icon {
         if let Err(e) = state.add(hwnd) {
@@ -615,7 +643,11 @@ mod tests {
         let ctx = egui::Context::default();
         let shared = Arc::new(Shared::default());
         let (events, receiver) = mpsc::channel();
-        let notifier = Notifier { events, ctx };
+        let notifier = Notifier {
+            events,
+            ctx,
+            shared: shared.clone(),
+        };
         let thread_shared = Arc::clone(&shared);
         let (done, finished) = mpsc::channel();
         let worker = std::thread::spawn(move || {
@@ -655,5 +687,98 @@ mod tests {
         worker.join().unwrap();
         assert_eq!(unsafe { IsWindow(hwnd) }, 0);
         assert_eq!(shared.hwnd.load(Ordering::Acquire), 0);
+    }
+}
+
+/// Data-free activation only. A stale/recycled HWND must never target another app.
+fn wake_main(hwnd: HWND) {
+    let mut pid = 0;
+    unsafe {
+        if hwnd != 0 && GetWindowThreadProcessId(hwnd, &mut pid) != 0 && pid == std::process::id() {
+            ShowWindowAsync(
+                hwnd,
+                if IsIconic(hwnd) != 0 {
+                    SW_RESTORE
+                } else {
+                    SW_SHOW
+                },
+            );
+            SetForegroundWindow(hwnd);
+        }
+    }
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use super::*;
+    #[test]
+    fn tray_actions_restore_a_hidden_native_window_before_requesting_a_frame() {
+        // No real tray icon or eframe loop needed: exercise the native wake
+        // against an actual hidden HWND with the same cross-thread boundary.
+        let name = wide(&format!("PCSweep.WakeTest.{}", std::process::id()));
+        let module = unsafe { GetModuleHandleW(std::ptr::null()) };
+        let class = WNDCLASSW {
+            lpfnWndProc: Some(DefWindowProcW),
+            hInstance: module,
+            lpszClassName: name.as_ptr(),
+            ..unsafe { zeroed() }
+        };
+        assert_ne!(unsafe { RegisterClassW(&class) }, 0);
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_TOOLWINDOW,
+                name.as_ptr(),
+                name.as_ptr(),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                200,
+                100,
+                0,
+                0,
+                module,
+                std::ptr::null(),
+            )
+        };
+        assert_ne!(hwnd, 0);
+        let shared = Arc::new(Shared::default());
+        shared.main_hwnd.store(hwnd, Ordering::Release);
+        let (events, rx) = mpsc::channel();
+        let notifier = Notifier {
+            events,
+            ctx: egui::Context::default(),
+            shared,
+        };
+        for event in [TrayEvent::Show, TrayEvent::CheckUpdates, TrayEvent::Quit] {
+            unsafe {
+                ShowWindow(hwnd, SW_HIDE);
+            };
+            assert_eq!(unsafe { IsWindowVisible(hwnd) }, 0);
+            let sender = notifier.clone();
+            let expected = event.clone();
+            std::thread::spawn(move || sender.send(event))
+                .join()
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while unsafe { IsWindowVisible(hwnd) } == 0 {
+                let mut msg: MSG = unsafe { zeroed() };
+                unsafe {
+                    while PeekMessageW(&mut msg, 0, 0, 0, PM_REMOVE) != 0 {
+                        TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "a hidden window must wake without a UI redraw"
+                );
+                std::thread::yield_now();
+            }
+            assert_eq!(rx.try_recv().unwrap(), expected);
+        }
+        unsafe {
+            DestroyWindow(hwnd);
+            UnregisterClassW(name.as_ptr(), module);
+        }
     }
 }

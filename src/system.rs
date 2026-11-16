@@ -693,8 +693,9 @@ pub fn relaunch_as_admin() -> bool {
         return false;
     };
     let script = format!(
-        "Start-Process -FilePath '{}' -Verb RunAs",
-        exe.display().to_string().replace('\'', "''")
+        "Start-Process -FilePath '{}' -ArgumentList '--wait-for-parent {}' -Verb RunAs",
+        exe.display().to_string().replace('\'', "''"),
+        std::process::id()
     );
     util::hidden_command("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])

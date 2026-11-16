@@ -1,3 +1,18 @@
+# PCSweep 1.7.0
+
+This update fixes large saved-map stalls and tray activation, adds single-instance handling and readable text controls, and introduces reviewed post-uninstall cleanup.
+
+- **Responsive storage maps:** buffered snapshot I/O replaces byte/token native reads and writes. A finished scan appears before saving completes. Restores have a 30-second fallback and a Skip restore control. Scan work continues when you switch pages.
+- **Useful saved-map selection:** selected files can be checked on disk without remapping a drive, then reviewed and checked again before moving to the Recycle Bin. Changed files and unsupported drives are preserved.
+- **Working tray activation:** Show, Check for updates and Quit wake a hidden native window before requesting a UI frame. Opening another copy activates the existing session. Elevation has an explicit parent-process handoff.
+- **Readability:** persistent 100%, 110%, 125% and 150% interface sizes, plus bolder text. Enlarged layouts retain reachable controls with horizontal scrolling where needed. App options can scroll on small displays.
+- **Administrator startup choice:** an optional remembered setting asks for normal Windows UAC approval at startup; canceling continues normally. Administrator restart remains available when needed.
+- **Better installed-app inventory:** drive letters and location details are visible/searchable. Missing locations can use icon/uninstaller evidence for display; shared Windows installer paths are excluded.
+- **Post-uninstall review:** tracks the registered uninstaller and remembers its product identity between sessions. Exact leftover folders and registry keys show confidence and matching evidence, with no automatic selection. Shared/protected locations and installed-product collisions are excluded and checked again before removal.
+- **Recovery:** reviewed folders go to the Recycle Bin with cleanup history. Registry cleanup keeps raw typed-value backups for the latest 16 generations and has a confirmed restore action that preserves later differing values.
+
+The leftover scanner is intentionally bounded and exact-match based; it does not claim BCU's full scanner coverage or prove that portable/unregistered apps never share a folder. See [the research and implementation notes](UNINSTALLER_RESEARCH.md).
+
 # PCSweep 1.6.0
 
 This release adds direct controls, fixes DNS eligibility, shows native app icons, and keeps expensive disk scans available between sessions.

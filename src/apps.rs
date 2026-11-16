@@ -30,10 +30,28 @@ pub struct InstalledApp {
     pub uninstall: String,
     pub scope: &'static str,
     pub location: String,
+    pub location_reported: bool,
     pub kind: AppKind,
     pub running: Option<bool>,
     pub startup: Option<bool>,
     pub icon: IconSource,
+}
+
+impl InstalledApp {
+    pub fn drive_label(&self) -> String {
+        use std::path::{Component, Path, Prefix};
+        let path = util::expand_env(self.location.trim().trim_matches('"'));
+        match Path::new(&path).components().next() {
+            Some(Component::Prefix(p)) => match p.kind() {
+                Prefix::Disk(d) | Prefix::VerbatimDisk(d) => {
+                    format!("{}:", (d as char).to_ascii_uppercase())
+                }
+                Prefix::UNC(_, _) | Prefix::VerbatimUNC(_, _) => "Network".into(),
+                _ => "Drive unknown".into(),
+            },
+            _ => "Drive unknown".into(),
+        }
+    }
 }
 
 pub fn list() -> Vec<InstalledApp> {
@@ -104,13 +122,18 @@ pub fn list() -> Vec<InstalledApp> {
             )) {
                 continue;
             }
-            let location: String = k
+            let mut location: String = k
                 .get_value::<String, _>("InstallLocation")
                 .unwrap_or_default()
                 .trim()
                 .to_string();
+            let location_reported = !location.is_empty();
+            let display = k.get_value::<String, _>("DisplayIcon").unwrap_or_default();
+            if location.is_empty() {
+                location = inferred_location(&display, &uninstall);
+            }
             let icon = IconSource::desktop(
-                k.get_value::<String, _>("DisplayIcon").unwrap_or_default(),
+                display,
                 uninstall_command(&uninstall)
                     .map(|(exe, _)| exe)
                     .unwrap_or_default(),
@@ -126,6 +149,7 @@ pub fn list() -> Vec<InstalledApp> {
                 uninstall,
                 scope,
                 location,
+                location_reported,
                 kind: AppKind::Desktop,
                 running: None,
                 startup: None,
@@ -134,6 +158,27 @@ pub fn list() -> Vec<InstalledApp> {
         }
     }
     out
+}
+
+/// Fallback only for display and inventory. Never infer a cleanup folder from
+/// a shared Windows installer executable.
+fn inferred_location(display: &str, uninstall: &str) -> String {
+    let from_icon = crate::app_icons::parse_display_icon(display).map(|(p, _)| p);
+    let from_uninstall = uninstall_command(uninstall)
+        .ok()
+        .map(|(p, _)| std::path::PathBuf::from(p));
+    from_icon
+        .or(from_uninstall)
+        .filter(|p| p.is_absolute())
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .filter(|p| {
+            !util::is_within(
+                &util::norm(p),
+                &util::norm(&util::env("WINDIR").unwrap_or_else(|| r"C:\Windows".into())),
+            )
+        })
+        .map(|p| p.display().to_string())
+        .unwrap_or_default()
 }
 
 /// Split the executable from the Windows argument tail without interpreting shell
@@ -185,16 +230,6 @@ fn uninstall_command(command: &str) -> std::io::Result<(String, String)> {
         args.replace_range(..2, "/X");
     }
     Ok((program.to_string(), args))
-}
-
-/// Runs the app's own uninstaller, which shows its own confirmation.
-pub fn launch_uninstaller(cmd: &str) -> std::io::Result<()> {
-    let (program, args) = uninstall_command(cmd)?;
-    Command::new(program)
-        .raw_arg(args)
-        .creation_flags(util::CREATE_NO_WINDOW)
-        .spawn()
-        .map(|_| ())
 }
 
 #[cfg(test)]
@@ -256,11 +291,11 @@ pub enum AppFilter {
 }
 
 pub struct AppInventory {
-    list: Vec<InstalledApp>,
+    pub(crate) list: Vec<InstalledApp>,
     store_error: Option<String>,
 }
 
-fn inventory() -> AppInventory {
+pub(crate) fn inventory() -> AppInventory {
     let mut list = list();
     let store_error = match app_packages::store_packages() {
         Ok(packages) => {
@@ -273,6 +308,7 @@ fn inventory() -> AppInventory {
                 uninstall: String::new(),
                 scope: "Your account",
                 location: p.location.clone(),
+                location_reported: true,
                 icon: IconSource::Store {
                     family: p.family.clone(),
                     location: p.location.clone(),
@@ -333,6 +369,7 @@ pub struct AppsState {
     action_text: String,
     refresh_updates: bool,
     icons: RefCell<IconCache>,
+    pub leftovers: crate::leftovers::State,
 }
 
 impl Default for AppsState {
@@ -356,12 +393,13 @@ impl Default for AppsState {
             action_text: String::new(),
             refresh_updates: false,
             icons: RefCell::new(IconCache::default()),
+            leftovers: Default::default(),
         }
     }
 }
 impl AppsState {
     pub fn busy(&self) -> bool {
-        self.action.running()
+        self.action.running() || self.leftovers.busy()
     }
 }
 
@@ -489,23 +527,37 @@ impl App {
         self.apps.action = Task::spawn(ctx, move || app_packages::run(action));
     }
 
-    pub fn launch_uninstall(&mut self, app: &InstalledApp) {
-        match launch_uninstaller(&app.uninstall) {
-            Ok(()) => {
-                util::log(format!("Started the uninstaller for {}", app.name));
-                self.toast(
-                    ToastKind::Info,
-                    format!(
-                        "{}'s uninstaller is starting. Refresh the list when it's done.",
-                        app.name
-                    ),
-                );
-            }
-            Err(e) => self.toast(
-                ToastKind::Error,
-                format!("Couldn't start the uninstaller: {e}"),
-            ),
+    pub fn launch_uninstall(&mut self, app: &InstalledApp, ctx: &egui::Context) {
+        if self.mutations_running() {
+            self.toast(ToastKind::Info, "Wait for the current operation to finish.");
+            return;
         }
+        let target = crate::leftovers::Target::from(app);
+        self.apps.leftovers.target = Some(target.clone());
+        self.apps.leftovers.review = None;
+        self.apps.leftovers.error = None;
+        self.apps.leftovers.message = Some(
+            "Running the app's registered uninstaller. Review its own removal choices first."
+                .into(),
+        );
+        let command = app.uninstall.clone();
+        self.apps.leftovers.launch = Task::spawn(ctx, move || {
+            crate::scan_cache::save("last-uninstall.json", crate::scan_cache::now(), &target)?;
+            let (program, args) = uninstall_command(&command).map_err(|e| e.to_string())?;
+            let status = Command::new(program)
+                .raw_arg(args)
+                .creation_flags(util::CREATE_NO_WINDOW)
+                .status()
+                .map_err(|e| e.to_string())?;
+            if status.success() || matches!(status.code(), Some(1641 | 3010)) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Uninstaller returned {}. Finish or retry removal before checking leftovers.",
+                    status.code().unwrap_or(-1)
+                ))
+            }
+        });
     }
 
     fn ask_store_remove(&mut self, packages: Vec<StorePackage>) {
@@ -524,6 +576,12 @@ impl App {
     pub fn page_apps(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
         let mut acts = Vec::new();
+        widgets::page_header(
+            ui,
+            "Installed apps",
+            "Review what is installed, remove optional apps, and update the apps you choose.",
+        );
+        self.leftovers_ui(ui);
         self.render_apps(ui, &mut acts);
         self.apps.icons.borrow_mut().start_pending(&ctx);
         for a in acts {
@@ -620,11 +678,7 @@ impl App {
 
     fn render_apps(&self, ui: &mut Ui, acts: &mut Vec<PAct>) {
         let s = &self.apps;
-        widgets::page_header(
-            ui,
-            "Installed apps",
-            "Review what is installed, remove optional apps, and update the apps you choose.",
-        );
+
         let total: u64 = s.list.iter().map(|a| a.size).sum();
         ui.horizontal_wrapped(|ui| {
             ui.label(
@@ -638,7 +692,8 @@ impl App {
             )));
             ui.add_space(12.0);
             let mut f = s.filter.clone();
-            if widgets::search_box(ui, &mut f, "Search apps or publishers", 220.0).changed() {
+            if widgets::search_box(ui, &mut f, "Search apps, publishers or drive", 220.0).changed()
+            {
                 acts.push(PAct::Filter(f));
             }
             if ui
@@ -745,7 +800,9 @@ impl App {
                 };
                 view && (filter.is_empty()
                     || a.name.to_lowercase().contains(&filter)
-                    || a.publisher.to_lowercase().contains(&filter))
+                    || a.publisher.to_lowercase().contains(&filter)
+                    || a.location.to_lowercase().contains(&filter)
+                    || a.drive_label().to_lowercase().contains(&filter))
             })
             .collect();
         match s.sort {
@@ -779,7 +836,7 @@ impl App {
                     ui.with_layout(Layout::left_to_right(Align::Center),|ui|{ui.vertical(|ui|{
                         ui.spacing_mut().item_spacing.y=1.0;
                         ui.add(Label::new(widgets::strong(&a.name,14.5)).truncate()).on_hover_text(format!("{}\n{}\n{}",a.name,a.publisher,a.location));
-                        let mut meta=vec![match a.kind{AppKind::Desktop=>"Desktop".to_string(),AppKind::Store(_)=>"Store / MSIX".to_string()}];
+                        let mut meta=vec![a.drive_label(),match a.kind{AppKind::Desktop=>"Desktop".to_string(),AppKind::Store(_)=>"Store / MSIX".to_string()}];
                         if !a.version.is_empty(){meta.push(a.version.clone());}if !a.publisher.is_empty(){meta.push(a.publisher.clone());}meta.push(a.scope.to_string());
                         if a.running==Some(true){meta.push("Running".into());}if a.startup==Some(true){meta.push("Starts with Windows".into());}
                         if let Some(date)=a.installed{meta.push(format!("installed {}",date.format("%b %d, %Y")));}
@@ -895,6 +952,7 @@ pub(crate) fn preview_fixture() -> AppsState {
             uninstall: "fixture-uninstaller.exe".into(),
             scope: "Your account",
             location: r"C:\Users\Preview\AppData\Local\Programs\Microsoft VS Code".into(),
+            location_reported: true,
             kind: AppKind::Desktop,
             running: Some(true),
             startup: Some(false),
@@ -909,6 +967,7 @@ pub(crate) fn preview_fixture() -> AppsState {
             uninstall: "fixture-uninstaller.exe".into(),
             scope: "All users",
             location: r"C:\Program Files\Mozilla Firefox".into(),
+            location_reported: true,
             kind: AppKind::Desktop,
             running: Some(false),
             startup: Some(false),
@@ -957,6 +1016,7 @@ pub(crate) fn preview_fixture() -> AppsState {
             uninstall: String::new(),
             scope: "Your account",
             location: p.location.clone(),
+            location_reported: true,
             icon: IconSource::Generic,
             kind: AppKind::Store(p),
             running: None,
@@ -981,4 +1041,26 @@ pub(crate) fn preview_fixture() -> AppsState {
         },
     ];
     s
+}
+
+#[cfg(test)]
+mod drive_tests {
+    use super::*;
+    #[test]
+    fn inventory_exposes_drive_letters_and_honest_unknown_locations() {
+        let mut a = preview_fixture().list.remove(0);
+        a.location = r"D:\Games\Example".into();
+        assert_eq!(a.drive_label(), "D:");
+        a.location = r"\\?\E:\Apps\Example".into();
+        assert_eq!(a.drive_label(), "E:");
+        a.location = r"\\server\apps\Example".into();
+        assert_eq!(a.drive_label(), "Network");
+        a.location.clear();
+        assert_eq!(a.drive_label(), "Drive unknown");
+        assert!(inferred_location("", r"C:\Windows\System32\msiexec.exe /x {ABC}").is_empty());
+        assert_eq!(
+            inferred_location(r#""D:\Apps\Example\app.exe",0"#, ""),
+            r"D:\Apps\Example"
+        );
+    }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "pcsweep"
-version = "1.6.0"
+version = "1.7.0"
 edition = "2021"
 description = "Fast, safe disk cleanup and PC health tool for Windows 11"
 repository = "https://github.com/kashrtx/pcsweep"
@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 # GUI: keep the 0.29 API; Cargo.lock pins the complete application build.
 eframe = "0.29"
+raw-window-handle = "0.6"
 # System info: memory, CPU, processes, drives
 sysinfo = "~0.30"
 # Windows registry (startup apps, installed apps, known folders)

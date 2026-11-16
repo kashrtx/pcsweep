@@ -110,7 +110,7 @@ fn on_local_drive(path: &Path) -> bool {
 
 /// DisplayIcon supports a quoted filename containing commas, followed by a
 /// signed resource/index value. A negative value names a resource ID.
-fn parse_display_icon(text: &str) -> Option<(PathBuf, i32)> {
+pub(crate) fn parse_display_icon(text: &str) -> Option<(PathBuf, i32)> {
     if text.contains(['\0', '\r', '\n']) {
         return None;
     }

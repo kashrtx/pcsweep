@@ -6,6 +6,7 @@ mod analyzer;
 mod app;
 mod app_icons;
 mod app_packages;
+mod appearance;
 mod apps;
 mod background;
 mod cleaner;
@@ -13,7 +14,9 @@ mod dashboard;
 mod dns;
 mod duplicates;
 mod file_changes;
+mod instance;
 mod journal;
+mod leftovers;
 mod network;
 mod platform;
 mod power;
@@ -46,6 +49,18 @@ fn main() -> Result<(), eframe::Error> {
     }
     if let Some(code) = updates::run_helper_mode() {
         std::process::exit(code);
+    }
+    instance::wait_for_parent();
+    let _instance = match instance::acquire() {
+        Ok(Some(guard)) => guard,
+        Ok(None) => return Ok(()),
+        Err(error) => {
+            instance::show_error(&error);
+            return Ok(());
+        }
+    };
+    if instance::elevate_on_start() {
+        return Ok(());
     }
     // Deep folder trees are scanned recursively in parallel; give worker threads
     // plenty of stack so nothing can overflow on unusual directory layouts.

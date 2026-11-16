@@ -52,7 +52,10 @@ fn fitted_zoom(native_points: egui::Vec2) -> f32 {
 /// minimum. Fit the whole layout to that work area without shrinking normal
 /// windows. Multiplying out the current zoom prevents resize feedback loops.
 pub fn fit_to_viewport(ctx: &egui::Context) {
-    let zoom = fitted_zoom(ctx.screen_rect().size() * ctx.zoom_factor());
+    let scale = ctx
+        .data(|d| d.get_temp::<f32>(egui::Id::new("pcsweep.text_scale")))
+        .unwrap_or(1.0);
+    let zoom = fitted_zoom(ctx.screen_rect().size() * ctx.zoom_factor()) * scale;
     if (ctx.zoom_factor() - zoom).abs() > 0.005 {
         ctx.set_zoom_factor(zoom);
     }
@@ -114,14 +117,24 @@ pub fn setup_fonts(ctx: &egui::Context) {
         semi.insert(0, "segoe_sb".to_owned());
     }
 
-    let mut light = body.clone();
-    if let Some(bytes) = load("segoeuil.ttf") {
-        fonts
-            .font_data
-            .insert("segoe_light".to_owned(), FontData::from_owned(bytes));
-        light.insert(0, "segoe_light".to_owned());
+    if ctx
+        .data(|d| d.get_temp::<bool>(egui::Id::new("pcsweep.bold")))
+        .unwrap_or(false)
+    {
+        body = semi.clone();
     }
-
+    let mut light = body.clone();
+    if !ctx
+        .data(|d| d.get_temp::<bool>(egui::Id::new("pcsweep.bold")))
+        .unwrap_or(false)
+    {
+        if let Some(bytes) = load("segoeuil.ttf") {
+            fonts
+                .font_data
+                .insert("segoe_light".to_owned(), FontData::from_owned(bytes));
+            light.insert(0, "segoe_light".to_owned());
+        }
+    }
     let mut icons = body.clone();
     for file in ["SegoeIcons.ttf", "segmdl2.ttf"] {
         if let Some(bytes) = load(file) {

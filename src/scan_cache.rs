@@ -5,7 +5,7 @@ use crate::util;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{BufReader, BufWriter, Read, Write},
     os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -138,8 +138,8 @@ fn load_in<T: DeserializeOwned>(dir: &Path, name: &str) -> Result<Option<Stored<
         Err(e) => return Err(e.to_string()),
     };
     regular(&file)?;
-    let value: Envelope<T> = serde_json::from_reader(file.take(MAX_BYTES + 1))
-        .map_err(|e| format!("Saved scan could not be read: {e}"))?;
+    let value: Envelope<T> =
+        read_snapshot(file).map_err(|e| format!("Saved scan could not be read: {e}"))?;
     if value.schema != SCHEMA
         || value.saved == 0
         || value.saved > now().saturating_add(5 * 60 * 1000)
@@ -151,11 +151,33 @@ fn load_in<T: DeserializeOwned>(dir: &Path, name: &str) -> Result<Option<Stored<
         data: value.data,
     }))
 }
-struct Limited<'a> {
-    file: &'a mut File,
+fn read_snapshot<R: Read, T: DeserializeOwned>(reader: R) -> serde_json::Result<Envelope<T>> {
+    serde_json::from_reader(BufReader::with_capacity(
+        256 * 1024,
+        reader.take(MAX_BYTES + 1),
+    ))
+}
+fn write_snapshot<W: Write, T: Serialize>(writer: W, saved: u64, data: &T) -> Result<(), String> {
+    let mut output = Limited {
+        file: BufWriter::with_capacity(256 * 1024, writer),
+        bytes: 0,
+    };
+    serde_json::to_writer(
+        &mut output,
+        &Envelope {
+            schema: SCHEMA,
+            saved,
+            data,
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    output.flush().map_err(|e| e.to_string())
+}
+struct Limited<W> {
+    file: W,
     bytes: u64,
 }
-impl Write for Limited<'_> {
+impl<W: Write> Write for Limited<W> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         if self.bytes.saturating_add(bytes.len() as u64) > MAX_BYTES {
             return Err(std::io::Error::other("Scan is too large to save locally."));
@@ -199,9 +221,12 @@ fn save_in<T: Serialize>(dir: &Path, name: &str, saved: u64, data: &T) -> Result
     {
         Ok(f) => {
             regular(&f)?;
-            if serde_json::from_reader::<_, Header>(f.take(MAX_BYTES + 1))
-                .ok()
-                .is_some_and(|h| h.schema == SCHEMA && h.saved > saved)
+            if serde_json::from_reader::<_, Header>(BufReader::with_capacity(
+                256 * 1024,
+                f.take(MAX_BYTES + 1),
+            ))
+            .ok()
+            .is_some_and(|h| h.schema == SCHEMA && h.saved > saved)
             {
                 return Ok(());
             }
@@ -222,18 +247,7 @@ fn save_in<T: Serialize>(dir: &Path, name: &str, saved: u64, data: &T) -> Result
             .custom_flags(0x0020_0000)
             .open(&temp)
             .map_err(|e| e.to_string())?;
-        serde_json::to_writer(
-            Limited {
-                file: &mut f,
-                bytes: 0,
-            },
-            &Envelope {
-                schema: SCHEMA,
-                saved,
-                data,
-            },
-        )
-        .map_err(|e| e.to_string())?;
+        write_snapshot(&mut f, saved, data)?;
         f.flush()
             .and_then(|_| f.sync_all())
             .map_err(|e| e.to_string())?;
@@ -398,5 +412,76 @@ mod tests {
             .unwrap();
         assert!(load_in::<u32>(&dir, "test.json").is_err());
         fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod large_snapshot_tests {
+    use super::*;
+    #[derive(Default)]
+    struct Counter {
+        bytes: Vec<u8>,
+        writes: usize,
+        reads: usize,
+        at: usize,
+    }
+    impl Write for Counter {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.writes += 1;
+            self.bytes.extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl Read for Counter {
+        fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+            self.reads += 1;
+            let n = b.len().min(self.bytes.len() - self.at);
+            b[..n].copy_from_slice(&self.bytes[self.at..self.at + n]);
+            self.at += n;
+            Ok(n)
+        }
+    }
+    #[test]
+    fn large_json_uses_chunked_io_in_both_directions() {
+        let data:Vec<_>=(0..100_000).map(|i|format!("C:\\Users\\Example\\AppData\\Local\\Programs\\Product\\content\\item-{i:08}-{}", "x".repeat(80))).collect();
+        let mut io = Counter::default();
+        write_snapshot(&mut io, 123, &data).unwrap();
+        assert!(io.bytes.len() > 10_000_000);
+        let expected = io.bytes.len().div_ceil(256 * 1024);
+        assert!(
+            io.writes <= expected + 1,
+            "JSON tokens must not become individual native writes: {}",
+            io.writes
+        );
+        let restored: Envelope<Vec<String>> = read_snapshot(&mut io).unwrap();
+        assert_eq!(restored.data, data);
+        assert!(
+            io.reads <= expected + 2,
+            "JSON bytes must not become individual native reads: {}",
+            io.reads
+        );
+    }
+    #[test]
+    fn flush_failures_and_size_limit_are_reported() {
+        struct Fails;
+        impl Write for Fails {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("disk full"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        assert!(write_snapshot(Fails, 1, &vec![1, 2, 3])
+            .unwrap_err()
+            .contains("disk full"));
+        let mut writer = Limited {
+            file: Vec::new(),
+            bytes: MAX_BYTES - 1,
+        };
+        assert!(writer.write_all(b"too much").is_err());
     }
 }

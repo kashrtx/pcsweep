@@ -310,6 +310,15 @@ pub fn junk_delete_allowed(p: &Path) -> bool {
     !within_any(&n, &f.downloads) && !within_any(&n, &f.libraries)
 }
 
+pub(crate) fn personal_overlap(path: &Path) -> bool {
+    let n = norm(path);
+    let f = folders();
+    f.downloads
+        .iter()
+        .chain(f.libraries.iter())
+        .any(|p| is_within(&n, p) || is_within(p, &n))
+}
+
 /// Why a user-selected file/folder must not be moved to the Recycle Bin (fast, no disk access).
 pub fn block_reason_fast(p: &Path) -> Option<&'static str> {
     let n = norm(p);
@@ -447,6 +456,71 @@ pub fn remove_empty_dir(path: &Path) -> Result<(), String> {
         return Err("Links and non-folders are protected".into());
     }
     fs::remove_dir(resolved).map_err(|e| format!("Folder was kept: {e}"))
+}
+
+pub(crate) fn fixed_local(path: &Path) -> bool {
+    use std::path::{Component, Prefix};
+    let drive = match path.components().next() {
+        Some(Component::Prefix(p)) => match p.kind() {
+            Prefix::Disk(d) | Prefix::VerbatimDisk(d) => Some(d),
+            _ => None,
+        },
+        _ => None,
+    };
+    drive.is_some_and(|d| {
+        let root: Vec<_> = format!("{}:\\", d as char)
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        unsafe { windows_sys::Win32::Storage::FileSystem::GetDriveTypeW(root.as_ptr()) == 3 }
+    })
+}
+#[derive(Clone)]
+pub struct CheckedPath {
+    pub path: PathBuf,
+    pub size: u64,
+    modified: Option<SystemTime>,
+    created: Option<SystemTime>,
+    tree: Option<u64>,
+}
+pub fn check_selected(items: Vec<(PathBuf, u64)>) -> Result<Vec<CheckedPath>, String> {
+    if items.len() > 10_000 {
+        return Err("Select fewer than 10,000 items per review.".into());
+    }
+    items.into_iter().map(|(path,_)| {
+        if !fixed_local(&path) {
+            return Err("This drive does not provide a fixed local Recycle Bin. Use Explorer to choose how to remove these files.".into());
+        }
+        if let Some(reason)=block_reason(&path){return Err(format!("{}: {reason}",path.display()));}
+        let md=fs::symlink_metadata(&path).map_err(|e|format!("{}: {e}",path.display()))?;
+        let (tree,size)=if md.is_dir(){let(sig,bytes,_)=crate::leftovers::snapshot_folder(&path)?;(Some(sig),bytes)}else if md.is_file(){(None,md.len())}else{return Err("Only ordinary files and folders can be selected".into());};
+        Ok(CheckedPath{path,size,modified:md.modified().ok(),created:md.created().ok(),tree})
+    }).collect()
+}
+pub fn recycle_checked(items: Vec<CheckedPath>) -> RecycleReport {
+    let mut good = Vec::new();
+    let mut failed = Vec::new();
+    for item in items {
+        let current = check_selected(vec![(item.path.clone(), item.size)]);
+        match current {
+            Ok(now)
+                if now[0].size == item.size
+                    && now[0].modified == item.modified
+                    && now[0].created == item.created
+                    && now[0].tree == item.tree =>
+            {
+                good.push((item.path, item.size))
+            }
+            _ => failed.push((
+                item.path,
+                "Changed since review or no longer eligible; preserved. Check the selection again."
+                    .into(),
+            )),
+        }
+    }
+    let mut report = recycle(good, "Space analyzer — verified selection");
+    report.failed.extend(failed);
+    report
 }
 
 pub struct RecycleReport {
@@ -828,5 +902,26 @@ mod tests {
         )
         .is_err());
         assert!(p.exists());
+    }
+}
+
+#[cfg(test)]
+mod selected_review_tests {
+    use super::*;
+    #[test]
+    fn changed_files_are_preserved_after_selection_review() {
+        let dir =
+            std::env::temp_dir().join(format!("pcsweep-recycle-review-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("keep.tmp");
+        fs::write(&path, b"before").unwrap();
+        let reviewed = check_selected(vec![(path.clone(), 1)]).unwrap();
+        assert_eq!(reviewed[0].size, 6);
+        fs::write(&path, b"changed since confirmation").unwrap();
+        let report = recycle_checked(reviewed);
+        assert!(report.done.is_empty());
+        assert_eq!(report.failed.len(), 1);
+        assert!(path.exists());
+        fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -76,7 +76,7 @@ jobs:
           New-Item -ItemType Directory -Force dist, pkg | Out-Null
           Copy-Item target/release/PCSweep.exe dist/PCSweep.exe
           Copy-Item LICENSE, NOTICE dist/
-          Copy-Item target/release/PCSweep.exe, README.md, LICENSE, NOTICE, PRIVACY.md, RELEASE_NOTES.md pkg/
+          Copy-Item target/release/PCSweep.exe, README.md, LICENSE, NOTICE, PRIVACY.md, RELEASE_NOTES.md, UNINSTALLER_RESEARCH.md pkg/
           Compress-Archive -Path pkg/* -DestinationPath "dist/PCSweep-$env:APP_VERSION-windows-x64.zip" -Force
           Get-ChildItem dist -File | Sort-Object Name | ForEach-Object {
             $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()

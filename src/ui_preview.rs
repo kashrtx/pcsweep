@@ -1248,7 +1248,7 @@ fn shipment_frame(
                         .inner_margin(Margin::symmetric(30.0, 22.0)),
                 )
                 .show(ctx, |ui| {
-                    ui.add_enabled_ui(enabled, |ui| app.render_page(ui));
+                    ui.add_enabled_ui(enabled, |ui| app.render_readable_page(ui));
                 });
             app.app_options_ui(ctx);
             app.modal_ui(ctx);
@@ -1993,4 +1993,105 @@ fn preexisting_update_service_block_can_be_enabled_with_explicit_review() {
     let cancel = text_rect(last.as_ref().unwrap(), "Cancel");
     let _ = shipment_frame(&ctx, &mut app, size, click_at(cancel.center()));
     assert!(app.modal.is_none() && !app.mutations_running());
+}
+
+#[test]
+fn enlarged_bold_interface_keeps_all_pages_reachable() {
+    let pages = [
+        Page::Dashboard,
+        Page::Cleaner,
+        Page::Analyzer,
+        Page::Duplicates,
+        Page::Apps,
+        Page::Startup,
+        Page::Memory,
+        Page::Privacy,
+        Page::Security,
+        Page::Background,
+        Page::Ads,
+        Page::Network,
+        Page::Power,
+        Page::Updates,
+        Page::Tools,
+        Page::Activity,
+        Page::Storage,
+        Page::WindowsControls,
+        Page::Speed,
+        Page::FileChanges,
+    ];
+    for scale in [125, 150] {
+        for page in pages {
+            let ctx = egui::Context::default();
+            let mut app = App::test_fixture();
+            app.page = page;
+            populate_page_fixture(&mut app, page);
+            app.appearance.scale = scale;
+            app.appearance.bold = true;
+            app.appearance.apply(&ctx);
+            theme::setup_fonts(&ctx);
+            theme::apply(&ctx);
+            let mut painter = CpuPainter::default();
+            let mut last = None;
+            for _ in 0..8 {
+                let output = shipment_frame(&ctx, &mut app, [900, 520], Vec::new());
+                upload_preview_textures(&mut painter, &output);
+                last = Some(output);
+            }
+            let output = last.unwrap();
+            assert!(
+                ctx.zoom_factor() > 0.9,
+                "chosen text enlargement must survive compact fitting"
+            );
+            save_shipment_preview(
+                &ctx,
+                &painter,
+                &output,
+                [900, 520],
+                &format!("readable-{scale}-{page:?}.png"),
+            );
+        }
+    }
+}
+
+#[test]
+fn uninstaller_confidence_review_is_visible_and_starts_unselected() {
+    let ctx = egui::Context::default();
+    theme::setup_fonts(&ctx);
+    theme::apply(&ctx);
+    let mut app = App::test_fixture();
+    app.page = Page::Apps;
+    app.apps.leftovers.target = Some(crate::leftovers::Target::from(&app.apps.list[0]));
+    app.apps.leftovers.review = Some(crate::leftovers::Review {
+        candidates: vec![crate::leftovers::Candidate {
+            item: crate::leftovers::Item::Folder {
+                path: r"C:\Users\Preview\AppData\Roaming\Example Product".into(),
+                signature: 0,
+                bytes: 12345,
+            },
+            confidence: crate::leftovers::Confidence::Review,
+            evidence: vec![
+                "Exact product-name folder in app data".into(),
+                "May contain preferences and saves".into(),
+            ],
+        }],
+        notes: Vec::new(),
+    });
+    let mut painter = CpuPainter::default();
+    let mut last = None;
+    for _ in 0..8 {
+        let output = shipment_frame(&ctx, &mut app, [1040, 680], Vec::new());
+        upload_preview_textures(&mut painter, &output);
+        last = Some(output);
+    }
+    let output = last.unwrap();
+    assert!(app.apps.leftovers.selected.is_empty());
+    assert!(!visible_texts(&output, "Check leftovers").is_empty());
+    assert!(!visible_texts(&output, "Needs review").is_empty());
+    save_shipment_preview(
+        &ctx,
+        &painter,
+        &output,
+        [1040, 680],
+        "uninstaller-leftovers-review.png",
+    );
 }

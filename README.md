@@ -35,7 +35,7 @@ The first release of a Cargo version uses its usual tag, such as `v1.1.0`. Furth
 - **Junk cleaner:** about 25 categories covering user and Windows temp, Store app temp, thumbnail cache, crash dumps and error reports, Delivery Optimization, Windows Update downloads, old logs, shader caches, driver installer leftovers, browser caches (Chrome, Edge, Firefox, Brave, Opera, Vivaldi), Discord, Teams, Slack, VS Code, Steam (including shader caches in every library), other Chromium/Electron app caches, and developer package caches. **Review files** opens a full-page list for any category: search by name or folder, sort by size, date or folder, untick anything to keep, and use bulk Keep/Include actions that clearly say whether they apply to all files or only the filtered ones. Your selections are remembered, and a file that matches two categories is only counted once.
 - **Space analyzer:** a parallel scan drawn as a clickable map you can drill into. Tabs for the largest files, old and unused files (filter by age and size), and a breakdown by file type.
 - **Duplicates:** byte-for-byte duplicate detection. One copy of each file is always kept.
-- **Installed apps:** sorted by size or install date, with each app's own uninstaller.
+- **Installed apps:** native icons, visible/searchable install drive and location, and tracked native uninstallers. Reviewed exact-match leftover folders and registry keys show confidence and evidence; files use the Recycle Bin and registry cleanup has typed-value backups. [Design research](UNINSTALLER_RESEARCH.md).
 - **Startup apps:** on/off switches that work exactly like Task Manager's.
 - **Memory and apps:** a compact summary of available RAM, committed memory and CPU (with more detail on demand), private-memory growth and grouped app usage in a list that uses the whole window. Tick several apps and use **Close selected** to ask them all to close normally; PCSweep then checks which apps actually exited and reports closed, still-open and unreachable apps separately, never force-closing. Private memory is read directly from Windows and shown as unavailable when Windows won't report it. You can also ask one app to close gracefully, use reversible efficiency mode for eligible background processes, or explicitly trim an app's working set under Advanced. Core/critical processes, reused PIDs and foreground processes are guarded. Trimming is temporary and may make an app reload pages; it does not fix a leak.
 - **Tools:** restore point, component store cleanup (WinSxS), turn hibernation off/on, System File Checker, DISM repair, drive error check, TRIM/optimize, power plans and DNS flush, with live output.
@@ -111,3 +111,9 @@ Copyright 2026 Kaushal Bhingaradia.
 Licensed under the [Apache License, Version 2.0](LICENSE). See `LICENSE` and `NOTICE`. Contributions are accepted under the same license.
 
 The workflow only publishes after all tests, build and packaging checks pass. A failed run leaves existing releases available.
+
+## New in 1.7.0
+
+Large scan snapshots use buffered I/O, completed maps display before saving, and slow restore can be skipped. Saved-map selections can validate current files without remapping the drive. Tray actions wake hidden windows natively; another launch activates the existing user/session instance. App options add persistent larger/bolder text and optional administrator startup with the normal UAC prompt.
+
+Post-uninstall review checks exact product leftovers against remaining installed apps. It never selects candidates automatically. Folders go to the Recycle Bin; the latest 16 registry cleanup backups retain raw value types for restoration. See [release notes](RELEASE_NOTES.md) and [research](UNINSTALLER_RESEARCH.md) for coverage and limits.

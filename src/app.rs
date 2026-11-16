@@ -104,6 +104,9 @@ pub enum Action {
     },
     RunTool(usize),
     Uninstall(crate::apps::InstalledApp),
+    RemoveLeftovers(crate::leftovers::Target, Vec<crate::leftovers::Candidate>),
+    RestoreLeftoverRegistry,
+    RecycleChecked(Vec<util::CheckedPath>),
     Privacy(crate::privacy::PrivacyAction),
     Preferences(crate::preferences::PreferencesAction),
     Security(crate::security::SecurityAction),
@@ -169,6 +172,7 @@ pub struct App {
     app_options_open: bool,
     tray_error: Option<String>,
     pub(crate) force_exit: bool,
+    pub(crate) appearance: crate::appearance::Appearance,
 }
 
 /// How long a new confirmation ignores its confirm button.
@@ -226,7 +230,9 @@ impl App {
         let mut open = self.app_options_open;
         let mut keep = self.keep_background;
         let mut automatic = self.updates.automatic_checks();
-        egui::Window::new("PCSweep options").open(&mut open).collapsible(false).resizable(false).default_width(480.0).show(ctx, |ui| {
+        let previous_appearance = self.appearance.clone();
+        let mut elevated = crate::appearance::start_elevated();
+        egui::Window::new("PCSweep options").open(&mut open).collapsible(false).resizable(false).default_width(480.0).vscroll(true).show(ctx, |ui| {
             ui.add(egui::Label::new("Choose how PCSweep stays available. No background cleanup, speed tests or Windows changes run automatically.").wrap());
             ui.add_space(8.0);
             ui.add_enabled(self.tray.available(), egui::Checkbox::new(&mut keep, "Keep running in the notification area when I close the window"));
@@ -234,11 +240,34 @@ impl App {
             if let Some(reason) = &self.tray_error { ui.colored_label(WARN, format!("Notification icon unavailable: {reason}")); }
             else if !self.tray.available() { ui.label(widgets::dim("Starting the notification icon…")); }
             ui.add_space(10.0);
+            ui.separator();
+            ui.label(widgets::strong("Readability", 17.0));
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Interface size");
+                for scale in [100,110,125,150] {
+                    ui.selectable_value(&mut self.appearance.scale, scale, format!("{scale}%"));
+                }
+            });
+            ui.checkbox(&mut self.appearance.bold, "Use bolder text");
+            ui.add(egui::Label::new("Size and weight are remembered. Larger layouts can scroll sideways when needed. Windows display scaling also applies.").wrap());
+            ui.separator();
+            ui.checkbox(&mut elevated, "Ask to start as administrator on future launches");
+            ui.add(egui::Label::new("Windows will ask for UAC approval. Canceling opens PCSweep normally. You can also restart as admin only when needed.").wrap());
+            ui.add_space(10.0);
             ui.checkbox(&mut automatic, "Check for PCSweep updates automatically once a day");
             ui.add(egui::Label::new("Works while the window is open or PCSweep is running in the background. Checks contact GitHub; updates install only when you choose. PCSweep does not add itself to Windows startup.").wrap());
             if ui.add(widgets::small("Open Updates")).clicked() { self.page = Page::Updates; }
         });
         self.app_options_open = open;
+        if self.appearance != previous_appearance {
+            self.appearance.save();
+            self.appearance.apply(ctx);
+            theme::setup_fonts(ctx);
+            theme::fit_to_viewport(ctx);
+        }
+        if elevated != crate::appearance::start_elevated() {
+            crate::appearance::set_start_elevated(elevated);
+        }
         if keep != self.keep_background {
             self.keep_background = keep;
             if let Ok((key, _)) =
@@ -252,6 +281,8 @@ impl App {
         }
     }
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let appearance = crate::appearance::Appearance::load();
+        appearance.apply(&cc.egui_ctx);
         theme::setup_fonts(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx);
         theme::read_windows_motion(&cc.egui_ctx);
@@ -300,7 +331,15 @@ impl App {
             app_options_open: false,
             tray_error: None,
             force_exit: false,
+            appearance: Default::default(),
         };
+        app.appearance = appearance;
+        use raw_window_handle::HasWindowHandle;
+        if let Ok(handle) = cc.window_handle() {
+            if let raw_window_handle::RawWindowHandle::Win32(h) = handle.as_raw() {
+                app.tray.bind_window(h.hwnd.get());
+            }
+        }
         util::load_log_history();
         util::log(format!(
             "PCSweep {} started{}",
@@ -310,6 +349,10 @@ impl App {
         app.startup.reload();
         app.restore_scan_caches(&cc.egui_ctx);
         app.start_apps_load(&cc.egui_ctx);
+        app.apps.leftovers.restore = Task::spawn(&cc.egui_ctx, || {
+            crate::scan_cache::load::<crate::leftovers::Target>("last-uninstall.json")
+                .map(|s| s.map(|s| s.data))
+        });
         app.refresh_windows_controls(&cc.egui_ctx);
         app
     }
@@ -375,6 +418,9 @@ impl App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             Action::CleanJunk => self.start_clean(ctx),
+            Action::RecycleChecked(items) => {
+                self.analyzer.recycle = Task::spawn(ctx, move || util::recycle_checked(items));
+            }
             Action::Recycle { items, origin } => self.start_recycle(items, origin, ctx),
             Action::Kill { pids, name } => {
                 let n = self.sys.kill(&pids);
@@ -397,7 +443,19 @@ impl App {
                 }
             }
             Action::RunTool(i) => self.start_tool(i, ctx),
-            Action::Uninstall(app) => self.launch_uninstall(&app),
+            Action::Uninstall(app) => self.launch_uninstall(&app, ctx),
+            Action::RemoveLeftovers(target, items) => {
+                if !self.mutations_running() {
+                    self.apps.leftovers.removal =
+                        Task::spawn(ctx, move || crate::leftovers::remove(target, items));
+                }
+            }
+            Action::RestoreLeftoverRegistry => {
+                if !self.mutations_running() {
+                    self.apps.leftovers.removal =
+                        Task::spawn(ctx, crate::leftovers::restore_registry);
+                }
+            }
             Action::Privacy(action) => self.execute_privacy(action, ctx),
             Action::Preferences(action) => self.execute_preferences(action, ctx),
             Action::Security(action) => self.execute_security(action, ctx),
@@ -421,6 +479,7 @@ impl App {
         self.poll_analyzer();
         self.poll_duplicates();
         self.poll_apps(ctx);
+        self.poll_leftovers(ctx);
         self.poll_tools();
         self.poll_memory();
         self.poll_privacy(ctx);
@@ -478,6 +537,8 @@ impl App {
             || self.cleaner.scan.running()
             || self.cleaner.clean.running()
             || self.analyzer.scan.running()
+            || self.analyzer.selection_check.running()
+            || self.analyzer.cache_running()
             || self.analyzer.recycle.running()
             || self.dups.scan.running()
             || self.dups.recycle.running()
@@ -680,6 +741,22 @@ impl App {
         }
     }
 
+    pub(crate) fn render_readable_page(&mut self, ui: &mut Ui) {
+        if self.appearance.scale > 100 {
+            // Keep full controls reachable at enlarged text sizes instead
+            // of shrinking the user's chosen text back down to fit.
+            egui::ScrollArea::horizontal()
+                .id_salt("readable_page")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.set_min_width(744.0_f32.max(ui.available_width()));
+                    self.render_page(ui);
+                });
+        } else {
+            self.render_page(ui);
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn test_fixture() -> Self {
         Self {
@@ -720,6 +797,7 @@ impl App {
             app_options_open: false,
             tray_error: None,
             force_exit: false,
+            appearance: Default::default(),
         }
     }
 
@@ -1002,7 +1080,7 @@ impl eframe::App for App {
                     });
                     ui.add_space(8.0);
                 }
-                ui.add_enabled_ui(enabled, |ui| self.render_page(ui));
+                ui.add_enabled_ui(enabled, |ui| self.render_readable_page(ui));
             });
 
         self.modal_ui(ctx);

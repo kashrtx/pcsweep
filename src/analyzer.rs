@@ -170,8 +170,6 @@ pub struct Progress {
     pub bytes: AtomicU64,
     pub cancel: AtomicBool,
     pub current: Mutex<String>,
-    cache_stamp: AtomicU64,
-    cache_error: Mutex<Option<String>>,
 }
 
 struct Shared<'a> {
@@ -697,6 +695,7 @@ pub struct AnalyzerCache {
     load: Task<Result<Option<LoadedMaps>, String>>,
     save: Task<Result<Vec<MapIndex>, String>>,
     requested: Option<PathBuf>,
+    load_started: Option<Instant>,
     disk_index: Vec<MapIndex>,
     recent: Vec<SavedMap>,
     stamp: Option<u64>,
@@ -1020,6 +1019,7 @@ pub struct AnalyzerState {
     pub old_min: u64,
     pub recycle: Task<util::RecycleReport>,
     pub journal_error: Option<String>,
+    pub selection_check: Task<Result<Vec<util::CheckedPath>, String>>,
 }
 
 impl Default for AnalyzerState {
@@ -1041,11 +1041,16 @@ impl Default for AnalyzerState {
             old_min: 100 * 1024 * 1024,
             recycle: Task::default(),
             journal_error: None,
+            selection_check: Task::default(),
         }
     }
 }
 
 impl AnalyzerState {
+    pub(crate) fn cache_running(&self) -> bool {
+        self.cache.load.running() || self.cache.save.running()
+    }
+
     fn activate_saved(&mut self, root: &Path) -> bool {
         let Some(index) = self
             .cache
@@ -1094,6 +1099,7 @@ pub fn mark_preview_saved(state: &mut AnalyzerState) {
 enum AAct {
     Go(Page),
     DismissJournalError,
+    SkipRestore,
     Scan(PathBuf),
     Rescan(PathBuf),
     PickFolder,
@@ -1161,10 +1167,23 @@ impl App {
         a.cache.dirty = Some(Instant::now());
     }
     pub(crate) fn restore_analyzer_cache(&mut self, ctx: &egui::Context) {
+        self.analyzer.cache.load_started = Some(Instant::now());
         self.analyzer.cache.load = Task::spawn(ctx, load_maps);
     }
     pub(crate) fn poll_analyzer_cache(&mut self, ctx: &egui::Context) {
+        if self.analyzer.cache.load.running()
+            && self
+                .analyzer
+                .cache
+                .load_started
+                .is_some_and(|t| t.elapsed() > Duration::from_secs(30))
+        {
+            self.analyzer.cache.load = Task::default();
+            self.analyzer.cache.error = Some("Restoring the saved map took too long. You can start a fresh scan; the saved files have not been removed.".into());
+            self.analyzer.cache.requested = None;
+        }
         if let Some(result) = self.analyzer.cache.load.poll() {
+            self.analyzer.cache.load_started = None;
             let requested = self.analyzer.cache.requested.take();
             match result.and_then(|r| r) {
                 Ok(Some(loaded)) => {
@@ -1261,6 +1280,7 @@ impl App {
             {
                 self.analyzer.scan_root = Some(path.clone());
                 self.analyzer.cache.requested = Some(path);
+                self.analyzer.cache.load_started = Some(Instant::now());
                 self.analyzer.cache.load = Task::spawn(ctx, move || {
                     load_indexed_map(&item).map(|map| {
                         Some(LoadedMaps {
@@ -1296,44 +1316,9 @@ impl App {
         });
         let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
         let threads = scan_threads(hdd, cores);
-        let mut older = self.analyzer.cache.recent.clone();
-        let disk_index = self.analyzer.cache.disk_index.clone();
-        self.analyzer.scan = Task::spawn(ctx, move || {
-            let result = Arc::new(scan_bounded(root, p2.clone(), threads));
-            let stamp = crate::scan_cache::now();
-            if !result.cancelled {
-                if let Ok(mut current) = p2.current.lock() {
-                    *current = "Saving this map for next time…".into();
-                }
-                older.retain(|m| util::norm(&m.result.root_path) != util::norm(&result.root_path));
-                older.insert(
-                    0,
-                    SavedMap {
-                        result: result.clone(),
-                        stamp,
-                        view: MapView {
-                            nav: Vec::new(),
-                            tab: ATab::Folders,
-                            filter: String::new(),
-                            old_months: 12,
-                            old_min: 100 * 1024 * 1024,
-                            removed: HashSet::new(),
-                            sort: ASort::Size,
-                        },
-                        read_only: false,
-                    },
-                );
-                older.truncate(RECENT_MAPS);
-                if let Err(error) = save_maps(older, disk_index) {
-                    if let Ok(mut message) = p2.cache_error.lock() {
-                        *message = Some(error);
-                    }
-                }
-            }
-            p2.cache_stamp.store(stamp, Ordering::Relaxed);
-            Arc::try_unwrap(result)
-                .unwrap_or_else(|_| unreachable!("Only the scan worker retains this result"))
-        });
+        // Publish traversal results before serialization. Persistence has its own
+        // task, so a slow disk or antivirus cannot hold a completed map hostage.
+        self.analyzer.scan = Task::spawn(ctx, move || scan_bounded(root, p2, threads));
         self.analyzer.progress = Some(progress);
         self.analyzer.scan_root = Some(path.clone());
         self.analyzer.started = Some(Instant::now());
@@ -1351,6 +1336,18 @@ impl App {
     }
 
     pub fn poll_analyzer(&mut self) {
+        if self.modal.is_none() && !self.mutations_running() {
+            if let Some(result) = self.analyzer.selection_check.poll() {
+                match result.and_then(|r| r) {
+                    Ok(items) if !items.is_empty() => {
+                        let total = items.iter().map(|p| p.size).sum();
+                        self.modal=Some(Modal{title:format!("Move {} to the Recycle Bin?",fmt_bytes(total)),body:format!("{} selected items were checked on disk now. They will be checked again before moving. You can restore them from the Recycle Bin.",items.len()),details:items.iter().map(|p|format!("{} ({})",p.path.display(),fmt_bytes(p.size))).collect(),note:Some("This review uses current files, so you do not need to remap the drive. Whole folders include all their contents.".into()),confirm:"Move to Recycle Bin".into(),danger:true,action:Action::RecycleChecked(items)});
+                    }
+                    Ok(_) => self.toast(ToastKind::Info, "No eligible files were selected."),
+                    Err(e) => self.toast(ToastKind::Error, e),
+                }
+            }
+        }
         if let Some(r) = self.analyzer.scan.poll() {
             match r {
                 Ok(res) => {
@@ -1361,19 +1358,8 @@ impl App {
                         fmt_num(res.root.files),
                         res.elapsed.as_secs_f32()
                     ));
-                    self.analyzer.cache.stamp = Some(
-                        self.analyzer
-                            .progress
-                            .as_ref()
-                            .map(|p| p.cache_stamp.load(Ordering::Relaxed))
-                            .filter(|n| *n > 0)
-                            .unwrap_or_else(crate::scan_cache::now),
-                    );
-                    self.analyzer.cache.error = self
-                        .analyzer
-                        .progress
-                        .as_ref()
-                        .and_then(|p| p.cache_error.lock().ok().and_then(|m| m.clone()));
+                    self.analyzer.cache.stamp = (!res.cancelled).then(crate::scan_cache::now);
+                    self.analyzer.cache.error = None;
                     self.analyzer.cache.read_only = false;
                     self.analyzer.result = Some(Arc::new(res));
                     self.remember_analyzer();
@@ -1437,6 +1423,11 @@ impl App {
         for a in acts {
             match a {
                 AAct::Go(page) => self.page = page,
+                AAct::SkipRestore => {
+                    self.analyzer.cache.load = Task::default();
+                    self.analyzer.cache.load_started = None;
+                    self.analyzer.cache.requested = None;
+                }
                 AAct::DismissJournalError => self.analyzer.journal_error = None,
                 AAct::Scan(p) => self.start_analyze(p, &ctx),
                 AAct::Rescan(p) => self.force_analyze(p, &ctx),
@@ -1480,7 +1471,10 @@ impl App {
                 AAct::ClearSel => self.analyzer.selected.clear(),
                 AAct::AskRecycle(items) => {
                     if self.analyzer.cache.read_only {
-                        self.toast(ToastKind::Info, "Refresh this saved map before moving files. Saved results are a view of an earlier scan.");
+                        if !self.analyzer.selection_check.running() {
+                            self.analyzer.selection_check =
+                                Task::spawn(&ctx, move || util::check_selected(items));
+                        }
                     } else {
                         self.ask_recycle(items, Origin::Analyzer);
                     }
@@ -1645,6 +1639,9 @@ impl App {
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.label(widgets::dim("Restoring saved disk maps…"));
+                if ui.add(widgets::small("Skip restore")).clicked() {
+                    acts.push(AAct::SkipRestore);
+                }
             });
             return;
         }
@@ -1714,7 +1711,7 @@ impl App {
                 "Scan from {}. {}",
                 crate::scan_cache::saved_label(stamp),
                 if a.cache.read_only {
-                    "Saved map · Refresh before moving files."
+                    "Saved map · Selected files are checked before moving."
                 } else {
                     "Refresh when files change; switching drives keeps their maps."
                 }
@@ -2004,8 +2001,12 @@ impl App {
             )));
             if ui
                 .add_enabled(
-                    !selected.is_empty() && !a.recycle.running() && !a.cache.read_only,
-                    widgets::danger("Move selected to Recycle Bin…"),
+                    !selected.is_empty() && !a.recycle.running() && !a.selection_check.running(),
+                    widgets::danger(if a.selection_check.running() {
+                        "Checking selected files…"
+                    } else {
+                        "Move selected to Recycle Bin…"
+                    }),
                 )
                 .clicked()
             {
@@ -2041,7 +2042,7 @@ impl App {
                                 matches!(child.kind, NodeKind::Dir | NodeKind::File) && !removed;
                             if actionable {
                                 let btn = ui.add_enabled(
-                                    block.is_none() && !a.cache.read_only,
+                                    block.is_none() && !a.selection_check.running(),
                                     widgets::small(widgets::icon(ic::CLEAN, 13.0, TEXT_DIM)),
                                 );
                                 let btn = match block {
@@ -2158,7 +2159,9 @@ impl App {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui
                     .add_enabled(
-                        !sel_items.is_empty() && !a.recycle.running() && !a.cache.read_only,
+                        !sel_items.is_empty()
+                            && !a.recycle.running()
+                            && !a.selection_check.running(),
                         widgets::danger(widgets::icon_text(
                             ic::CLEAN,
                             "Move selected to Recycle Bin",
@@ -2555,5 +2558,86 @@ mod tests {
         assert!(result.cancelled);
         assert_eq!(result.dirs, 0);
         assert_eq!(result.root.files, 0);
+    }
+}
+
+#[cfg(test)]
+mod responsiveness_tests {
+    use super::*;
+    #[test]
+    fn scan_results_do_not_wait_for_snapshot_persistence_or_the_selected_tab() {
+        let ctx = egui::Context::default();
+        let mut app = App::test_fixture();
+        let dir =
+            std::env::temp_dir().join(format!("pcsweep-responsive-scan-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        for i in 0..128 {
+            fs::write(dir.join(format!("{i}.tmp")), b"example").unwrap();
+        }
+        let (release, wait) = std::sync::mpsc::channel();
+        app.analyzer.cache.save = Task::spawn(&ctx, move || {
+            wait.recv().unwrap();
+            Ok(Vec::new())
+        });
+        app.force_analyze(dir.clone(), &ctx);
+        app.page = Page::Memory;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.analyzer.scan.running() {
+            app.poll_analyzer();
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(app.page == Page::Memory);
+        assert_eq!(app.analyzer.result.as_ref().unwrap().root.files, 128);
+        assert!(
+            app.analyzer.cache.save.running(),
+            "a completed map must be usable before saving finishes"
+        );
+        release.send(()).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn stalled_restore_times_out_without_waiting_for_its_worker() {
+        let ctx = egui::Context::default();
+        let mut app = App::test_fixture();
+        let (release, wait) = std::sync::mpsc::channel();
+        app.analyzer.cache.load = Task::spawn(&ctx, move || {
+            wait.recv().unwrap();
+            Ok(None)
+        });
+        app.analyzer.cache.load_started = Some(Instant::now() - Duration::from_secs(31));
+        app.poll_analyzer_cache(&ctx);
+        assert!(!app.analyzer.cache.load.running());
+        assert!(app.analyzer.cache.error.is_some());
+        release.send(()).unwrap();
+    }
+    #[test]
+    fn cached_file_selection_can_be_validated_without_remapping_the_drive() {
+        let ctx = egui::Context::default();
+        let mut app = App::test_fixture();
+        let dir =
+            std::env::temp_dir().join(format!("pcsweep-saved-selection-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("review-me.tmp");
+        fs::write(&path, b"new contents").unwrap();
+        mark_preview_saved(&mut app.analyzer);
+        let items = vec![(path.clone(), 1)];
+        app.analyzer.selection_check = Task::spawn(&ctx, move || util::check_selected(items));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.analyzer.selection_check.running() {
+            app.poll_analyzer();
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let modal = app.modal.unwrap();
+        match modal.action {
+            Action::RecycleChecked(items) => {
+                assert_eq!(items[0].size, 12);
+                assert_eq!(items[0].path, path);
+            }
+            _ => panic!("current-file confirmation required"),
+        }
+        assert!(!app.analyzer.scan.running());
+        fs::remove_dir_all(dir).unwrap();
     }
 }
