@@ -446,6 +446,8 @@ fn inventory() -> Inventory {
         let supported = available(p, build);
         let bit = value.as_ref().and_then(RawValue::as_dword);
         let configurable = readable && (value.is_none() || matches!(bit, Some(0 | 1)));
+        let owns =
+            saved.is_none_or(|entry| value == entry.before || value.as_ref() == Some(&entry.after));
         let status = if let Err(e) = read {
             format!("Could not read: {e}")
         } else if let Err(e) = policy {
@@ -470,15 +472,15 @@ fn inventory() -> Inventory {
                 && !managed
                 && configurable
                 && bit != Some(0)
-                && saved.is_none()
+                && owns
                 && journal_error.is_none(),
             can_enable: supported
                 && !managed
                 && configurable
                 && bit != Some(1)
-                && saved.is_none()
+                && owns
                 && journal_error.is_none(),
-            can_undo: !managed && saved.is_some() && journal_error.is_none(),
+            can_undo: !managed && saved.is_some() && owns && journal_error.is_none(),
         });
     }
     let root = RegKey::predef(HKEY_CURRENT_USER);
@@ -630,13 +632,41 @@ fn set_preference(id: String, expected: Option<RawValue>, enabled: bool) -> Resu
     {
         return Err("The existing value is unrecognized and was preserved.".into());
     }
-    apply_value(&mut RegistryStore, &id, expected, enabled)?;
+    choose_value(&mut RegistryStore, &id, expected, enabled)?;
     broadcast_preferences();
     Ok(format!(
         "Turned {} {}. Windows may apply the change after sign-out.",
         if enabled { "on" } else { "off" },
         p.name
     ))
+}
+
+fn choose_value<S: Store>(
+    store: &mut S,
+    id: &str,
+    expected: Option<RawValue>,
+    enabled: bool,
+) -> Result<(), String> {
+    if store.read(id)? != expected {
+        return Err("This preference changed after review. Refresh before changing it.".into());
+    }
+    let saved = store
+        .journal()?
+        .entries
+        .into_iter()
+        .find(|entry| entry.id == id);
+    if let Some(entry) = saved {
+        // Finish the existing exact Undo first. If the new requested value is
+        // the original, this is the complete toggle. Otherwise begin a new
+        // reviewed change from that original, including original absence.
+        undo(store, id)?;
+        if entry.before.as_ref() == Some(&RawValue::dword(u32::from(enabled))) {
+            return Ok(());
+        }
+        apply_value(store, id, entry.before, enabled)
+    } else {
+        apply_value(store, id, expected, enabled)
+    }
 }
 
 fn broadcast_preferences() {
@@ -712,7 +742,7 @@ pub(crate) fn preview_fixture() -> PrivacyState {
                     "On (saved preference)".into()
                 },
                 can_disable: supported && i > 0,
-                can_enable: false,
+                can_enable: supported && i == 0,
                 can_undo: i == 0,
             }
         })
@@ -979,6 +1009,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn direct_toggle_can_reverse_an_owned_change_without_losing_original_absence() {
+        for original in [None, Some(RawValue::dword(1))] {
+            let mut store = MemoryStore::default();
+            if let Some(v) = &original {
+                store.values.insert("advertising_id".into(), v.clone());
+            }
+            choose_value(&mut store, "advertising_id", original.clone(), false).unwrap();
+            choose_value(&mut store, "advertising_id", Some(RawValue::dword(0)), true).unwrap();
+            assert_eq!(
+                store.read("advertising_id").unwrap(),
+                Some(RawValue::dword(1))
+            );
+            if original.is_none() {
+                assert_eq!(store.journal().unwrap().entries[0].before, None);
+                undo(&mut store, "advertising_id").unwrap();
+                assert_eq!(store.read("advertising_id").unwrap(), None);
+            } else {
+                assert!(store.journal().unwrap().entries.is_empty());
+            }
+        }
+    }
     #[test]
     fn enabling_a_preference_preserves_off_and_absent_originals_for_undo() {
         for original in [None, Some(RawValue::dword(0))] {
