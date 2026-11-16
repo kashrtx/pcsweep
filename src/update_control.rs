@@ -891,6 +891,18 @@ pub fn preview_fixture() -> Snapshot {
         Ok(None),
     )
 }
+
+#[cfg(test)]
+pub fn preview_preexisting_disabled_fixture() -> Snapshot {
+    snapshot(
+        ServiceState {
+            start: SERVICE_DISABLED,
+            delayed: false,
+            state: SERVICE_STOPPED,
+        },
+        Ok(None),
+    )
+}
 #[cfg(test)]
 pub fn preview_disabled_fixture() -> Snapshot {
     let original = ServiceState {

@@ -830,7 +830,8 @@ impl App {
             widgets::section(ui, "Your account preferences");
             for item in &inv.items {
                 let Ok(p) = preference(&item.id) else { continue; };
-                widgets::tight_frame().show(ui, |ui| {
+                if !available(p, inv.build) { continue; }
+                widgets::tight_card(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(widgets::icon(ic::SHIELD, 18.0, ACCENT));
                         ui.label(widgets::strong(p.name, 15.0));

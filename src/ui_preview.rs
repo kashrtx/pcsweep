@@ -1250,6 +1250,7 @@ fn shipment_frame(
                 .show(ctx, |ui| {
                     ui.add_enabled_ui(enabled, |ui| app.render_page(ui));
                 });
+            app.app_options_ui(ctx);
             app.modal_ui(ctx);
         },
     )
@@ -1920,4 +1921,76 @@ fn analyzer_filter_sort_and_multi_selection_review_only_shown_eligible_files() {
         !app.analyzer.scan.running(),
         "reading and filtering saved data cannot start a rescan"
     );
+}
+
+#[test]
+fn background_options_stay_readable_at_compact_and_default_sizes() {
+    for size in [[900, 520], [1320, 860]] {
+        let ctx = egui::Context::default();
+        theme::setup_fonts(&ctx);
+        theme::apply(&ctx);
+        let mut app = App::test_fixture();
+        let mut painter = CpuPainter::default();
+        let mut last = None;
+        for _ in 0..7 {
+            let output = shipment_frame(&ctx, &mut app, size, Vec::new());
+            upload_preview_textures(&mut painter, &output);
+            last = Some(output);
+        }
+        let button = text_rect(last.as_ref().unwrap(), "App options");
+        let output = shipment_frame(&ctx, &mut app, size, click_at(button.center()));
+        upload_preview_textures(&mut painter, &output);
+        for _ in 0..6 {
+            let output = shipment_frame(&ctx, &mut app, size, Vec::new());
+            upload_preview_textures(&mut painter, &output);
+            last = Some(output);
+        }
+        let output = last.unwrap();
+        for text in [
+            "PCSweep options",
+            "Keep running in the notification area when I close the window",
+            "Check for PCSweep updates automatically once a day",
+        ] {
+            text_rect(&output, text);
+        }
+        assert!(!app.mutations_running());
+        save_shipment_preview(
+            &ctx,
+            &painter,
+            &output,
+            size,
+            &format!("background-options-{}x{}.png", size[0], size[1]),
+        );
+    }
+}
+
+#[test]
+fn preexisting_update_service_block_can_be_enabled_with_explicit_review() {
+    let ctx = egui::Context::default();
+    theme::setup_fonts(&ctx);
+    theme::apply(&ctx);
+    let mut app = App::test_fixture();
+    app.page = Page::WindowsControls;
+    app.is_admin = true;
+    app.windows_controls = crate::windows_controls::preview_preexisting_service_block();
+    let size = [1320, 860];
+    let mut last = None;
+    for _ in 0..7 {
+        last = Some(shipment_frame(&ctx, &mut app, size, Vec::new()));
+    }
+    let button = text_rect(last.as_ref().unwrap(), "Enable service with Manual start…");
+    let _ = shipment_frame(&ctx, &mut app, size, click_at(button.center()));
+    assert!(matches!(
+        app.modal.as_ref().map(|m| &m.action),
+        Some(Action::WindowsControls(
+            crate::windows_controls::WindowsControlsAction::EnableService { .. }
+        ))
+    ));
+    assert!(!app.mutations_running(), "review cannot change a service");
+    for _ in 0..5 {
+        last = Some(shipment_frame(&ctx, &mut app, size, Vec::new()));
+    }
+    let cancel = text_rect(last.as_ref().unwrap(), "Cancel");
+    let _ = shipment_frame(&ctx, &mut app, size, click_at(cancel.center()));
+    assert!(app.modal.is_none() && !app.mutations_running());
 }

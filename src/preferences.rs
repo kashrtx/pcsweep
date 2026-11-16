@@ -972,31 +972,70 @@ impl App {
             } else {
                 &inventory.user_error
             };
-            widgets::tight_frame().show(ui,|ui|{
-                ui.horizontal_wrapped(|ui|{
-                    ui.label(widgets::strong(s.name,15.0));
-                    if s.machine{widgets::badge(ui,"System-wide · admin",TEXT_DIM);}
+            widgets::tight_card(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(widgets::strong(s.name, 15.0));
+                    if s.machine {
+                        widgets::badge(ui, "System-wide · admin", TEXT_DIM);
+                    }
                 });
                 ui.label(widgets::dim(s.description));
-                let current=item.value.as_ref().ok().and_then(|v|v.as_ref());
-                let bit=current.and_then(Raw::number);
-                let state=current.and_then(|value|configured(s,value));
-                let recognized=current.is_none()||state.is_some();
-                let own=item.undo.as_ref().is_none_or(|e|item.value.as_ref().is_ok_and(|v|e.owns(v)));
-                let can_change=!busy&&item.value.is_ok()&&item.guard.is_ok()&&journal_error.is_none()&&recognized&&own&&(!s.machine||self.is_admin)&&(!s.existing_only||current.is_some());
-                let status=match &item.value{
-                    Err(e)=>format!("Unavailable: {e}"),
-                    Ok(None)=>"Windows default · no explicit value saved".into(),
-                    Ok(Some(_))if s.id=="optional_diagnostics"&&bit==Some(0)=>"Optional data off · a lower diagnostic level is configured".into(),
-                    Ok(Some(_))if bit==Some(s.off)=>if s.id=="optional_diagnostics"{"Required data only · optional data off".into()}else if s.id=="recall_snapshots"{"Snapshot saving blocked by account policy".into()}else{"Off".into()},
-                    Ok(Some(_))if bit==Some(s.on)=>if s.id=="recall_snapshots"{"Policy allows individual opt-in · saving state is separate".into()}else{"On".into()},
-                    _=>"Windows published an unrecognized preference; kept unchanged".into(),
+                let current = item.value.as_ref().ok().and_then(|v| v.as_ref());
+                let bit = current.and_then(Raw::number);
+                let state = current.and_then(|value| configured(s, value));
+                let recognized = current.is_none() || state.is_some();
+                let own = item
+                    .undo
+                    .as_ref()
+                    .is_none_or(|e| item.value.as_ref().is_ok_and(|v| e.owns(v)));
+                let can_change = !busy
+                    && item.value.is_ok()
+                    && item.guard.is_ok()
+                    && journal_error.is_none()
+                    && recognized
+                    && own
+                    && (!s.machine || self.is_admin)
+                    && (!s.existing_only || current.is_some());
+                let status = match &item.value {
+                    Err(e) => format!("Unavailable: {e}"),
+                    Ok(None) => "Windows default · no explicit value saved".into(),
+                    Ok(Some(_)) if s.id == "optional_diagnostics" && bit == Some(0) => {
+                        "Optional data off · a lower diagnostic level is configured".into()
+                    }
+                    Ok(Some(_)) if bit == Some(s.off) => {
+                        if s.id == "optional_diagnostics" {
+                            "Required data only · optional data off".into()
+                        } else if s.id == "recall_snapshots" {
+                            "Snapshot saving blocked by account policy".into()
+                        } else {
+                            "Off".into()
+                        }
+                    }
+                    Ok(Some(_)) if bit == Some(s.on) => {
+                        if s.id == "recall_snapshots" {
+                            "Policy allows individual opt-in · saving state is separate".into()
+                        } else {
+                            "On".into()
+                        }
+                    }
+                    _ => "Windows published an unrecognized preference; kept unchanged".into(),
                 };
                 ui.label(widgets::faint(status));
-                if let Err(e)=&item.guard{ui.colored_label(WARN,e);}
-                if let Some(e)=journal_error{ui.colored_label(WARN,e);}
-                if !own{ui.colored_label(WARN,"Changed outside PCSweep. Your newer choice is preserved.");}
-                if s.existing_only&&current.is_none(){ui.label(widgets::faint("PCSweep could not confirm this preference for this account or Windows build."));}
+                if let Err(e) = &item.guard {
+                    ui.colored_label(WARN, e);
+                }
+                if let Some(e) = journal_error {
+                    ui.colored_label(WARN, e);
+                }
+                if !own {
+                    ui.colored_label(
+                        WARN,
+                        "Changed outside PCSweep. Your newer choice is preserved.",
+                    );
+                }
+                if s.existing_only && current.is_none() {
+                    ui.label(widgets::faint("PCSweep could not confirm this preference for this account or Windows build."));
+                }
                 ui.horizontal_wrapped(|ui|{
                     for (enabled,label)in[(false,"Turn off…"),(true,"Turn on…")]{
                         if s.id=="recall_snapshots"&&enabled {continue}

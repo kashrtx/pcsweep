@@ -219,7 +219,7 @@ impl App {
         }
     }
 
-    fn app_options_ui(&mut self, ctx: &egui::Context) {
+    pub(crate) fn app_options_ui(&mut self, ctx: &egui::Context) {
         if !self.app_options_open || self.modal.is_some() {
             return;
         }

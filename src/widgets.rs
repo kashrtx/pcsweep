@@ -150,6 +150,15 @@ pub fn card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
         .inner
 }
 
+pub fn tight_card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    tight_frame()
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            add(ui)
+        })
+        .inner
+}
+
 pub fn primary(text: impl Into<WidgetText>) -> Button<'static> {
     let t: WidgetText = text.into();
     Button::new(t.color(Color32::WHITE))

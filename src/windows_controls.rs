@@ -1722,6 +1722,14 @@ pub(crate) fn preview_fixture_variant(
 }
 
 #[cfg(test)]
+pub(crate) fn preview_preexisting_service_block() -> WindowsControlsState {
+    let mut state = preview_fixture_variant(true, false, false);
+    state.snapshot.as_mut().unwrap().service =
+        Ok(crate::update_control::preview_preexisting_disabled_fixture());
+    state
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
