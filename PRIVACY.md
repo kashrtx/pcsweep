@@ -24,8 +24,12 @@ Windows file-change and audit views read existing local records on request. They
 
 ## Saved scans and background mode
 
-Analyzer, cleaner and duplicate snapshots are stored locally in the scan-cache folder beside the activity log. They can contain filenames and folder paths. Snapshots have bounded retention, are not uploaded, and are shown with their saved time. A refresh is required before destructive actions from restored results. The last page, window size and close-to-notification-area preference are saved locally.
+Analyzer, cleaner and duplicate snapshots are stored locally in the scan-cache folder beside the activity log. They can contain filenames and folder paths. Snapshots have bounded retention, are not uploaded, and are shown with their saved time. Restored cleaner/duplicate results require a refresh before deletion. Space analyzer selections can instead validate the selected files on disk, then recheck them before moving; they do not require remapping the full drive. The last page, window size and close-to-notification-area preference are saved locally.
 
 Notification-area mode is optional. It keeps this process running; it does not install a service or Windows startup entry. Optional daily GitHub update checks can continue while the window is hidden. Installation remains explicit. Update-reminder dismissal and the last recorded Windows installation age are local preferences; no missing-update catalog lookup runs automatically.
 
 Native application artwork is read from local app resources or the Windows Shell on workers. PCSweep does not launch an uninstaller or contact an icon-download service to obtain it.
+
+## Uninstaller leftovers and readability
+
+PCSweep remembers the last desktop product submitted for uninstall, including its name, publisher and location, locally. Reviewed registry cleanup retains the latest 16 typed-value backup generations in the guarded local scan-cache folder. Backups can contain sensitive application settings; they are not uploaded. Folder removals are recorded in local cleanup history and use the Recycle Bin on supported fixed local drives. The interface size, bold-text and optional UAC startup preferences are stored per account.

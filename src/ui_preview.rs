@@ -385,7 +385,7 @@ fn render_page(page: Page, size: [u32; 2], path: &Path, pending_dns: bool) {
         let output = ctx.run(input, |ctx| {
             theme::fit_to_viewport(ctx);
             egui::SidePanel::left("nav")
-                .exact_width(236.0)
+                .exact_width(app.navigation_width(ctx))
                 .resizable(false)
                 .show_separator_line(false)
                 .frame(
@@ -1231,7 +1231,7 @@ fn shipment_frame(
             theme::fit_to_viewport(ctx);
             let enabled = app.modal.is_none();
             egui::SidePanel::left("shipment_navigation")
-                .exact_width(236.0)
+                .exact_width(app.navigation_width(ctx))
                 .resizable(false)
                 .frame(
                     Frame::none()
@@ -1901,8 +1901,11 @@ fn analyzer_filter_sort_and_multi_selection_review_only_shown_eligible_files() {
     }
     let output = last.unwrap();
     assert!(
-        has_visible_text_containing(&output, "Saved map · Refresh before moving files."),
-        "restored maps must show their freshness limitation before file actions"
+        has_visible_text_containing(
+            &output,
+            "Saved map · Selected files are checked before moving."
+        ),
+        "restored maps must explain current-file validation before file actions"
     );
     let recycle = text_rect(&output, "Move selected to Recycle Bin…");
     save_shipment_preview(
@@ -1914,8 +1917,8 @@ fn analyzer_filter_sort_and_multi_selection_review_only_shown_eligible_files() {
     );
     let _ = shipment_frame(&ctx, &mut app, size, click_at(recycle.center()));
     assert!(
-        app.modal.is_none() && !app.mutations_running(),
-        "a restored saved map requires Refresh before destructive actions"
+        app.modal.is_none() && !app.mutations_running() && app.analyzer.selection_check.running(),
+        "a restored map must validate the selection before opening a mutation confirmation"
     );
     assert!(
         !app.analyzer.scan.running(),

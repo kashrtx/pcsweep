@@ -97,10 +97,16 @@ struct Backup {
     target: Target,
     items: Vec<RegistryItem>,
 }
+pub struct RestorePlan {
+    pub stamp: u64,
+    pub product: String,
+    pub paths: Vec<String>,
+}
 #[derive(Default)]
 pub struct State {
     pub target: Option<Target>,
     pub restore: Task<Result<Option<Target>, String>>,
+    pub restore_review: Task<Result<RestorePlan, String>>,
     pub scan: Task<Result<Review, String>>,
     pub removal: Task<Result<String, String>>,
     pub launch: Task<Result<(), String>>,
@@ -579,7 +585,11 @@ pub fn remove(t: Target, items: Vec<Candidate>) -> Result<String, String> {
         )?;
     }
 
-    let mut journal = Session::begin("Uninstaller leftovers")?;
+    let mut journal = if items.iter().any(|c| matches!(c.item, Item::Folder { .. })) {
+        Some(Session::begin("Uninstaller leftovers")?)
+    } else {
+        None
+    };
     let mut done = 0;
     let mut failures = Vec::new();
     for c in items {
@@ -595,6 +605,7 @@ pub fn remove(t: Target, items: Vec<Candidate>) -> Result<String, String> {
                     failures.push(format!("{} changed or is protected", path.display()));
                     continue;
                 }
+                let journal = journal.as_mut().ok_or("Cleanup history is unavailable")?;
                 let ids = journal.intend(
                     "Reviewed uninstaller leftover",
                     Act::Recycle,
@@ -710,10 +721,44 @@ fn valid_tree(t: &KeyTree, depth: usize, budget: &mut usize) -> bool {
     }
     true
 }
-pub fn restore_registry() -> Result<String, String> {
-    let mut archive = scan_cache::load::<BackupArchive>("leftover-registry-backups.json")?
-        .ok_or("No registry backup is available")?
-        .data;
+pub fn restore_plan() -> Result<RestorePlan, String> {
+    let stored = scan_cache::load::<BackupArchive>("leftover-registry-backups.json")?
+        .ok_or("No registry backup is available")?;
+    if stored.data.backups.len() > 16 {
+        return Err("Registry backup archive is invalid".into());
+    }
+    let b = stored
+        .data
+        .backups
+        .last()
+        .ok_or("No registry backup is available")?;
+    if b.items.len() > 8 || b.items.is_empty() {
+        return Err("Registry backup contents are invalid".into());
+    }
+    for k in &b.items {
+        if !registry_paths(&b.target).contains(&k.path)
+            || !valid_tree(&k.tree, 0, &mut (1024 * 1024))
+        {
+            return Err("Registry backup failed validation".into());
+        }
+    }
+    Ok(RestorePlan {
+        stamp: stored.saved,
+        product: b.target.name.clone(),
+        paths: b
+            .items
+            .iter()
+            .map(|k| format!("{}\\{}", if k.machine { "HKLM" } else { "HKCU" }, k.path))
+            .collect(),
+    })
+}
+pub fn restore_registry(expected: u64) -> Result<String, String> {
+    let stored = scan_cache::load::<BackupArchive>("leftover-registry-backups.json")?
+        .ok_or("No registry backup is available")?;
+    if stored.saved != expected {
+        return Err("The backup changed. Review it again before restoring.".into());
+    }
+    let mut archive = stored.data;
     if archive.backups.len() > 16 {
         return Err("Registry backup archive is invalid".into());
     }
@@ -743,6 +788,14 @@ pub fn restore_registry() -> Result<String, String> {
 }
 impl crate::app::App {
     pub fn poll_leftovers(&mut self, ctx: &egui::Context) {
+        if self.modal.is_none() && !self.mutations_running() {
+            if let Some(result) = self.apps.leftovers.restore_review.poll() {
+                match result.and_then(|r|r) {
+                    Ok(plan)=>self.modal=Some(crate::app::Modal{title:format!("Restore {} registry backup?",plan.product),body:"Restore the listed registry keys from the last cleanup backup. Differing values added since cleanup are preserved; a conflict leaves the backup available. Files can be restored separately from the Recycle Bin.".into(),details:plan.paths,note:None,confirm:"Restore backup".into(),danger:false,action:crate::app::Action::RestoreLeftoverRegistry(plan.stamp)}),
+                    Err(e)=>self.apps.leftovers.error=Some(e),
+                }
+            }
+        }
         if let Some(r) = self.apps.leftovers.restore.poll() {
             if self.apps.leftovers.target.is_none() {
                 if let Ok(Ok(Some(target))) = r {
@@ -778,32 +831,69 @@ impl crate::app::App {
     pub(crate) fn leftovers_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let state = &mut self.apps.leftovers;
-        if state.target.is_none() {
+        let Some(target) = state.target.clone() else {
             return;
-        }
+        };
+        let mut modal = None;
         egui::CollapsingHeader::new("Uninstaller leftovers").default_open(true).show(ui,|ui| {
-        widgets::tight_card(ui,|ui| {
-            let target=state.target.clone().unwrap();ui.label(widgets::strong(format!("After uninstalling {}",target.name),16.0));
-            ui.add(egui::Label::new("Review exact product folders and registry keys after removal. Confidence is evidence, not a guarantee. Preferences and saved data may be included. Nothing is selected automatically.").wrap());
-            if let Some(error)=&state.error{ui.colored_label(WARN,error);}
-            if let Some(message)=&state.message{ui.add(egui::Label::new(message).wrap());}
-            ui.horizontal_wrapped(|ui| {
-                if ui.add_enabled(!state.busy()&&!state.scan.running(),widgets::small("Check leftovers")).clicked(){let t=target.clone();state.scan=Task::spawn(&ctx,move||scan(&t));}
-                if ui.add_enabled(!state.busy()&&!state.scan.running(),widgets::small("Restore last registry backup…")).clicked(){self.modal=Some(crate::app::Modal{title:"Restore leftover registry backup?".into(),body:"Restore the typed registry values saved before PCSweep's last leftover cleanup. Values changed since cleanup will be preserved. App files can be restored from the Recycle Bin.".into(),details:Vec::new(),note:None,confirm:"Restore backup".into(),danger:false,action:crate::app::Action::RestoreLeftoverRegistry});}
-                if state.scan.running()||state.busy(){ui.spinner();}
-            });
-            let busy=state.busy();
-            if let Some(review)=&state.review {
-                if review.candidates.is_empty(){ui.label(widgets::dim("No eligible exact-match leftovers found. Shared, protected and uncertain locations are kept."));}
-                ScrollArea::vertical().id_salt("leftover_review").max_height((ui.available_height()*0.35).clamp(80.0,240.0)).auto_shrink([false,true]).show(ui,|ui|{
-                    for(i,c)in review.candidates.iter().enumerate(){ui.push_id(i,|ui|{ui.horizontal(|ui|{let mut on=state.selected.contains(&i);if ui.add_enabled(!busy,egui::Checkbox::without_text(&mut on)).changed(){if on{state.selected.insert(i);}else{state.selected.remove(&i);}}
-                        ui.vertical(|ui|{ui.label(widgets::strong(if c.confidence==Confidence::High{"High confidence"}else{"Needs review"},13.0));ui.add(egui::Label::new(c.label()).wrap());ui.label(widgets::faint(c.evidence.join(" · ")));});});ui.separator();});}
-                    for note in &review.notes{ui.add(egui::Label::new(widgets::dim(note)).wrap());}
+            widgets::tight_card(ui,|ui| {
+                ui.label(widgets::strong(format!("After uninstalling {}",target.name),16.0));
+                ui.add(egui::Label::new("Review exact product folders and registry keys after removal. Confidence is evidence, not a guarantee. Preferences and saved data may be included. Nothing is selected automatically.").wrap());
+                if let Some(error)=&state.error {ui.add(egui::Label::new(egui::RichText::new(error).color(WARN)).wrap());}
+                if let Some(message)=&state.message {ui.add(egui::Label::new(message).wrap());}
+                let busy=state.busy()||state.scan.running()||state.restore_review.running();
+                ui.horizontal_wrapped(|ui| {
+                    if ui.add_enabled(!busy,widgets::small("Check leftovers")).clicked() {
+                        let t=target.clone();state.error=None;
+                        state.scan=Task::spawn(&ctx,move||scan(&t));
+                    }
+                    if ui.add_enabled(!busy,widgets::small("Restore last registry backup…")).clicked() {
+                        state.error=None;state.restore_review=Task::spawn(&ctx,restore_plan);
+                    }
+                    if busy {ui.spinner();}
                 });
-                if ui.add_enabled(!state.selected.is_empty()&&!state.busy(),widgets::small(format!("Review removal ({})…",state.selected.len()))).clicked(){let chosen:Vec<_>=state.selected.iter().filter_map(|i|review.candidates.get(*i).cloned()).collect();self.modal=Some(crate::app::Modal{title:"Remove reviewed app leftovers?".into(),body:"Selected folders will move to the Recycle Bin. Registry keys are backed up before removal. Check the paths carefully: app preferences, profiles and saves can be included.".into(),details:chosen.iter().map(Candidate::label).collect(),note:Some("Shared paths, links, changes since the scan and newly installed apps are checked again before removal. The latest 16 registry cleanup backups are retained.".into()),confirm:"Remove selected leftovers".into(),danger:true,action:crate::app::Action::RemoveLeftovers(target,chosen)});}
-            }
+                if let Some(review)=&state.review {
+                    if review.candidates.is_empty() {
+                        ui.add(egui::Label::new(widgets::dim("No eligible exact-match leftovers found. Shared, protected and uncertain locations are kept.")).wrap());
+                    }
+                    ScrollArea::vertical().id_salt("leftover_review").max_height((ui.available_height()*0.35).clamp(80.0,240.0)).auto_shrink([false,true]).show(ui,|ui| {
+                        for(i,c)in review.candidates.iter().enumerate() {
+                            ui.push_id(i,|ui| {
+                                ui.horizontal(|ui| {
+                                    let mut on=state.selected.contains(&i);
+                                    if ui.add_enabled(!busy,egui::Checkbox::without_text(&mut on)).changed() {
+                                        if on {state.selected.insert(i);} else {state.selected.remove(&i);}
+                                    }
+                                    ui.vertical(|ui| {
+                                        let confidence=if c.confidence==Confidence::High {"High confidence"} else {"Needs review"};
+                                        ui.label(widgets::strong(confidence,13.0));
+                                        ui.add(egui::Label::new(c.label()).wrap());
+                                        ui.add(egui::Label::new(widgets::faint(c.evidence.join(" · "))).wrap());
+                                    });
+                                });
+                                ui.separator();
+                            });
+                        }
+                        for note in &review.notes {ui.add(egui::Label::new(widgets::dim(note)).wrap());}
+                    });
+                    if ui.add_enabled(!state.selected.is_empty()&&!busy,widgets::small(format!("Review removal ({})…",state.selected.len()))).clicked() {
+                        let mut indices:Vec<_>=state.selected.iter().copied().collect();indices.sort_unstable();
+                        let chosen:Vec<_>=indices.into_iter().filter_map(|i|review.candidates.get(i).cloned()).collect();
+                        modal=Some(crate::app::Modal {
+                            title:"Remove reviewed app leftovers?".into(),
+                            body:"Selected folders will move to the Recycle Bin. Registry keys are backed up before removal. Check the paths carefully: app preferences, profiles and saves can be included.".into(),
+                            details:chosen.iter().map(Candidate::label).collect(),
+                            note:Some("Shared paths, links, changes since the scan and newly installed apps are checked again before removal. The latest 16 registry cleanup backups are retained.".into()),
+                            confirm:"Remove selected leftovers".into(),danger:true,
+                            action:crate::app::Action::RemoveLeftovers(target.clone(),chosen),
+                        });
+                    }
+                }
+            });
         });
-        });
+        if modal.is_some() {
+            self.modal = modal;
+        }
     }
 }
 
@@ -922,5 +1012,43 @@ mod tests {
             },
         ));
         assert!(!valid_tree(&tree, 0, &mut 1024));
+    }
+    #[test]
+    fn native_registry_cleanup_has_persistent_reviewed_undo_and_generation_checks() {
+        let name = format!("PCSweepLeftoversE2E{}", std::process::id());
+        let t = target(&name);
+        let path = format!("Software\\{name}");
+        let root = RegKey::predef(HKEY_CURRENT_USER);
+        let key = create_key(&root, &path).unwrap();
+        key.set_value("Saved preference", &42u32).unwrap();
+        let tree = key_tree(&key, 0, &mut (1024 * 1024)).unwrap();
+        drop(key);
+        let item = Candidate {
+            item: Item::Registry(RegistryItem {
+                machine: false,
+                path: path.clone(),
+                tree,
+            }),
+            confidence: Confidence::Review,
+            evidence: vec!["disposable test key".into()],
+        };
+        let result = remove(t, vec![item]).unwrap();
+        assert!(result.starts_with("Removed 1"), "{result}");
+        assert!(root.open_subkey(&path).is_err());
+        let plan = restore_plan().unwrap();
+        assert_eq!(plan.product, name);
+        assert_eq!(plan.paths, vec![format!("HKCU\\{path}")]);
+        assert!(restore_registry(plan.stamp.saturating_sub(1)).is_err());
+        assert!(root.open_subkey(&path).is_err());
+        restore_registry(plan.stamp).unwrap();
+        assert_eq!(
+            root.open_subkey(&path)
+                .unwrap()
+                .get_value::<u32, _>("Saved preference")
+                .unwrap(),
+            42
+        );
+        root.delete_subkey_all(&path).unwrap();
+        assert!(restore_plan().is_err());
     }
 }

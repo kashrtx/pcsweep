@@ -41,6 +41,37 @@ pub enum Page {
     FileChanges,
 }
 
+fn nav_groups() -> [&'static [(Page, char, &'static str)]; 4] {
+    [
+        &[(Page::Dashboard, ic::HOME, "Overview")],
+        &[
+            (Page::Cleaner, ic::CLEAN, "Junk cleaner"),
+            (Page::Analyzer, ic::PIE, "Space analyzer"),
+            (Page::Storage, ic::DRIVE, "Disk health"),
+            (Page::Duplicates, ic::COPY, "Duplicates"),
+            (Page::Apps, ic::APPS, "Installed apps"),
+        ],
+        &[
+            (Page::Ads, ic::GLOBE, "Ads and tracking"),
+            (Page::Privacy, ic::LOCK, "Privacy and ads"),
+            (Page::Security, ic::SHIELD, "Security check"),
+            (Page::Startup, ic::POWER, "Startup apps"),
+            (Page::Background, ic::BOLT, "Background activity"),
+            (Page::Memory, ic::SPEED, "Memory and apps"),
+            (Page::Network, ic::GLOBE, "Connection health"),
+            (Page::Speed, ic::SPEED, "Internet speed test"),
+            (Page::Power, ic::POWER, "Battery and power"),
+        ],
+        &[
+            (Page::WindowsControls, ic::TOOLS, "Windows controls"),
+            (Page::FileChanges, ic::HISTORY, "Windows file changes"),
+            (Page::Tools, ic::TOOLS, "Tools"),
+            (Page::Updates, ic::UPDATE, "Updates"),
+            (Page::Activity, ic::HISTORY, "Activity log"),
+        ],
+    ]
+}
+
 const SESSION_KEY: &str = r"Software\PCSweep\Session";
 
 fn load_session() -> (Page, [f32; 2]) {
@@ -105,7 +136,7 @@ pub enum Action {
     RunTool(usize),
     Uninstall(crate::apps::InstalledApp),
     RemoveLeftovers(crate::leftovers::Target, Vec<crate::leftovers::Candidate>),
-    RestoreLeftoverRegistry,
+    RestoreLeftoverRegistry(u64),
     RecycleChecked(Vec<util::CheckedPath>),
     Privacy(crate::privacy::PrivacyAction),
     Preferences(crate::preferences::PreferencesAction),
@@ -241,22 +272,23 @@ impl App {
             else if !self.tray.available() { ui.label(widgets::dim("Starting the notification icon…")); }
             ui.add_space(10.0);
             ui.separator();
-            ui.label(widgets::strong("Readability", 17.0));
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Interface size");
-                for scale in [100,110,125,150] {
-                    ui.selectable_value(&mut self.appearance.scale, scale, format!("{scale}%"));
-                }
+            egui::CollapsingHeader::new("Readability and text").show(ui,|ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Interface size");
+                    for scale in [100,110,125,150] {
+                        ui.selectable_value(&mut self.appearance.scale,scale,format!("{scale}%"));
+                    }
+                });
+                ui.checkbox(&mut self.appearance.bold,"Use bolder text");
+                ui.add(egui::Label::new("Size and weight are remembered. Larger layouts can scroll sideways when needed. Windows display scaling also applies.").wrap());
             });
-            ui.checkbox(&mut self.appearance.bold, "Use bolder text");
-            ui.add(egui::Label::new("Size and weight are remembered. Larger layouts can scroll sideways when needed. Windows display scaling also applies.").wrap());
             ui.separator();
-            ui.checkbox(&mut elevated, "Ask to start as administrator on future launches");
-            ui.add(egui::Label::new("Windows will ask for UAC approval. Canceling opens PCSweep normally. You can also restart as admin only when needed.").wrap());
-            ui.add_space(10.0);
             ui.checkbox(&mut automatic, "Check for PCSweep updates automatically once a day");
             ui.add(egui::Label::new("Works while the window is open or PCSweep is running in the background. Checks contact GitHub; updates install only when you choose. PCSweep does not add itself to Windows startup.").wrap());
             if ui.add(widgets::small("Open Updates")).clicked() { self.page = Page::Updates; }
+            ui.separator();
+            ui.checkbox(&mut elevated,"Ask to start as administrator on future launches");
+            ui.add(egui::Label::new("Windows asks for UAC approval. Canceling opens PCSweep normally. Administrator restart is also available when needed.").wrap());
         });
         self.app_options_open = open;
         if self.appearance != previous_appearance {
@@ -450,10 +482,10 @@ impl App {
                         Task::spawn(ctx, move || crate::leftovers::remove(target, items));
                 }
             }
-            Action::RestoreLeftoverRegistry => {
+            Action::RestoreLeftoverRegistry(stamp) => {
                 if !self.mutations_running() {
                     self.apps.leftovers.removal =
-                        Task::spawn(ctx, crate::leftovers::restore_registry);
+                        Task::spawn(ctx, move || crate::leftovers::restore_registry(stamp));
                 }
             }
             Action::Privacy(action) => self.execute_privacy(action, ctx),
@@ -550,8 +582,103 @@ impl App {
 
     // ------------------------------------------------------------ sidebar
 
-    pub(crate) fn sidebar(&mut self, ui: &mut Ui) {
+    pub(crate) fn compact_navigation(&self, ctx: &egui::Context) -> bool {
+        self.appearance.scale > 100 && ctx.screen_rect().width() < 1120.0
+    }
+    pub(crate) fn navigation_width(&self, ctx: &egui::Context) -> f32 {
+        if self.compact_navigation(ctx) {
+            74.0
+        } else {
+            236.0
+        }
+    }
+    pub(crate) fn compact_sidebar(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
+        let mode = egui::Id::new("pcsweep.nav_compact");
+        let was_compact = ctx.data(|d| d.get_temp::<bool>(mode)).unwrap_or(false);
+        ctx.data_mut(|d| d.insert_temp(mode, true));
+        if !was_compact || self.last_nav_page != Some(self.page) {
+            self.reveal_nav_frames = 3;
+        }
+        let reveal = self.reveal_nav_frames > 0;
+        self.reveal_nav_frames = self.reveal_nav_frames.saturating_sub(1);
+        self.last_nav_page = Some(self.page);
+        ui.vertical_centered(|ui| {
+            ui.label(widgets::strong("PC", 21.0))
+                .on_hover_text("PCSweep");
+            ui.add_space(10.0);
+            ScrollArea::vertical()
+                .id_salt("compact_navigation")
+                .max_height((ui.available_height() - 120.0).max(80.0))
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for group in nav_groups() {
+                        for &(page, icon, label) in group {
+                            let response = ui
+                                .add(
+                                    egui::Button::new(widgets::icon(
+                                        icon,
+                                        20.0,
+                                        if self.page == page { ACCENT } else { TEXT_DIM },
+                                    ))
+                                    .fill(if self.page == page {
+                                        ACCENT_SOFT
+                                    } else {
+                                        SIDEBAR
+                                    })
+                                    .min_size(vec2(40.0, 38.0)),
+                                )
+                                .on_hover_text(label);
+                            response.widget_info(|| {
+                                egui::WidgetInfo::selected(
+                                    egui::WidgetType::SelectableLabel,
+                                    true,
+                                    self.page == page,
+                                    label,
+                                )
+                            });
+                            if response.clicked() {
+                                self.page = page;
+                            }
+                            if self.page == page && reveal {
+                                response.scroll_to_me(Some(Align::Center));
+                            }
+                        }
+                        ui.add_space(8.0);
+                    }
+                });
+        });
+        ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
+            if ui
+                .add(widgets::small(widgets::icon(ic::TOOLS, 19.0, TEXT_DIM)))
+                .on_hover_text("PCSweep options and text size")
+                .clicked()
+            {
+                self.app_options_open = true;
+            }
+            if self.is_admin {
+                ui.label(widgets::icon(ic::SHIELD, 17.0, GOOD))
+                    .on_hover_text("Running as administrator");
+            } else if ui
+                .add_enabled(
+                    !self.relaunch.running(),
+                    widgets::small(widgets::icon(ic::SHIELD, 19.0, WARN)),
+                )
+                .on_hover_text("Restart as administrator")
+                .clicked()
+            {
+                self.relaunch_admin(&ctx);
+            }
+        });
+    }
+
+    pub(crate) fn sidebar(&mut self, ui: &mut Ui) {
+        if self.compact_navigation(ui.ctx()) {
+            self.compact_sidebar(ui);
+            return;
+        }
+        let ctx = ui.ctx().clone();
+        ctx.data_mut(|d| d.insert_temp(egui::Id::new("pcsweep.nav_compact"), false));
         ui.horizontal(|ui| {
             let (rect, _) = ui.allocate_exact_size(vec2(36.0, 36.0), egui::Sense::hover());
             ui.painter()
@@ -593,34 +720,7 @@ impl App {
             Some(format!("{} on", self.startup.enabled_count()))
         };
 
-        let nav: [&[(Page, char, &str)]; 4] = [
-            &[(Page::Dashboard, ic::HOME, "Overview")],
-            &[
-                (Page::Cleaner, ic::CLEAN, "Junk cleaner"),
-                (Page::Analyzer, ic::PIE, "Space analyzer"),
-                (Page::Storage, ic::DRIVE, "Disk health"),
-                (Page::Duplicates, ic::COPY, "Duplicates"),
-                (Page::Apps, ic::APPS, "Installed apps"),
-            ],
-            &[
-                (Page::Ads, ic::GLOBE, "Ads and tracking"),
-                (Page::Privacy, ic::LOCK, "Privacy and ads"),
-                (Page::Security, ic::SHIELD, "Security check"),
-                (Page::Startup, ic::POWER, "Startup apps"),
-                (Page::Background, ic::BOLT, "Background activity"),
-                (Page::Memory, ic::SPEED, "Memory and apps"),
-                (Page::Network, ic::GLOBE, "Connection health"),
-                (Page::Speed, ic::SPEED, "Internet speed test"),
-                (Page::Power, ic::POWER, "Battery and power"),
-            ],
-            &[
-                (Page::WindowsControls, ic::TOOLS, "Windows controls"),
-                (Page::FileChanges, ic::HISTORY, "Windows file changes"),
-                (Page::Tools, ic::TOOLS, "Tools"),
-                (Page::Updates, ic::UPDATE, "Updates"),
-                (Page::Activity, ic::HISTORY, "Activity log"),
-            ],
-        ];
+        let nav = nav_groups();
         if self.last_nav_page != Some(self.page) {
             // ScrollArea settles its viewport over the first layout passes.
             self.reveal_nav_frames = 3;
@@ -749,7 +849,7 @@ impl App {
                 .id_salt("readable_page")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    ui.set_min_width(744.0_f32.max(ui.available_width()));
+                    ui.set_min_width(640.0_f32.max(ui.available_width()));
                     self.render_page(ui);
                 });
         } else {
@@ -1049,7 +1149,7 @@ impl eframe::App for App {
 
         let enabled = self.modal.is_none();
         egui::SidePanel::left("nav")
-            .exact_width(236.0)
+            .exact_width(self.navigation_width(ctx))
             .resizable(false)
             .show_separator_line(false)
             .frame(

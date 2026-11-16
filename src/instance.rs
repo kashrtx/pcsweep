@@ -72,7 +72,10 @@ fn acquire_named(name: &str, activate: bool) -> Result<Option<Guard>, String> {
     let (handle, duplicate) = if existing != 0 {
         (existing, true)
     } else {
-        let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+        let handle = unsafe {
+            SetLastError(0);
+            CreateMutexW(std::ptr::null(), 0, name.as_ptr())
+        };
         let error = unsafe { GetLastError() };
         if handle == 0 {
             return Err(format!(
