@@ -100,6 +100,19 @@ pub fn strong(text: impl Into<String>, size: f32) -> RichText {
     RichText::new(text.into()).font(semibold(size)).color(TEXT)
 }
 
+fn motion(ui: &Ui, id: egui::Id, target: bool) -> f32 {
+    let duration = ui.style().animation_time;
+    if duration <= 0.0 {
+        if target {
+            1.0
+        } else {
+            0.0
+        }
+    } else {
+        ui.ctx().animate_bool_with_time(id, target, duration)
+    }
+}
+
 pub fn page_header(ui: &mut Ui, title: &str, subtitle: &str) {
     ui.label(RichText::new(title).font(semibold(28.0)).color(TEXT));
     ui.label(dim(subtitle));
@@ -286,7 +299,7 @@ pub fn toggle(ui: &mut Ui, on: bool, enabled: bool) -> Response {
         Sense::hover()
     };
     let (rect, resp) = ui.allocate_exact_size(size, sense);
-    let t = ui.ctx().animate_bool(resp.id, on);
+    let t = motion(ui, resp.id, on);
     let off_col = Color32::from_rgb(58, 66, 86);
     let mut track = mix(off_col, ACCENT_STRONG, t);
     if !enabled {
@@ -313,27 +326,33 @@ pub fn nav_item(
 ) -> Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::click());
     let hovered = resp.hovered();
+    let selected_t = motion(ui, resp.id.with("selection"), selected);
+    let hover_t = motion(ui, resp.id.with("hover"), hovered);
     let painter = ui.painter();
-    if selected {
-        painter.rect_filled(rect, Rounding::same(9.0), ACCENT_SOFT);
+    if selected_t > 0.0 {
+        painter.rect_filled(
+            rect,
+            Rounding::same(9.0),
+            mix(SIDEBAR, ACCENT_SOFT, selected_t),
+        );
         painter.rect_filled(
             Rect::from_min_size(
                 pos2(rect.left(), rect.top() + 10.0),
-                vec2(3.0, rect.height() - 20.0),
+                vec2(3.0, (rect.height() - 20.0) * selected_t),
             ),
             Rounding::same(2.0),
-            ACCENT,
+            mix(SIDEBAR, ACCENT, selected_t),
         );
-    } else if hovered {
-        painter.rect_filled(rect, Rounding::same(9.0), CARD);
+    } else if hover_t > 0.0 {
+        painter.rect_filled(rect, Rounding::same(9.0), mix(SIDEBAR, CARD, hover_t));
     }
-    let fg = if selected || hovered { TEXT } else { TEXT_DIM };
+    let fg = mix(TEXT_DIM, TEXT, selected_t.max(hover_t));
     painter.text(
         pos2(rect.left() + 16.0, rect.center().y),
         Align2::LEFT_CENTER,
         icon_char,
         icon_font(16.0),
-        if selected { ACCENT } else { fg },
+        mix(fg, ACCENT, selected_t),
     );
     painter.text(
         pos2(rect.left() + 44.0, rect.center().y),
@@ -368,9 +387,16 @@ pub fn row<R>(ui: &mut Ui, height: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
         },
     );
     let rect = inner.response.rect;
-    if ui.rect_contains_pointer(rect) {
-        ui.painter()
-            .set(bg, Shape::rect_filled(rect, Rounding::same(8.0), CARD_HI));
+    let hover_t = motion(
+        ui,
+        inner.response.id.with("row-hover"),
+        ui.rect_contains_pointer(rect),
+    );
+    if hover_t > 0.0 {
+        ui.painter().set(
+            bg,
+            Shape::rect_filled(rect, Rounding::same(8.0), mix(BG, CARD_HI, hover_t)),
+        );
     }
     inner.inner
 }

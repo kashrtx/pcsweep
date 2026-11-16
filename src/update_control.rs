@@ -46,6 +46,8 @@ impl ServiceState {
 enum Phase {
     DisablePrepared,
     Disabled,
+    EnablePrepared,
+    Enabled,
     RestorePrepared,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,13 +60,30 @@ struct Undo {
     restore_from: Option<ServiceState>,
 }
 impl Undo {
+    fn enables(&self) -> bool {
+        self.original.start == SERVICE_DISABLED
+    }
+    fn target(&self) -> ServiceState {
+        if self.enables() {
+            ServiceState {
+                start: SERVICE_DEMAND_START,
+                delayed: false,
+                state: SERVICE_STOPPED,
+            }
+        } else {
+            self.original.disabled()
+        }
+    }
     fn validate(&self) -> Result<(), String> {
         if self.version != 1
             || !matches!(
                 self.original.start,
-                SERVICE_AUTO_START | SERVICE_DEMAND_START
+                SERVICE_AUTO_START | SERVICE_DEMAND_START | SERVICE_DISABLED
             )
             || !self.original.stable()
+            || (self.enables() && self.original.state != SERVICE_STOPPED)
+            || (matches!(self.phase, Phase::EnablePrepared | Phase::Enabled) && !self.enables())
+            || (matches!(self.phase, Phase::DisablePrepared | Phase::Disabled) && self.enables())
             || chrono::DateTime::parse_from_rfc3339(&self.started).is_err()
             || (self.phase == Phase::RestorePrepared) != self.restore_from.is_some()
         {
@@ -73,7 +92,7 @@ impl Undo {
             );
         }
         if let Some(from) = &self.restore_from {
-            if !from.stable() || !from.config_during_change(&self.original.disabled()) {
+            if !from.stable() || !from.config_during_change(&self.target()) {
                 return Err("The saved Windows Update service recovery state is invalid.".into());
             }
         }
@@ -83,7 +102,7 @@ impl Undo {
         if current == &self.original {
             return true;
         }
-        let disabled = self.original.disabled();
+        let disabled = self.target();
         match self.phase {
             Phase::DisablePrepared => {
                 current.config_during_change(&disabled)
@@ -93,6 +112,14 @@ impl Undo {
                     )
             }
             Phase::Disabled => current == &disabled,
+            Phase::EnablePrepared => {
+                current.config_during_change(&disabled)
+                    && matches!(
+                        current.state,
+                        SERVICE_STOPPED | SERVICE_RUNNING | SERVICE_START_PENDING
+                    )
+            }
+            Phase::Enabled => current.config_eq(&disabled) && current.stable(),
             Phase::RestorePrepared => {
                 let Some(from) = &self.restore_from else {
                     return false;
@@ -116,6 +143,8 @@ pub struct Snapshot {
     pub undo_available: bool,
     pub restore_available: bool,
     pub disable_available: bool,
+    pub enable_available: bool,
+    pub undo_restores_disabled: bool,
     pub since_disabled: Option<String>,
     pub warning: Option<String>,
     raw: ServiceState,
@@ -137,15 +166,15 @@ fn snapshot(current: ServiceState, undo: Result<Option<Undo>, String>) -> Snapsh
     let warning = match &undo {
         Err(e) => Some(e.clone()),
         Ok(Some(saved)) if !saved.owns(&current) => Some("Windows or another program changed the service after PCSweep. That change is preserved; automatic restoration is blocked.".into()),
-        Ok(Some(saved)) if saved.phase == Phase::Disabled && current == saved.original => Some("Windows or another program has already restored the original service state. The service is no longer disabled by this saved change; Restore clears the completed Undo record.".into()),
-        Ok(Some(saved)) if saved.phase != Phase::Disabled => Some("A previous service operation was interrupted or only partly completed. Restore the saved service before another change.".into()),
+        Ok(Some(saved)) if matches!(saved.phase, Phase::Disabled | Phase::Enabled) && current == saved.original => Some("Windows or another program has already restored the saved original service state. Review its current mode; Undo clears the completed saved change.".into()),
+        Ok(Some(saved)) if !matches!(saved.phase, Phase::Disabled | Phase::Enabled) => Some("A previous service operation was interrupted or only partly completed. Restore the saved service before another change.".into()),
         _ => None,
     };
     let since_disabled = undo
         .as_ref()
         .ok()
         .and_then(|v| v.as_ref())
-        .filter(|u| current.start == SERVICE_DISABLED && u.owns(&current))
+        .filter(|u| !u.enables() && current.start == SERVICE_DISABLED && u.owns(&current))
         .map(|u| u.started.clone());
     Snapshot {
         start_mode: match current.start {
@@ -179,6 +208,14 @@ fn snapshot(current: ServiceState, undo: Result<Option<Undo>, String>) -> Snapsh
         disable_available: matches!(&undo, Ok(None))
             && current.stable()
             && matches!(current.start, SERVICE_AUTO_START | SERVICE_DEMAND_START),
+        enable_available: matches!(&undo, Ok(None))
+            && current.start == SERVICE_DISABLED
+            && current.state == SERVICE_STOPPED,
+        undo_restores_disabled: undo
+            .as_ref()
+            .ok()
+            .and_then(|v| v.as_ref())
+            .is_some_and(Undo::enables),
         since_disabled,
         warning,
         raw: current,
@@ -255,6 +292,40 @@ fn disable_transaction(
     backend.save(&Some(undo))?;
     Ok("Windows Update service is Disabled and Stopped, confirmed by Windows. Windows may repair or re-enable it later. Restore returns the saved start mode and running state.".into())
 }
+
+fn enable_transaction(
+    backend: &mut impl Backend,
+    expected: &str,
+    now: String,
+) -> Result<String, String> {
+    let (original, existing) = read_reviewed(backend, expected)?;
+    if existing.is_some() || original.start != SERVICE_DISABLED || original.state != SERVICE_STOPPED
+    {
+        return Err("Only a stopped, already-disabled service without an existing PCSweep Undo can use this explicit enabling action. Refresh its state first.".into());
+    }
+    let mut undo = Undo {
+        version: 1,
+        original: original.clone(),
+        phase: Phase::EnablePrepared,
+        started: now,
+        restore_from: None,
+    };
+    undo.validate()?;
+    backend.save(&Some(undo.clone()))?;
+    if backend.read()? != original {
+        return Err(
+            "The service changed while saving Undo. No service write was attempted.".into(),
+        );
+    }
+    backend.set_start(SERVICE_DEMAND_START, false)?;
+    let current = backend.read()?;
+    if !current.config_eq(&undo.target()) || !current.stable() {
+        return Err("Windows has not confirmed the Manual/trigger-start configuration. The saved original disabled state remains recoverable through Undo.".into());
+    }
+    undo.phase = Phase::Enabled;
+    backend.save(&Some(undo))?;
+    Ok(format!("Windows Update service is enabled for Manual/trigger start and currently {}. PCSweep did not start or stop it. Your previous Disabled state is saved for Undo; update policies and pauses are unchanged.", if current.state == SERVICE_RUNNING { "Running" } else { "Stopped" }))
+}
 fn restore_transaction(backend: &mut impl Backend, expected: &str) -> Result<String, String> {
     let (mut current, undo) = read_reviewed(backend, expected)?;
     let mut undo = undo.ok_or("There is no PCSweep service change to restore.")?;
@@ -279,7 +350,7 @@ fn restore_transaction(backend: &mut impl Backend, expected: &str) -> Result<Str
     if undo.phase != Phase::RestorePrepared {
         // An original config with a different runtime state was never a result
         // of our disable sequence, whose first write always disables starts.
-        if !current.config_during_change(&undo.original.disabled()) {
+        if !current.config_during_change(&undo.target()) {
             return Err(
                 "The service configuration changed outside PCSweep. It was preserved.".into(),
             );
@@ -787,6 +858,15 @@ pub fn disable(expected: String) -> Result<String, String> {
         chrono::Utc::now().to_rfc3339(),
     )
 }
+pub fn enable(expected: String) -> Result<String, String> {
+    mutation_guard()?;
+    let _lock = Lock::take()?;
+    enable_transaction(
+        &mut NativeBackend::open(true)?,
+        &expected,
+        chrono::Utc::now().to_rfc3339(),
+    )
+}
 pub fn restore(expected: String) -> Result<String, String> {
     mutation_guard()?;
     let _lock = Lock::take()?;
@@ -995,6 +1075,51 @@ mod tests {
         f.fail_save = Some(1);
         assert!(disable_fake(&mut f).is_err());
         assert_eq!(f.writes, 0);
+    }
+    #[test]
+    fn explicitly_enabling_a_preexisting_block_preserves_it_for_exact_undo() {
+        for delayed in [false, true] {
+            let mut f = Fake::new(SERVICE_DISABLED, SERVICE_STOPPED, delayed);
+            let original = f.current.clone();
+            assert!(snapshot(f.current.clone(), Ok(None)).enable_available);
+            let fp = f.expected();
+            enable_transaction(&mut f, &fp, "2026-11-16T00:00:00Z".into()).unwrap();
+            assert_eq!(f.current.start, SERVICE_DEMAND_START);
+            assert_eq!(f.current.state, SERVICE_STOPPED);
+            assert!(!f.current.delayed);
+            // Windows can legitimately trigger-start an enabled Manual service.
+            f.current.state = SERVICE_RUNNING;
+            assert!(snapshot(f.current.clone(), Ok(f.undo.clone())).restore_available);
+            restore_fake(&mut f).unwrap();
+            assert_eq!(f.current, original);
+            assert!(f.undo.is_none());
+        }
+    }
+    #[test]
+    fn enabling_requires_review_and_durable_undo_and_legacy_records_still_decode() {
+        let mut f = Fake::new(SERVICE_DISABLED, SERVICE_STOPPED, false);
+        let fp = f.expected();
+        f.fail_save = Some(1);
+        assert!(enable_transaction(&mut f, &fp, "2026-11-16T00:00:00Z".into()).is_err());
+        assert_eq!(f.writes, 0);
+        f.fail_save = None;
+        assert!(enable_transaction(&mut f, "stale", "2026-11-16T00:00:00Z".into()).is_err());
+        assert_eq!(f.writes, 0);
+        let old = Undo {
+            version: 1,
+            original: ServiceState {
+                start: SERVICE_DEMAND_START,
+                delayed: false,
+                state: SERVICE_RUNNING,
+            },
+            phase: Phase::Disabled,
+            started: "2026-11-15T00:00:00Z".into(),
+            restore_from: None,
+        };
+        let saved = serde_json::to_vec(&old).unwrap();
+        let decoded: Undo = serde_json::from_slice(&saved).unwrap();
+        decoded.validate().unwrap();
+        assert!(!decoded.enables());
     }
     #[test]
     fn failed_stop_preserves_undo_and_restores_partial_disable() {
@@ -1301,6 +1426,16 @@ mod tests {
                 assert_eq!(backend.read().unwrap(), original);
                 assert!(backend.undo.is_none());
             }
+            backend.native.set_start(SERVICE_DISABLED, false).unwrap();
+            let original = backend.read().unwrap();
+            let reviewed = fingerprint(&original, &None).unwrap();
+            enable_transaction(&mut backend, &reviewed, "2026-11-16T00:00:00Z".into()).unwrap();
+            assert_eq!(backend.read().unwrap().start, SERVICE_DEMAND_START);
+            assert_eq!(backend.read().unwrap().state, SERVICE_STOPPED);
+            let reviewed = fingerprint(&backend.read().unwrap(), &backend.undo).unwrap();
+            restore_transaction(&mut backend, &reviewed).unwrap();
+            assert_eq!(backend.read().unwrap(), original);
+            assert!(backend.undo.is_none());
         }
         fixture
             .remove()

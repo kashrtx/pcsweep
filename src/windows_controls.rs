@@ -1050,8 +1050,12 @@ pub enum WindowsControlsAction {
     DisableService {
         expected: String,
     },
+    EnableService {
+        expected: String,
+    },
     RestoreService {
         expected: String,
+        restores_disabled: bool,
     },
     ForgetService {
         expected: String,
@@ -1127,7 +1131,10 @@ fn execute(action: WindowsControlsAction) -> Result<String, String> {
         WindowsControlsAction::DisableService { expected } => {
             crate::update_control::disable(expected)
         }
-        WindowsControlsAction::RestoreService { expected } => {
+        WindowsControlsAction::EnableService { expected } => {
+            crate::update_control::enable(expected)
+        }
+        WindowsControlsAction::RestoreService { expected, .. } => {
             crate::update_control::restore(expected)
         }
         WindowsControlsAction::ForgetService { expected } => {
@@ -1344,7 +1351,8 @@ fn render_update_controls(
                         let enabled = !busy && admin && snapshot.service_guard.is_ok();
                         ui.horizontal_wrapped(|ui| {
                             if ui.add_enabled(enabled && service.disable_available, widgets::small("Turn Windows Update service off…")).clicked() { *action = Some(WindowsControlsAction::DisableService { expected: expected.clone() }); }
-                            if ui.add_enabled(enabled && service.restore_available, widgets::small("Restore Windows Update service…")).clicked() { *action = Some(WindowsControlsAction::RestoreService { expected: expected.clone() }); }
+                            if ui.add_enabled(enabled && service.enable_available, widgets::small("Enable service with Manual start…")).clicked() { *action = Some(WindowsControlsAction::EnableService { expected: expected.clone() }); }
+                            if ui.add_enabled(enabled && service.restore_available, widgets::small(if service.undo_restores_disabled { "Undo service enabling — turn off…" } else { "Restore Windows Update service…" })).clicked() { *action = Some(WindowsControlsAction::RestoreService { expected: expected.clone(), restores_disabled: service.undo_restores_disabled }); }
                             if service.undo_available && !service.restore_available && ui.add_enabled(!busy && admin, widgets::small("Forget stale service Undo…")).clicked() { *action = Some(WindowsControlsAction::ForgetService { expected }); }
                         });
                     }
@@ -1377,7 +1385,19 @@ impl App {
         if let Some(result) = self.windows_controls.load.poll() {
             self.windows_controls.loaded = true;
             match result.and_then(|r| r) {
-                Ok(snapshot) => self.windows_controls.snapshot = Some(snapshot),
+                Ok(snapshot) => {
+                    if let Some(motion) = snapshot
+                        .values
+                        .iter()
+                        .find(|(id, _)| id == "client_animation")
+                        .and_then(|(_, v)| v.as_ref().ok())
+                        .and_then(|v| v.as_ref())
+                        .and_then(Value::number)
+                    {
+                        crate::theme::set_motion(ctx, motion != 0);
+                    }
+                    self.windows_controls.snapshot = Some(snapshot);
+                }
                 Err(e) => self.windows_controls.error = Some(e),
             }
         }
@@ -1593,7 +1613,9 @@ impl App {
                 WindowsControlsAction::Set {control,..} if control=="pause" => ("Pause Windows updates for up to 35 days?","Apply the supported feature and quality update pause policies starting today. Windows resumes after 35 days unless you resume earlier. Current recognized policy values are saved exactly for Undo. Updates already installing and other update channels may continue. The app will show Windows' observed pause status separately from the requested policy.",false),
                 WindowsControlsAction::Resume {..} => ("Resume the PCSweep update pause?","Restore the exact pause settings saved before PCSweep's change. Other update modes and service controls stay as they are. If a pause was already present before PCSweep, restoring it may keep that earlier pause active; the observed Windows status is shown after refresh.",false),
                 WindowsControlsAction::DisableService {..} => ("Disable the Windows Update service?","Set the Windows Update service (wuauserv) to Disabled and ask it to stop. This is a stronger advanced control, available on Home as well as Pro. Windows Update checks and updates that depend on this service will stop working while it is disabled. Save ongoing work first; an installation already in progress may continue. PCSweep saves the exact current service mode and running state before changing anything. Windows can repair or re-enable the service later. No protected services, tasks, permissions or update endpoints are changed.",true),
-                WindowsControlsAction::RestoreService {..} => ("Restore the Windows Update service?","Restore only the service start mode, delayed-start flag and running state saved before PCSweep's service block. Existing update policies and pauses stay unchanged. An outside change to the service configuration is preserved.",false),
+                WindowsControlsAction::EnableService {..} => ("Enable the previously disabled Windows Update service?", "Change this stopped service from Disabled to Manual/trigger start, so Windows can start it when needed. PCSweep does not force it to start or change update policies or pauses. The current disabled state and delayed-start flag are saved exactly for Undo. This is an explicit choice for a pre-existing block, not a guessed restoration of Windows defaults.", false),
+                WindowsControlsAction::RestoreService { restores_disabled: true, .. } => ("Undo service enabling and turn it off again?", "Restore the Disabled and Stopped state saved before you explicitly enabled this service. Windows Update checks will stop working again. Update policies and pauses stay unchanged; an outside service configuration change is preserved.", true),
+                WindowsControlsAction::RestoreService {..} => ("Restore the Windows Update service?","Restore only the service start mode, delayed-start flag and running state saved before PCSweep's service change. Existing update policies and pauses stay unchanged. An outside change to the service configuration is preserved.",false),
                 WindowsControlsAction::ForgetService {..} => ("Forget the stale service Undo?","Keep Windows' current service configuration and discard only the saved PCSweep service Undo that no longer matches it. This does not start, stop or configure a service.",true),
                 WindowsControlsAction::Set { control, .. } if control == "exclude_drivers" => {
                     ("Exclude drivers from quality updates?", "This requests Windows' supported driver-exclusion policy. It does not block every driver installation channel or update already in progress. Keep manufacturer driver updates under review. Undo restores the saved policy value.", false)

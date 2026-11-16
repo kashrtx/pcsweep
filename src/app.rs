@@ -254,6 +254,7 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::setup_fonts(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx);
+        theme::read_windows_motion(&cc.egui_ctx);
         let is_admin = system::is_admin();
         let (page, last_window_size) = load_session();
         let keep_background = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)

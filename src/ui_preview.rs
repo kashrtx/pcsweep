@@ -1469,6 +1469,11 @@ fn direct_game_mode_choice_prepares_a_preference_change_inside_the_app() {
 
 fn collect_image_rects(shape: &Shape, clip: Rect, found: &mut Vec<Rect>) {
     match shape {
+        Shape::Rect(rect) if rect.fill_texture_id != TextureId::Managed(0) => {
+            if clip.contains_rect(rect.rect) {
+                found.push(rect.rect);
+            }
+        }
         Shape::Mesh(mesh) if mesh.texture_id != TextureId::Managed(0) => {
             let rect = mesh.calc_bounds();
             if clip.contains_rect(rect) {

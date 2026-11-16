@@ -174,6 +174,10 @@ pub fn apply(ctx: &egui::Context) {
     style.spacing.icon_width = 18.0;
     style.spacing.icon_width_inner = 10.0;
     style.spacing.icon_spacing = 6.0;
+    let motion = ctx
+        .data(|data| data.get_temp::<bool>(egui::Id::new("pcsweep.motion")))
+        .unwrap_or(true);
+    style.animation_time = if motion { 0.14 } else { 0.0 };
     // Reserve a real gutter consistently, rather than drawing an expanding
     // floating thumb over file names or placing it against content-width text.
     style.spacing.scroll = egui::style::ScrollStyle {
@@ -229,4 +233,30 @@ pub fn apply(ctx: &egui::Context) {
     }
     style.visuals = v;
     ctx.set_style(style);
+}
+
+pub fn set_motion(ctx: &egui::Context, enabled: bool) {
+    ctx.data_mut(|data| data.insert_temp(egui::Id::new("pcsweep.motion"), enabled));
+    let duration = if enabled { 0.14 } else { 0.0 };
+    if (ctx.style().animation_time - duration).abs() > f32::EPSILON {
+        ctx.style_mut(|style| style.animation_time = duration);
+    }
+}
+
+pub fn read_windows_motion(ctx: &egui::Context) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SystemParametersInfoW, SPI_GETCLIENTAREAANIMATION,
+    };
+    let mut enabled = 1i32;
+    if unsafe {
+        SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            (&mut enabled as *mut i32).cast(),
+            0,
+        )
+    } != 0
+    {
+        set_motion(ctx, enabled != 0);
+    }
 }
