@@ -700,39 +700,7 @@ impl App {
     fn render_memory_summary(&self, ui: &mut Ui, color: egui::Color32, acts: &mut Vec<MAct>) {
         let s = &self.sys;
         widgets::card(ui, |ui| {
-            ui.horizontal(|ui| {
-                let frac = s.mem_frac();
-                let percent = format!("{:.0}%", frac * 100.0);
-                widgets::ring(ui, frac, 64.0, 7.0, color, &percent, "RAM");
-                ui.add_space(6.0);
-                ui.vertical(|ui| {
-                    let available = format!("{} available", fmt_bytes(s.mem_avail));
-                    ui.label(widgets::strong(available, 16.0));
-                    ui.label(widgets::dim(format!(
-                        "{} in use of {}",
-                        fmt_bytes(s.mem_used),
-                        fmt_bytes(s.mem_total)
-                    )));
-                });
-                ui.add_space(24.0);
-                ui.vertical(|ui| {
-                    ui.label(widgets::strong("Committed memory", 14.0));
-                    if s.memory_info_available {
-                        ui.label(widgets::dim(format!(
-                            "{} of {} limit",
-                            fmt_bytes(s.commit_total),
-                            fmt_bytes(s.commit_limit)
-                        )));
-                    } else {
-                        ui.label(widgets::dim("Unavailable"));
-                    }
-                });
-                ui.add_space(24.0);
-                ui.vertical(|ui| {
-                    ui.label(widgets::strong(format!("CPU {:.0}%", s.cpu), 14.0));
-                    ui.label(widgets::dim(format!("{} logical cores", s.cores)))
-                        .on_hover_text(&s.cpu_name);
-                });
+            if ui.available_width() < 800.0 {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let label = if self.mem.details {
                         "Fewer details"
@@ -742,8 +710,96 @@ impl App {
                     if ui.add(widgets::small(label)).clicked() {
                         acts.push(MAct::Details(!self.mem.details));
                     }
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        let frac = s.mem_frac();
+                        widgets::ring(
+                            ui,
+                            frac,
+                            48.0,
+                            5.0,
+                            color,
+                            &format!("{:.0}%", frac * 100.0),
+                            "RAM",
+                        );
+                        ui.vertical(|ui| {
+                            ui.add(
+                                egui::Label::new(widgets::strong(
+                                    format!("{} available", fmt_bytes(s.mem_avail)),
+                                    15.0,
+                                ))
+                                .truncate(),
+                            );
+                            let commit = if s.memory_info_available {
+                                format!(
+                                    "Commit {} / {}",
+                                    fmt_bytes(s.commit_total),
+                                    fmt_bytes(s.commit_limit)
+                                )
+                            } else {
+                                "Commit unavailable".into()
+                            };
+                            ui.add(
+                                egui::Label::new(widgets::dim(format!(
+                                    "{commit} · CPU {:.0}%",
+                                    s.cpu
+                                )))
+                                .truncate(),
+                            )
+                            .on_hover_text(format!(
+                                "{} in use of {} RAM · {} logical cores",
+                                fmt_bytes(s.mem_used),
+                                fmt_bytes(s.mem_total),
+                                s.cores
+                            ));
+                        });
+                    });
                 });
-            });
+            } else {
+                ui.horizontal(|ui| {
+                    let frac = s.mem_frac();
+                    let percent = format!("{:.0}%", frac * 100.0);
+                    widgets::ring(ui, frac, 64.0, 7.0, color, &percent, "RAM");
+                    ui.add_space(6.0);
+                    ui.vertical(|ui| {
+                        let available = format!("{} available", fmt_bytes(s.mem_avail));
+                        ui.label(widgets::strong(available, 16.0));
+                        ui.label(widgets::dim(format!(
+                            "{} in use of {}",
+                            fmt_bytes(s.mem_used),
+                            fmt_bytes(s.mem_total)
+                        )));
+                    });
+                    ui.add_space(24.0);
+                    ui.vertical(|ui| {
+                        ui.label(widgets::strong("Committed memory", 14.0));
+                        if s.memory_info_available {
+                            ui.label(widgets::dim(format!(
+                                "{} of {} limit",
+                                fmt_bytes(s.commit_total),
+                                fmt_bytes(s.commit_limit)
+                            )));
+                        } else {
+                            ui.label(widgets::dim("Unavailable"));
+                        }
+                    });
+                    ui.add_space(24.0);
+                    ui.vertical(|ui| {
+                        ui.label(widgets::strong(format!("CPU {:.0}%", s.cpu), 14.0));
+                        ui.label(widgets::dim(format!("{} logical cores", s.cores)))
+                            .on_hover_text(&s.cpu_name);
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let label = if self.mem.details {
+                            "Fewer details"
+                        } else {
+                            "More details"
+                        };
+                        if ui.add(widgets::small(label)).clicked() {
+                            acts.push(MAct::Details(!self.mem.details));
+                        }
+                    });
+                });
+            }
             if self.mem.details {
                 ui.separator();
                 ui.horizontal_wrapped(|ui| {

@@ -2052,6 +2052,47 @@ fn enlarged_bold_interface_keeps_all_pages_reachable() {
                 [900, 520],
                 &format!("readable-{scale}-{page:?}.png"),
             );
+            if page == Page::Memory {
+                let more = text_rect(&output, "More details");
+                let stats = format!(
+                    "Commit {} / {} · CPU {:.0}%",
+                    crate::util::fmt_bytes(app.sys.commit_total),
+                    crate::util::fmt_bytes(app.sys.commit_limit),
+                    app.sys.cpu
+                );
+                let stats_rect = text_rect(&output, &stats);
+                assert!(
+                    !stats_rect.intersects(more),
+                    "summary statistics must not overlap the details control"
+                );
+                let heading = text_rect(&output, "Memory and running apps");
+                let events = vec![
+                    egui::Event::PointerMoved(heading.center()),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, -1000.0),
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ];
+                let frame = shipment_frame(&ctx, &mut app, [900, 520], events);
+                upload_preview_textures(&mut painter, &frame);
+                let mut scrolled = frame;
+                for _ in 0..20 {
+                    scrolled = shipment_frame(&ctx, &mut app, [900, 520], Vec::new());
+                    upload_preview_textures(&mut painter, &scrolled);
+                }
+                assert!(
+                    !visible_texts(&scrolled, "chrome.exe").is_empty(),
+                    "enlarged memory lists must remain reachable by scrolling"
+                );
+                save_shipment_preview(
+                    &ctx,
+                    &painter,
+                    &scrolled,
+                    [900, 520],
+                    &format!("readable-{scale}-Memory-scrolled.png"),
+                );
+            }
         }
     }
 }

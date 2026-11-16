@@ -845,11 +845,15 @@ impl App {
         if self.appearance.scale > 100 {
             // Keep full controls reachable at enlarged text sizes instead
             // of shrinking the user's chosen text back down to fit.
-            egui::ScrollArea::horizontal()
+            let area = ui.available_size().max(vec2(640.0, 680.0));
+            egui::ScrollArea::both()
                 .id_salt("readable_page")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    ui.set_min_width(640.0_f32.max(ui.available_width()));
+                    // A bounded page canvas keeps virtualized inner lists
+                    // useful when larger text leaves little vertical room.
+                    ui.set_width(area.x);
+                    ui.set_height(area.y);
                     self.render_page(ui);
                 });
         } else {

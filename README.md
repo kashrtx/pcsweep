@@ -114,6 +114,6 @@ The workflow only publishes after all tests, build and packaging checks pass. A 
 
 ## New in 1.7.0
 
-Large scan snapshots use buffered I/O, completed maps display before saving, and slow restore can be skipped. Saved-map selections can validate current files without remapping the drive. Tray actions wake hidden windows natively; another launch activates the existing user/session instance. App options add persistent larger/bolder text and optional administrator startup with the normal UAC prompt.
+Large scan snapshots use buffered I/O, completed maps display before saving, and slow restore can be skipped. Saved-map selections can validate current files without remapping the drive. Tray actions wake hidden windows natively; another launch activates the existing user/session instance. Enlarged pages can scroll to keep long lists reachable. App options add persistent larger/bolder text and optional administrator startup with the normal UAC prompt.
 
 Post-uninstall review checks exact product leftovers against remaining installed apps. It never selects candidates automatically. Folders go to the Recycle Bin; the latest 16 registry cleanup backups retain raw value types for restoration. See [release notes](RELEASE_NOTES.md) and [research](UNINSTALLER_RESEARCH.md) for coverage and limits.
