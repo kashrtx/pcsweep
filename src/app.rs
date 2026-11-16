@@ -288,7 +288,7 @@ impl App {
             if ui.add(widgets::small("Open Updates")).clicked() { self.page = Page::Updates; }
             ui.separator();
             ui.checkbox(&mut elevated,"Ask to start as administrator on future launches");
-            ui.add(egui::Label::new("Windows asks for UAC approval. Canceling opens PCSweep normally. Administrator restart is also available when needed.").wrap());
+            ui.add(egui::Label::new("Windows asks for UAC approval. Canceling opens PCSweep normally. Administrator restart is also available when needed. In an elevated session, app updates can be saved but cannot replace the running executable automatically.").wrap());
         });
         self.app_options_open = open;
         if self.appearance != previous_appearance {
@@ -1131,8 +1131,10 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             self.background_hidden = true;
         }
+        let needs_native_tick =
+            self.background_hidden || ctx.input(|i| i.viewport().minimized == Some(true));
         self.tray
-            .background_poll(self.background_hidden, self.any_running());
+            .background_poll(needs_native_tick, self.any_running());
         if self.background_hidden {
             self.poll(ctx);
             self.tray.background_poll(true, self.any_running());

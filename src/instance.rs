@@ -115,9 +115,12 @@ fn acquire_named(name: &str, activate: bool) -> Result<Option<Guard>, String> {
     }
     Ok(None)
 }
+fn is_handoff_arg(arg: &str) -> bool {
+    matches!(arg, "--wait-for-parent" | "--pcsweep-update-ack")
+}
 /// Elevation is an opt-in preference, always using Windows' normal UAC prompt.
 pub fn elevate_on_start() -> bool {
-    if crate::system::is_admin() || std::env::args().any(|s| s == "--wait-for-parent") {
+    if crate::system::is_admin() || std::env::args().any(|s| is_handoff_arg(&s)) {
         return false;
     }
     let enabled = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
@@ -183,5 +186,11 @@ mod tests {
         assert!(acquire_named(&name, false).unwrap().is_some());
         assert_eq!(activation_title(), activation_title());
         assert_ne!(activate_message(), 0);
+    }
+    #[test]
+    fn update_acknowledgment_must_not_be_lost_to_an_elevation_relaunch() {
+        assert!(is_handoff_arg("--pcsweep-update-ack"));
+        assert!(is_handoff_arg("--wait-for-parent"));
+        assert!(!is_handoff_arg("PCSweep.exe"));
     }
 }

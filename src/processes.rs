@@ -701,56 +701,58 @@ impl App {
         let s = &self.sys;
         widgets::card(ui, |ui| {
             if ui.available_width() < 800.0 {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let label = if self.mem.details {
-                        "Fewer details"
-                    } else {
-                        "More details"
-                    };
-                    if ui.add(widgets::small(label)).clicked() {
-                        acts.push(MAct::Details(!self.mem.details));
-                    }
-                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                        let frac = s.mem_frac();
-                        widgets::ring(
-                            ui,
-                            frac,
-                            48.0,
-                            5.0,
-                            color,
-                            &format!("{:.0}%", frac * 100.0),
-                            "RAM",
-                        );
-                        ui.vertical(|ui| {
-                            ui.add(
-                                egui::Label::new(widgets::strong(
-                                    format!("{} available", fmt_bytes(s.mem_avail)),
-                                    15.0,
-                                ))
-                                .truncate(),
+                ui.horizontal(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let label = if self.mem.details {
+                            "Fewer details"
+                        } else {
+                            "More details"
+                        };
+                        if ui.add(widgets::small(label)).clicked() {
+                            acts.push(MAct::Details(!self.mem.details));
+                        }
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            let frac = s.mem_frac();
+                            widgets::ring(
+                                ui,
+                                frac,
+                                48.0,
+                                5.0,
+                                color,
+                                &format!("{:.0}%", frac * 100.0),
+                                "RAM",
                             );
-                            let commit = if s.memory_info_available {
-                                format!(
-                                    "Commit {} / {}",
-                                    fmt_bytes(s.commit_total),
-                                    fmt_bytes(s.commit_limit)
+                            ui.vertical(|ui| {
+                                ui.add(
+                                    egui::Label::new(widgets::strong(
+                                        format!("{} available", fmt_bytes(s.mem_avail)),
+                                        15.0,
+                                    ))
+                                    .truncate(),
+                                );
+                                let commit = if s.memory_info_available {
+                                    format!(
+                                        "Commit {} / {}",
+                                        fmt_bytes(s.commit_total),
+                                        fmt_bytes(s.commit_limit)
+                                    )
+                                } else {
+                                    "Commit unavailable".into()
+                                };
+                                ui.add(
+                                    egui::Label::new(widgets::dim(format!(
+                                        "{commit} · CPU {:.0}%",
+                                        s.cpu
+                                    )))
+                                    .truncate(),
                                 )
-                            } else {
-                                "Commit unavailable".into()
-                            };
-                            ui.add(
-                                egui::Label::new(widgets::dim(format!(
-                                    "{commit} · CPU {:.0}%",
-                                    s.cpu
-                                )))
-                                .truncate(),
-                            )
-                            .on_hover_text(format!(
-                                "{} in use of {} RAM · {} logical cores",
-                                fmt_bytes(s.mem_used),
-                                fmt_bytes(s.mem_total),
-                                s.cores
-                            ));
+                                .on_hover_text(format!(
+                                    "{} in use of {} RAM · {} logical cores",
+                                    fmt_bytes(s.mem_used),
+                                    fmt_bytes(s.mem_total),
+                                    s.cores
+                                ));
+                            });
                         });
                     });
                 });

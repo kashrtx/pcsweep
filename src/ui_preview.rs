@@ -2082,7 +2082,7 @@ fn enlarged_bold_interface_keeps_all_pages_reachable() {
                     upload_preview_textures(&mut painter, &scrolled);
                 }
                 assert!(
-                    !visible_texts(&scrolled, "chrome.exe").is_empty(),
+                    !visible_texts(&scrolled, "chrome.exe (2)").is_empty(),
                     "enlarged memory lists must remain reachable by scrolling"
                 );
                 save_shipment_preview(
