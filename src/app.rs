@@ -587,7 +587,7 @@ impl App {
     }
     pub(crate) fn navigation_width(&self, ctx: &egui::Context) -> f32 {
         if self.compact_navigation(ctx) {
-            74.0
+            80.0
         } else {
             236.0
         }
@@ -1127,8 +1127,11 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             self.background_hidden = true;
         }
+        self.tray
+            .background_poll(self.background_hidden, self.any_running());
         if self.background_hidden {
             self.poll(ctx);
+            self.tray.background_poll(true, self.any_running());
             self.toasts
                 .retain(|t| t.born.elapsed() < Duration::from_secs(7));
             ctx.request_repaint_after(Duration::from_secs(if self.any_running() { 1 } else { 30 }));

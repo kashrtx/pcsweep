@@ -432,7 +432,7 @@ fn registry_allowed(k: &RegistryItem, t: &Target, installed: &[InstalledApp]) ->
         })
 }
 pub fn scan(t: &Target) -> Result<Review, String> {
-    let installed = apps::list();
+    let installed = apps::ownership_inventory();
     if installed.iter().any(|a| same_app(a, t)) {
         return Err("The app is still registered as installed. Finish its uninstaller, then check again. No leftovers were removed.".into());
     }
@@ -548,7 +548,7 @@ fn erase_tree(key: &RegKey, tree: &KeyTree) -> Result<(), String> {
     Ok(())
 }
 pub fn remove(t: Target, items: Vec<Candidate>) -> Result<String, String> {
-    let installed = apps::list();
+    let installed = apps::ownership_inventory();
     if installed.iter().any(|a| same_app(a, &t)) {
         return Err("The app is installed again; nothing was removed".into());
     }

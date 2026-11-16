@@ -20,6 +20,8 @@ use windows_sys::Win32::{
 
 const CALLBACK: u32 = WM_APP + 79;
 const STOP: u32 = WM_APP + 80;
+const POLL_MODE: u32 = WM_APP + 81;
+const BACKGROUND_TIMER: usize = 2;
 const RETRY_TIMER: usize = 1;
 // WinSDK defines NIN_KEYSELECT as a macro; windows-sys exposes its components.
 const NIN_KEYSELECT: u32 = NIN_SELECT | NINF_KEY;
@@ -40,6 +42,7 @@ pub enum TrayEvent {
 struct Shared {
     hwnd: AtomicIsize,
     main_hwnd: AtomicIsize,
+    background_interval: AtomicU64,
     ready: AtomicBool,
     stop: AtomicBool,
 }
@@ -115,6 +118,30 @@ impl Tray {
     }
     pub fn bind_window(&self, hwnd: HWND) {
         self.shared.main_hwnd.store(hwnd, Ordering::Release);
+    }
+    pub fn background_poll(&self, hidden: bool, busy: bool) {
+        let interval = if hidden {
+            if busy {
+                1
+            } else {
+                30
+            }
+        } else {
+            0
+        };
+        if self
+            .shared
+            .background_interval
+            .swap(interval, Ordering::AcqRel)
+            != interval
+        {
+            let hwnd = self.shared.hwnd.load(Ordering::Acquire);
+            if hwnd != 0 {
+                unsafe {
+                    PostMessageW(hwnd, POLL_MODE, 0, 0);
+                }
+            }
+        }
     }
     pub fn available(&self) -> bool {
         self.shared.ready.load(Ordering::Acquire) && self.shared.hwnd.load(Ordering::Acquire) != 0
@@ -437,6 +464,27 @@ unsafe fn handle_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARA
             }
             0
         }
+        POLL_MODE => {
+            let interval = state.shared.background_interval.load(Ordering::Acquire);
+            if interval == 0 {
+                KillTimer(hwnd, BACKGROUND_TIMER);
+            } else {
+                SetTimer(
+                    hwnd,
+                    BACKGROUND_TIMER,
+                    (interval * 1000).min(u32::MAX as u64) as u32,
+                    None,
+                );
+            }
+            0
+        }
+        WM_TIMER if wparam == BACKGROUND_TIMER => {
+            if state.shared.background_interval.load(Ordering::Acquire) > 0 {
+                post_background_frame(state.shared.main_hwnd.load(Ordering::Acquire));
+                state.notifier.ctx.request_repaint();
+            }
+            0
+        }
         WM_CLOSE | STOP => {
             DestroyWindow(hwnd);
             0
@@ -749,6 +797,17 @@ mod wake_tests {
             ctx: egui::Context::default(),
             shared,
         };
+        post_background_frame(hwnd);
+        let mut paint: MSG = unsafe { zeroed() };
+        assert_ne!(
+            unsafe { PeekMessageW(&mut paint, hwnd, WM_PAINT, WM_PAINT, PM_REMOVE) },
+            0
+        );
+        assert_eq!(
+            unsafe { IsWindowVisible(hwnd) },
+            0,
+            "background polling must not show the window"
+        );
         for event in [TrayEvent::Show, TrayEvent::CheckUpdates, TrayEvent::Quit] {
             unsafe {
                 ShowWindow(hwnd, SW_HIDE);
@@ -779,6 +838,17 @@ mod wake_tests {
         unsafe {
             DestroyWindow(hwnd);
             UnregisterClassW(name.as_ptr(), module);
+        }
+    }
+}
+
+/// winit's ordinary invalidation cannot paint a hidden HWND. An explicit paint
+/// message runs eframe's background update without making the window visible.
+fn post_background_frame(hwnd: HWND) {
+    let mut pid = 0;
+    unsafe {
+        if hwnd != 0 && GetWindowThreadProcessId(hwnd, &mut pid) != 0 && pid == std::process::id() {
+            PostMessageW(hwnd, WM_PAINT, 0, 0);
         }
     }
 }

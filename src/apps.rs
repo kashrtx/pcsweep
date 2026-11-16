@@ -55,6 +55,12 @@ impl InstalledApp {
 }
 
 pub fn list() -> Vec<InstalledApp> {
+    list_desktop(false)
+}
+pub(crate) fn ownership_inventory() -> Vec<InstalledApp> {
+    list_desktop(true)
+}
+fn list_desktop(include_hidden: bool) -> Vec<InstalledApp> {
     let mut out: Vec<InstalledApp> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let sources = [
@@ -71,6 +77,11 @@ pub fn list() -> Vec<InstalledApp> {
         (
             false,
             r"Software\Microsoft\Windows\CurrentVersion\Uninstall",
+            "Your account",
+        ),
+        (
+            false,
+            r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
             "Your account",
         ),
     ];
@@ -92,15 +103,17 @@ pub fn list() -> Vec<InstalledApp> {
             if name.is_empty() {
                 continue;
             }
-            if k.get_value::<u32, _>("SystemComponent").unwrap_or(0) == 1 {
+            if !include_hidden && k.get_value::<u32, _>("SystemComponent").unwrap_or(0) == 1 {
                 continue;
             }
             let parent: String = k.get_value("ParentKeyName").unwrap_or_default();
-            if !parent.is_empty() {
+            if !include_hidden && !parent.is_empty() {
                 continue;
             }
             let release: String = k.get_value("ReleaseType").unwrap_or_default();
-            if matches!(release.as_str(), "Update" | "Hotfix" | "Security Update") {
+            if !include_hidden
+                && matches!(release.as_str(), "Update" | "Hotfix" | "Security Update")
+            {
                 continue;
             }
             let version: String = k.get_value("DisplayVersion").unwrap_or_default();
