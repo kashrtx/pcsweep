@@ -593,11 +593,12 @@ impl App {
             let groups = self.dups.groups.clone();
             let removed = self.dups.removed.clone();
             let scanned = self.dups.cache.stamp;
+            let published = crate::scan_cache::now();
             self.dups.cache.dirty = None;
             self.dups.cache.save = Task::spawn(ctx, move || {
                 crate::scan_cache::save(
                     "duplicates.json",
-                    crate::scan_cache::now(),
+                    published,
                     &DuplicateDiskRef {
                         roots: &roots,
                         min_size,

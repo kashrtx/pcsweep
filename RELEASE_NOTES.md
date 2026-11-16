@@ -31,7 +31,8 @@ This release adds direct controls, fixes DNS eligibility, shows native app icons
 - Restored results require refresh before destructive actions. Refresh this folder can update a targeted analyzer view without remapping a whole drive. Same-session file actions retain protection checks.
 - Analyzer search, sorting, checkboxes, Select shown/Clear and selected-count/size summaries improve bulk Recycle Bin review. Protected paths and aggregate rows stay excluded.
 - Installed apps use native desktop resource icons and Store AppsFolder artwork, with bounded background extraction/caching, native fallback and proper icon/GDI/COM cleanup.
-- PCSweep remembers its last page and window size.
+- Per-file Keep choices survive cleaner refreshes, including size/category changes. Delayed cache saves cannot overwrite a newer scan.
+- PCSweep remembers its last page and window size. Shared preference cards use consistent widths, and subtle navigation/toggle/hover motion respects the Windows animation preference.
 
 ## Background availability and PCSweep updates
 

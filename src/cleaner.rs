@@ -605,6 +605,30 @@ pub struct ScanOutput {
     pub running: Vec<Vec<String>>,
     saved_at: u64,
     cache_error: Option<String>,
+    excluded: Vec<HashSet<PathBuf>>,
+    excluded_bytes: Vec<u64>,
+}
+
+fn keep_choices_after_refresh(
+    results: &[CatResult],
+    previous: &[HashSet<PathBuf>],
+) -> (Vec<HashSet<PathBuf>>, Vec<u64>) {
+    let kept: HashSet<&PathBuf> = previous.iter().flat_map(|set| set.iter()).collect();
+    let mut selected = Vec::with_capacity(results.len());
+    let mut bytes = Vec::with_capacity(results.len());
+    for result in results {
+        let mut files = HashSet::new();
+        let mut total = 0;
+        for file in &result.files {
+            if kept.contains(&file.path) {
+                files.insert(file.path.clone());
+                total += file.size;
+            }
+        }
+        selected.push(files);
+        bytes.push(total);
+    }
+    (selected, bytes)
 }
 
 pub struct CleanJob {
@@ -1141,6 +1165,8 @@ impl App {
             }
         }
         if !self.cleaner.cache.save.running()
+            && !self.cleaner.scan.running()
+            && !self.cleaner.clean.running()
             && self
                 .cleaner
                 .cache
@@ -1178,6 +1204,7 @@ impl App {
             return;
         }
         let cats = self.cleaner.cats.clone();
+        let previous_kept = self.cleaner.excluded.clone();
         self.cleaner.scan = Task::spawn(ctx, move || {
             let names = running_process_names();
             let mut results: Vec<CatResult> = cats.par_iter().map(scan_category).collect();
@@ -1205,11 +1232,11 @@ impl App {
                 })
                 .collect();
             let saved_at = crate::scan_cache::now();
-            let empty = vec![HashSet::new(); cats.len()];
+            let (excluded, excluded_bytes) = keep_choices_after_refresh(&results, &previous_kept);
             let data = CleanerDiskRef {
                 categories: cats.iter().map(|c| c.name).collect(),
                 results: results.iter().map(Some).collect(),
-                excluded: &empty,
+                excluded: &excluded,
                 review: None,
             };
             let cache_error = crate::scan_cache::save("cleaner.json", saved_at, &data).err();
@@ -1218,6 +1245,8 @@ impl App {
                 running,
                 saved_at,
                 cache_error,
+                excluded,
+                excluded_bytes,
             }
         });
     }
@@ -1232,12 +1261,8 @@ impl App {
                         .name("pcsweep-release-cleaner".into())
                         .spawn(move || drop(old));
                     self.cleaner.running = out.running;
-                    for s in self.cleaner.excluded.iter_mut() {
-                        s.clear();
-                    }
-                    for b in self.cleaner.excluded_bytes.iter_mut() {
-                        *b = 0;
-                    }
+                    self.cleaner.excluded = out.excluded;
+                    self.cleaner.excluded_bytes = out.excluded_bytes;
                     self.cleaner.scanned_once = true;
                     self.cleaner.cache.stamp = Some(out.saved_at);
                     self.cleaner.cache.error = out.cache_error;
@@ -1388,7 +1413,14 @@ impl App {
         let mut acts = Vec::new();
         if self.cleaner.review.is_some() {
             self.cleaner.prepare_review();
-            self.render_review(ui, &mut acts);
+            if self.cleaner.scan.running() {
+                ui.label(widgets::dim(
+                    "Refreshing this scan. Your Keep choices will be preserved.",
+                ));
+            }
+            ui.add_enabled_ui(!self.cleaner.scan.running(), |ui| {
+                self.render_review(ui, &mut acts)
+            });
             if self.modal.is_none() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                 acts.push(CAct::CloseReview);
             }
@@ -1963,6 +1995,33 @@ mod tests {
         assert_eq!(decoded.results[0].as_ref().unwrap().files[0].size, 12);
         decoded.categories[0] = "a different cleanup definition".into();
         assert!(validate_cleaner_cache(&decoded, &cats).is_err());
+    }
+
+    #[test]
+    fn refreshing_keeps_user_exceptions_even_if_a_file_changes_size_or_category() {
+        let path = PathBuf::from(r"C:\Users\Example\AppData\Local\Temp\keep.tmp");
+        let previous = vec![
+            HashSet::from([path.clone(), PathBuf::from(r"C:\gone.tmp")]),
+            HashSet::new(),
+        ];
+        let results = vec![
+            CatResult::default(),
+            CatResult {
+                files: vec![JunkFile {
+                    path: path.clone(),
+                    size: 99,
+                    modified: None,
+                    created: None,
+                }],
+                bytes: 99,
+                count: 1,
+                ..Default::default()
+            },
+        ];
+        let (kept, bytes) = keep_choices_after_refresh(&results, &previous);
+        assert!(kept[0].is_empty());
+        assert_eq!(kept[1], HashSet::from([path]));
+        assert_eq!(bytes, vec![0, 99]);
     }
 
     #[test]

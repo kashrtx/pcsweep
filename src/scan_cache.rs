@@ -23,6 +23,11 @@ struct Envelope<T> {
     saved: u64,
     data: T,
 }
+#[derive(Deserialize)]
+struct Header {
+    schema: u32,
+    saved: u64,
+}
 pub struct Stored<T> {
     pub saved: u64,
     pub data: T,
@@ -192,7 +197,15 @@ fn save_in<T: Serialize>(dir: &Path, name: &str, saved: u64, data: &T) -> Result
         .custom_flags(0x0020_0000)
         .open(&target)
     {
-        Ok(f) => regular(&f)?,
+        Ok(f) => {
+            regular(&f)?;
+            if serde_json::from_reader::<_, Header>(f.take(MAX_BYTES + 1))
+                .ok()
+                .is_some_and(|h| h.schema == SCHEMA && h.saved > saved)
+            {
+                return Ok(());
+            }
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.to_string()),
     }
@@ -349,6 +362,24 @@ mod tests {
         )
         .unwrap();
         assert!(load_in::<Vec<String>>(&dir, "test.json").is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn a_delayed_old_snapshot_cannot_replace_a_newer_scan() {
+        let dir = temp("generation");
+        save_in(&dir, "test.json", 200, &vec!["new scan"]).unwrap();
+        save_in(&dir, "test.json", 100, &vec!["old metadata job"]).unwrap();
+        let restored = load_in::<Vec<String>>(&dir, "test.json").unwrap().unwrap();
+        assert_eq!(restored.saved, 200);
+        assert_eq!(restored.data, vec!["new scan"]);
+        save_in(&dir, "test.json", 200, &vec!["same scan, updated choices"]).unwrap();
+        assert_eq!(
+            load_in::<Vec<String>>(&dir, "test.json")
+                .unwrap()
+                .unwrap()
+                .data,
+            vec!["same scan, updated choices"]
+        );
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]
