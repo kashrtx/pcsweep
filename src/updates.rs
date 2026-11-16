@@ -131,6 +131,14 @@ impl Default for UpdateState {
 }
 
 impl UpdateState {
+    pub fn automatic_checks(&self) -> bool {
+        self.automatic
+    }
+    pub fn has_available_update(&self) -> bool {
+        self.available
+            .as_ref()
+            .is_some_and(|u| self.skipped != u.identity())
+    }
     pub fn running(&self) -> bool {
         self.check.running() || self.install.running()
     }
@@ -935,7 +943,15 @@ pub fn confirm_update_startup() {
 }
 
 impl App {
-    fn begin_update_check(&mut self, ctx: &egui::Context) {
+    pub(crate) fn set_automatic_update_checks(&mut self, enabled: bool) {
+        self.updates.automatic = enabled;
+        util::save_settings(&[(
+            "updates.automatic".into(),
+            if enabled { "1" } else { "0" }.into(),
+        )]);
+    }
+
+    pub(crate) fn begin_update_check(&mut self, ctx: &egui::Context) {
         if self.updates.running() {
             return;
         }
@@ -989,6 +1005,7 @@ impl App {
             match result.and_then(|r| r) {
                 Ok(DownloadResult::Restart) => {
                     util::log("A verified PCSweep update is ready. Restarting the app.");
+                    self.force_exit = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 Ok(DownloadResult::Saved(path)) => {
@@ -1060,7 +1077,7 @@ impl App {
                     }
                 });
                 ui.add_space(6.0);
-                ui.checkbox(&mut automatic, "Check once a day while PCSweep is open");
+                ui.checkbox(&mut automatic, "Check once a day while PCSweep is running, including in the background");
                 ui.label(widgets::faint("Optional and off by default. Update checks contact GitHub without sending a device ID, app inventory or activity history."));
             });
             if let Some(error) = &self.updates.error {
@@ -1119,11 +1136,7 @@ impl App {
             }
         });
         if automatic != self.updates.automatic {
-            self.updates.automatic = automatic;
-            util::save_settings(&[(
-                "updates.automatic".into(),
-                if automatic { "1".into() } else { "0".into() },
-            )]);
+            self.set_automatic_update_checks(automatic);
         }
         if let Some(skipped) = skip {
             self.updates.skipped = skipped.clone();

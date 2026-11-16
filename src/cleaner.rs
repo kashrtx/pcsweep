@@ -7,9 +7,12 @@ use crate::util::{self, fmt_age, fmt_bytes, fmt_num};
 use crate::widgets::{self, ic};
 use eframe::egui::{self, Align, Label, Layout, RichText, ScrollArea, Ui};
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Instant;
 use std::time::{Duration, SystemTime};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -350,7 +353,7 @@ pub fn categories() -> Vec<Category> {
     ]
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct JunkFile {
     pub path: PathBuf,
     pub size: u64,
@@ -358,7 +361,7 @@ pub struct JunkFile {
     pub created: Option<SystemTime>,
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct CatResult {
     pub files: Vec<JunkFile>,
     pub dirs: Vec<PathBuf>,
@@ -600,6 +603,8 @@ fn running_process_names() -> HashSet<String> {
 pub struct ScanOutput {
     pub results: Vec<CatResult>,
     pub running: Vec<Vec<String>>,
+    saved_at: u64,
+    cache_error: Option<String>,
 }
 
 pub struct CleanJob {
@@ -745,7 +750,7 @@ pub fn run_clean(jobs: Vec<CleanJob>) -> CleanReport {
 
 // ====================================================================== state
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReviewSort {
     #[default]
     Largest,
@@ -782,10 +787,72 @@ impl FileReview {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct CleanerDisk {
+    categories: Vec<String>,
+    results: Vec<Option<CatResult>>,
+    excluded: Vec<HashSet<PathBuf>>,
+    review: Option<(usize, String, ReviewSort)>,
+}
+#[derive(Serialize)]
+struct CleanerDiskRef<'a> {
+    categories: Vec<&'a str>,
+    results: Vec<Option<&'a CatResult>>,
+    excluded: &'a [HashSet<PathBuf>],
+    review: Option<(usize, &'a str, ReviewSort)>,
+}
+struct RestoredCleaner {
+    results: Vec<Option<Arc<CatResult>>>,
+    excluded: Vec<HashSet<PathBuf>>,
+    excluded_bytes: Vec<u64>,
+    review: Option<FileReview>,
+}
+#[derive(Default)]
+pub struct CleanerCache {
+    load: Task<Result<Option<crate::scan_cache::Stored<RestoredCleaner>>, String>>,
+    save: Task<Result<(), String>>,
+    stamp: Option<u64>,
+    from_disk: bool,
+    dirty: Option<Instant>,
+    error: Option<String>,
+}
+fn validate_cleaner_cache(data: &CleanerDisk, cats: &[Category]) -> Result<(), String> {
+    if data.categories != cats.iter().map(|c| c.name.to_string()).collect::<Vec<_>>()
+        || data.results.len() != cats.len()
+        || data.excluded.len() != cats.len()
+        || data.results.iter().flatten().any(|r| {
+            r.files.len() > 500_000
+                || r.dirs.len() > 500_000
+                || r.files.iter().any(|f| !f.path.is_absolute())
+                || r.dirs.iter().any(|p| !p.is_absolute())
+        })
+    {
+        return Err("Saved cleaner categories changed; a fresh scan is needed.".into());
+    }
+    for (cat, result) in cats.iter().zip(&data.results) {
+        if let Some(result) = result {
+            if result.bytes > u64::MAX / 1024
+                || result.count > u64::MAX / 1024
+                || (cat.special != Special::RecycleBin
+                    && (result.count != result.files.len() as u64
+                        || result
+                            .files
+                            .iter()
+                            .try_fold(0u64, |sum, file| sum.checked_add(file.size))
+                            != Some(result.bytes)))
+            {
+                return Err("Saved cleaner totals are inconsistent.".into());
+            }
+        }
+    }
+    Ok(())
+}
+
 pub struct CleanerState {
     pub cats: Vec<Category>,
     pub selected: Vec<bool>,
-    pub results: Vec<Option<CatResult>>,
+    pub results: Vec<Option<Arc<CatResult>>>,
+    pub cache: CleanerCache,
     pub excluded: Vec<HashSet<PathBuf>>,
     pub excluded_bytes: Vec<u64>,
     pub running: Vec<Vec<String>>,
@@ -815,6 +882,7 @@ impl CleanerState {
                 )
                 .collect(),
             results: (0..n).map(|_| None).collect(),
+            cache: CleanerCache::default(),
             excluded: vec![HashSet::new(); n],
             excluded_bytes: vec![0; n],
             running: vec![Vec::new(); n],
@@ -986,7 +1054,126 @@ enum CAct {
 }
 
 impl App {
+    pub(crate) fn restore_cleaner_cache(&mut self, ctx: &egui::Context) {
+        let cats = self.cleaner.cats.clone();
+        self.cleaner.cache.load = Task::spawn(ctx, move || {
+            let value = crate::scan_cache::load::<CleanerDisk>("cleaner.json")?;
+            value
+                .map(|value| {
+                    validate_cleaner_cache(&value.data, &cats)?;
+                    let excluded_bytes = value
+                        .data
+                        .results
+                        .iter()
+                        .enumerate()
+                        .map(|(i, result)| {
+                            result
+                                .as_ref()
+                                .map(|r| {
+                                    r.files
+                                        .iter()
+                                        .filter(|f| value.data.excluded[i].contains(&f.path))
+                                        .map(|f| f.size)
+                                        .sum()
+                                })
+                                .unwrap_or(0)
+                        })
+                        .collect();
+                    let review = value
+                        .data
+                        .review
+                        .filter(|(i, filter, _)| *i < cats.len() && filter.len() <= 8192)
+                        .map(|(i, filter, sort)| {
+                            let mut review = FileReview::new(i);
+                            review.filter = filter;
+                            review.sort = sort;
+                            review
+                        });
+                    Ok(crate::scan_cache::Stored {
+                        saved: value.saved,
+                        data: RestoredCleaner {
+                            results: value
+                                .data
+                                .results
+                                .into_iter()
+                                .map(|r| r.map(Arc::new))
+                                .collect(),
+                            excluded: value.data.excluded,
+                            excluded_bytes,
+                            review,
+                        },
+                    })
+                })
+                .transpose()
+        });
+    }
+    pub(crate) fn poll_cleaner_cache(&mut self, ctx: &egui::Context) {
+        if let Some(result) = self.cleaner.cache.load.poll() {
+            match result.and_then(|r| r) {
+                Ok(Some(value)) if !self.cleaner.scan.running() && !self.cleaner.scanned_once => {
+                    self.cleaner.results = value.data.results;
+                    self.cleaner.excluded = value.data.excluded;
+                    self.cleaner.excluded_bytes = value.data.excluded_bytes;
+                    self.cleaner.review = value.data.review;
+                    self.cleaner.scanned_once = true;
+                    self.cleaner.generation += 1;
+                    self.cleaner.cache.stamp = Some(value.saved);
+                    self.cleaner.cache.from_disk = true;
+                }
+                Ok(_) => {
+                    if !self.cleaner.scanned_once && !self.cleaner.scan.running() {
+                        self.start_junk_scan(ctx);
+                    }
+                }
+                Err(e) => {
+                    self.cleaner.cache.error = Some(e);
+                    if !self.cleaner.scanned_once && !self.cleaner.scan.running() {
+                        self.start_junk_scan(ctx);
+                    }
+                }
+            }
+        }
+        if let Some(result) = self.cleaner.cache.save.poll() {
+            if let Err(e) = result.and_then(|r| r) {
+                self.cleaner.cache.error = Some(e);
+            } else {
+                self.cleaner.cache.error = None;
+            }
+        }
+        if !self.cleaner.cache.save.running()
+            && self
+                .cleaner
+                .cache
+                .dirty
+                .is_some_and(|at| at.elapsed() >= Duration::from_millis(500))
+        {
+            let categories: Vec<_> = self.cleaner.cats.iter().map(|c| c.name).collect();
+            let results = self.cleaner.results.clone();
+            let excluded = self.cleaner.excluded.clone();
+            let review = self
+                .cleaner
+                .review
+                .as_ref()
+                .map(|r| (r.category, r.filter.clone(), r.sort));
+            let stamp = self
+                .cleaner
+                .cache
+                .stamp
+                .unwrap_or_else(crate::scan_cache::now);
+            self.cleaner.cache.dirty = None;
+            self.cleaner.cache.save = Task::spawn(ctx, move || {
+                let data = CleanerDiskRef {
+                    categories,
+                    results: results.iter().map(|r| r.as_deref()).collect(),
+                    excluded: &excluded,
+                    review: review.as_ref().map(|(i, f, s)| (*i, f.as_str(), *s)),
+                };
+                crate::scan_cache::save("cleaner.json", stamp, &data)
+            });
+        }
+    }
     pub fn start_junk_scan(&mut self, ctx: &egui::Context) {
+        self.cleaner.cache.load = Task::default();
         if self.cleaner.scan.running() || self.cleaner.clean.running() {
             return;
         }
@@ -1017,7 +1204,21 @@ impl App {
                         .collect::<Vec<String>>()
                 })
                 .collect();
-            ScanOutput { results, running }
+            let saved_at = crate::scan_cache::now();
+            let empty = vec![HashSet::new(); cats.len()];
+            let data = CleanerDiskRef {
+                categories: cats.iter().map(|c| c.name).collect(),
+                results: results.iter().map(Some).collect(),
+                excluded: &empty,
+                review: None,
+            };
+            let cache_error = crate::scan_cache::save("cleaner.json", saved_at, &data).err();
+            ScanOutput {
+                results,
+                running,
+                saved_at,
+                cache_error,
+            }
         });
     }
 
@@ -1025,9 +1226,11 @@ impl App {
         if let Some(r) = self.cleaner.scan.poll() {
             match r {
                 Ok(out) => {
-                    for (i, res) in out.results.into_iter().enumerate() {
-                        self.cleaner.results[i] = Some(res);
-                    }
+                    let replacement = out.results.into_iter().map(|r| Some(Arc::new(r))).collect();
+                    let old = std::mem::replace(&mut self.cleaner.results, replacement);
+                    let _ = std::thread::Builder::new()
+                        .name("pcsweep-release-cleaner".into())
+                        .spawn(move || drop(old));
                     self.cleaner.running = out.running;
                     for s in self.cleaner.excluded.iter_mut() {
                         s.clear();
@@ -1036,6 +1239,10 @@ impl App {
                         *b = 0;
                     }
                     self.cleaner.scanned_once = true;
+                    self.cleaner.cache.stamp = Some(out.saved_at);
+                    self.cleaner.cache.error = out.cache_error;
+                    self.cleaner.cache.from_disk = false;
+                    self.cleaner.cache.dirty = None;
                     self.cleaner.generation += 1;
                 }
                 Err(e) => self.toast(ToastKind::Error, format!("Junk scan failed: {e}")),
@@ -1069,6 +1276,10 @@ impl App {
     }
 
     pub fn ask_clean(&mut self) {
+        if self.cleaner.cache.from_disk || self.cleaner.cache.load.running() {
+            self.toast(ToastKind::Info, "Refresh the saved junk scan before cleaning. This prevents older results from deleting newer Recycle Bin contents.");
+            return;
+        }
         let (bytes, files, n) = self.cleaner.selected_total();
         if n == 0 {
             self.toast(ToastKind::Info, "Nothing selected to clean.");
@@ -1111,6 +1322,13 @@ impl App {
     }
 
     pub fn start_clean(&mut self, ctx: &egui::Context) {
+        if self.cleaner.cache.from_disk || self.cleaner.cache.load.running() {
+            self.toast(
+                ToastKind::Info,
+                "Refresh this saved scan and review the new results before cleaning.",
+            );
+            return;
+        }
         if self.cleaner.clean.running()
             || self.analyzer.recycle.running()
             || self.dups.recycle.running()
@@ -1177,6 +1395,7 @@ impl App {
         } else {
             self.render_cleaner(ui, &mut acts);
         }
+        let cache_changed = !acts.is_empty();
         let mut selection_changed = false;
         for a in acts {
             match a {
@@ -1239,6 +1458,9 @@ impl App {
         if selection_changed {
             self.cleaner.save_selection();
         }
+        if cache_changed && self.cleaner.cache.stamp.is_some() {
+            self.cleaner.cache.dirty = Some(Instant::now());
+        }
     }
 
     fn render_cleaner(&self, ui: &mut Ui, acts: &mut Vec<CAct>) {
@@ -1248,7 +1470,27 @@ impl App {
             "Junk cleaner",
             "Caches, temp files and leftovers that are safe to remove. Nothing is deleted until you review it and confirm.",
         );
-        let scanning = c.scan.running();
+        if c.cache.load.running() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(widgets::dim("Restoring the last junk scan…"));
+            });
+        }
+        if let Some(stamp) = c.cache.stamp {
+            ui.label(widgets::dim(format!(
+                "Scan from {}. {}",
+                crate::scan_cache::saved_label(stamp),
+                if c.cache.from_disk {
+                    "Saved results · Scan again before cleaning."
+                } else {
+                    "Refresh when files change."
+                }
+            )));
+        }
+        if let Some(error) = &c.cache.error {
+            ui.label(widgets::faint(format!("Saving scan results: {error}")));
+        }
+        let scanning = c.scan.running() || c.cache.load.running();
         let cleaning = c.clean.running();
         let (sel_bytes, sel_files, sel_n) = c.selected_total();
 
@@ -1276,7 +1518,8 @@ impl App {
                     }
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let can_clean = !scanning
+                    let can_clean = !c.cache.from_disk
+                        && !scanning
                         && !cleaning
                         && !self.analyzer.recycle.running()
                         && !self.dups.recycle.running()
@@ -1674,6 +1917,53 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_cleaner_snapshot_requires_refresh_before_cleaning() {
+        let mut app = App::test_fixture();
+        app.cleaner.cache.from_disk = true;
+        app.ask_clean();
+        assert!(app.modal.is_none());
+        app.start_clean(&egui::Context::default());
+        assert!(
+            !app.cleaner.clean.running(),
+            "restored Recycle Bin totals must never authorize an empty-bin action"
+        );
+    }
+    #[test]
+    fn cleaner_cache_preserves_kept_files_and_rejects_changed_category_schema() {
+        let cats = categories();
+        let path = PathBuf::from(r"C:\Users\Example\AppData\Local\Temp\kept.tmp");
+        let mut results: Vec<Option<CatResult>> = (0..cats.len())
+            .map(|_| Some(CatResult::default()))
+            .collect();
+        results[0] = Some(CatResult {
+            files: vec![JunkFile {
+                path: path.clone(),
+                size: 12,
+                modified: Some(SystemTime::UNIX_EPOCH),
+                created: Some(SystemTime::UNIX_EPOCH),
+            }],
+            bytes: 12,
+            count: 1,
+            ..Default::default()
+        });
+        let mut excluded = vec![HashSet::new(); cats.len()];
+        excluded[0].insert(path.clone());
+        let disk = CleanerDisk {
+            categories: cats.iter().map(|c| c.name.into()).collect(),
+            results,
+            excluded,
+            review: Some((0, "kept".into(), ReviewSort::Path)),
+        };
+        let mut decoded: CleanerDisk =
+            serde_json::from_slice(&serde_json::to_vec(&disk).unwrap()).unwrap();
+        validate_cleaner_cache(&decoded, &cats).unwrap();
+        assert!(decoded.excluded[0].contains(&path));
+        assert_eq!(decoded.results[0].as_ref().unwrap().files[0].size, 12);
+        decoded.categories[0] = "a different cleanup definition".into();
+        assert!(validate_cleaner_cache(&decoded, &cats).is_err());
+    }
 
     #[test]
     fn target_expansion_keeps_files_and_supports_question_mark_wildcards() {

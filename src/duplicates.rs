@@ -5,6 +5,7 @@ use crate::util::{self, fmt_bytes, fmt_date, fmt_num};
 use crate::widgets::{self, ic};
 use eframe::egui::{self, Align, Color32, Label, Layout, RichText, ScrollArea, Ui};
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Read;
@@ -22,16 +23,19 @@ pub struct DupProgress {
     pub done: AtomicU64,
     pub total: AtomicU64,
     pub cancel: AtomicBool,
+    cache_stamp: AtomicU64,
+    cache_error: Mutex<Option<String>>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct DupFile {
     pub path: PathBuf,
     pub modified: Option<SystemTime>,
+    #[serde(skip)]
     pub block: Option<&'static str>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct DupGroup {
     pub size: u64,
     pub files: Vec<DupFile>,
@@ -348,7 +352,7 @@ pub fn find(roots: Vec<PathBuf>, min_size: u64, p: Arc<DupProgress>) -> Vec<DupG
 /// another app cannot change/delete it while selected copies are recycled.
 pub(crate) fn recycle_verified(
     items: Vec<(PathBuf, u64)>,
-    groups: Vec<DupGroup>,
+    groups: impl Into<Arc<Vec<DupGroup>>>,
 ) -> util::RecycleReport {
     use std::io::{Seek, SeekFrom};
     let selected: HashSet<_> = items.iter().map(|(p, _)| p.clone()).collect();
@@ -360,7 +364,8 @@ pub(crate) fn recycle_verified(
         journal_error: None,
     };
     let cancel = AtomicBool::new(false);
-    'groups: for group in groups {
+    let groups = groups.into();
+    'groups: for group in groups.iter() {
         let targets: Vec<_> = group
             .files
             .iter()
@@ -431,13 +436,70 @@ pub(crate) fn recycle_verified(
 
 // ====================================================================== state
 
+#[derive(Serialize, Deserialize)]
+struct DuplicateDisk {
+    roots: Vec<PathBuf>,
+    min_size: u64,
+    groups: Option<Vec<DupGroup>>,
+    removed: HashSet<PathBuf>,
+    scanned: Option<u64>,
+}
+#[derive(Serialize)]
+struct DuplicateDiskRef<'a> {
+    roots: &'a [PathBuf],
+    min_size: u64,
+    groups: Option<&'a [DupGroup]>,
+    removed: &'a HashSet<PathBuf>,
+    scanned: Option<u64>,
+}
+#[derive(Default)]
+pub struct DuplicateCache {
+    load: Task<Result<Option<crate::scan_cache::Stored<DuplicateDisk>>, String>>,
+    save: Task<Result<(), String>>,
+    stamp: Option<u64>,
+    from_disk: bool,
+    dirty: Option<Instant>,
+    error: Option<String>,
+}
+fn validate_duplicate_cache(data: &DuplicateDisk) -> Result<(), String> {
+    if data.roots.len() > 64
+        || data.roots.iter().any(|p| !p.is_absolute())
+        || data.min_size < 100 * 1024
+        || data.min_size > 100 * 1024 * 1024
+        || data.removed.len() > 500_000
+        || data.groups.as_ref().is_some_and(|groups| {
+            groups.len() > 3000
+                || groups.iter().any(|g| {
+                    g.files.len() > 100_000 || g.files.iter().any(|f| !f.path.is_absolute())
+                })
+        })
+    {
+        return Err("Saved duplicate results are invalid.".into());
+    }
+    if data.groups.as_ref().is_some_and(|groups| {
+        groups
+            .iter()
+            .try_fold(0u64, |sum, group| {
+                group
+                    .size
+                    .checked_mul(group.files.len() as u64)
+                    .and_then(|n| sum.checked_add(n))
+            })
+            .is_none_or(|n| n > u64::MAX / 4)
+    }) {
+        return Err("Saved duplicate totals are invalid.".into());
+    }
+    Ok(())
+}
+
 pub struct DupState {
     pub roots: Vec<PathBuf>,
     pub min_size: u64,
     pub scan: Task<Vec<DupGroup>>,
     pub progress: Option<Arc<DupProgress>>,
     pub started: Option<Instant>,
-    pub groups: Option<Vec<DupGroup>>,
+    pub groups: Option<Arc<Vec<DupGroup>>>,
+    pub cache: DuplicateCache,
     pub selected: HashSet<PathBuf>,
     pub removed: HashSet<PathBuf>,
     pub recycle: Task<util::RecycleReport>,
@@ -452,10 +514,17 @@ impl Default for DupState {
             progress: None,
             started: None,
             groups: None,
+            cache: DuplicateCache::default(),
             selected: HashSet::new(),
             removed: HashSet::new(),
             recycle: Task::default(),
         }
+    }
+}
+
+impl DupState {
+    pub(crate) fn saved_requires_refresh(&self) -> bool {
+        self.cache.from_disk || self.cache.load.running()
     }
 }
 
@@ -473,6 +542,73 @@ enum DAct {
 }
 
 impl App {
+    pub(crate) fn restore_duplicate_cache(&mut self, ctx: &egui::Context) {
+        self.dups.cache.load = Task::spawn(ctx, || {
+            let mut value = crate::scan_cache::load::<DuplicateDisk>("duplicates.json")?;
+            if let Some(v) = &mut value {
+                validate_duplicate_cache(&v.data)?;
+                if let Some(groups) = &mut v.data.groups {
+                    for group in groups {
+                        for file in &mut group.files {
+                            file.block = util::block_reason_fast(&file.path);
+                        }
+                    }
+                }
+            }
+            Ok(value)
+        });
+    }
+    pub(crate) fn poll_duplicate_cache(&mut self, ctx: &egui::Context) {
+        if let Some(result) = self.dups.cache.load.poll() {
+            match result.and_then(|r| r) {
+                Ok(Some(value)) if !self.dups.scan.running() && self.dups.groups.is_none() => {
+                    self.dups.roots = value.data.roots;
+                    self.dups.min_size = value.data.min_size;
+                    self.dups.groups = value.data.groups.map(Arc::new);
+                    self.dups.removed = value.data.removed;
+                    self.dups.cache.stamp = value.data.scanned;
+                    self.dups.cache.from_disk = self.dups.groups.is_some();
+                }
+                Ok(_) => {}
+                Err(e) => self.dups.cache.error = Some(e),
+            }
+        }
+        if let Some(result) = self.dups.cache.save.poll() {
+            if let Err(e) = result.and_then(|r| r) {
+                self.dups.cache.error = Some(e);
+            } else {
+                self.dups.cache.error = None;
+            }
+        }
+        if !self.dups.cache.save.running()
+            && !self.dups.scan.running()
+            && self
+                .dups
+                .cache
+                .dirty
+                .is_some_and(|at| at.elapsed() >= std::time::Duration::from_millis(700))
+        {
+            let roots = self.dups.roots.clone();
+            let min_size = self.dups.min_size;
+            let groups = self.dups.groups.clone();
+            let removed = self.dups.removed.clone();
+            let scanned = self.dups.cache.stamp;
+            self.dups.cache.dirty = None;
+            self.dups.cache.save = Task::spawn(ctx, move || {
+                crate::scan_cache::save(
+                    "duplicates.json",
+                    crate::scan_cache::now(),
+                    &DuplicateDiskRef {
+                        roots: &roots,
+                        min_size,
+                        groups: groups.as_ref().map(|g| g.as_slice()),
+                        removed: &removed,
+                        scanned,
+                    },
+                )
+            });
+        }
+    }
     pub fn poll_duplicates(&mut self) {
         if let Some(r) = self.dups.scan.poll() {
             match r {
@@ -494,7 +630,22 @@ impl App {
                             "Duplicate scan stopped. Start a new scan when ready.",
                         );
                     } else {
-                        self.dups.groups = Some(groups);
+                        self.dups.groups = Some(Arc::new(groups));
+                        self.dups.cache.stamp = Some(
+                            self.dups
+                                .progress
+                                .as_ref()
+                                .map(|p| p.cache_stamp.load(Ordering::Relaxed))
+                                .filter(|n| *n > 0)
+                                .unwrap_or_else(crate::scan_cache::now),
+                        );
+                        self.dups.cache.error = self
+                            .dups
+                            .progress
+                            .as_ref()
+                            .and_then(|p| p.cache_error.lock().ok().and_then(|m| m.clone()));
+                        self.dups.cache.from_disk = false;
+                        self.dups.cache.dirty = None;
                     }
                 }
                 Err(e) => self.toast(ToastKind::Error, format!("Duplicate scan failed: {e}")),
@@ -546,6 +697,7 @@ impl App {
         let ctx = ui.ctx().clone();
         let mut acts = Vec::new();
         self.render_duplicates(ui, &mut acts);
+        let cache_changed = !acts.is_empty();
         for a in acts {
             match a {
                 DAct::AddFolder => {
@@ -575,7 +727,30 @@ impl App {
                     let p2 = prog.clone();
                     let roots = self.dups.roots.clone();
                     let min = self.dups.min_size;
-                    self.dups.scan = Task::spawn(&ctx, move || find(roots, min, p2));
+                    self.dups.scan = Task::spawn(&ctx, move || {
+                        let groups = find(roots.clone(), min, p2.clone());
+                        if !p2.cancel.load(Ordering::Relaxed) {
+                            set_stage(&p2, "Saving results for next time…", 0);
+                            let stamp = crate::scan_cache::now();
+                            let empty = HashSet::new();
+                            let data = DuplicateDiskRef {
+                                roots: &roots,
+                                min_size: min,
+                                groups: Some(&groups),
+                                removed: &empty,
+                                scanned: Some(stamp),
+                            };
+                            if let Err(error) =
+                                crate::scan_cache::save("duplicates.json", stamp, &data)
+                            {
+                                if let Ok(mut message) = p2.cache_error.lock() {
+                                    *message = Some(error);
+                                }
+                            }
+                            p2.cache_stamp.store(stamp, Ordering::Relaxed);
+                        }
+                        groups
+                    });
                     self.dups.progress = Some(prog);
                     self.dups.started = Some(Instant::now());
                     self.dups.groups = None;
@@ -618,7 +793,7 @@ impl App {
                 DAct::AutoKeep(newest) => {
                     if let Some(groups) = &self.dups.groups {
                         let mut sel = HashSet::new();
-                        for g in groups {
+                        for g in groups.iter() {
                             let live: Vec<&DupFile> = g
                                 .files
                                 .iter()
@@ -645,9 +820,17 @@ impl App {
                 DAct::ClearSel => self.dups.selected.clear(),
                 DAct::Show(p) => util::show_in_explorer(&p),
                 DAct::AskRecycle => {
+                    if self.dups.cache.from_disk {
+                        self.toast(
+                            ToastKind::Info,
+                            "Refresh these saved duplicate results before moving files.",
+                        );
+                        continue;
+                    }
+
                     let mut items = Vec::new();
                     if let Some(groups) = &self.dups.groups {
-                        for g in groups {
+                        for g in groups.iter() {
                             for f in &g.files {
                                 if self.dups.selected.contains(&f.path) {
                                     items.push((f.path.clone(), g.size));
@@ -659,6 +842,9 @@ impl App {
                 }
             }
         }
+        if cache_changed {
+            self.dups.cache.dirty = Some(Instant::now());
+        }
     }
 
     fn render_duplicates(&self, ui: &mut Ui, acts: &mut Vec<DAct>) {
@@ -668,7 +854,27 @@ impl App {
             "Duplicate files",
             "Finds files with exactly the same contents, byte for byte, so you only keep one copy.",
         );
-        let scanning = d.scan.running();
+        if d.cache.load.running() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(widgets::dim("Restoring saved duplicate results…"));
+            });
+        }
+        if let Some(stamp) = d.cache.stamp {
+            ui.label(widgets::dim(format!(
+                "Scan from {}. {}",
+                crate::scan_cache::saved_label(stamp),
+                if d.cache.from_disk {
+                    "Saved results · Find duplicates again before moving files."
+                } else {
+                    "Files are checked again before recycling."
+                }
+            )));
+        }
+        if let Some(error) = &d.cache.error {
+            ui.label(widgets::faint(format!("Saving duplicate results: {error}")));
+        }
+        let scanning = d.scan.running() || d.cache.load.running();
 
         widgets::card(ui, |ui| {
             ui.label(widgets::strong("Where to look", 15.0));
@@ -724,7 +930,7 @@ impl App {
                         }
                     } else if ui
                         .add_enabled(
-                            !d.roots.is_empty() && !d.recycle.running(),
+                            !d.roots.is_empty() && !d.recycle.running() && !d.cache.load.running(),
                             widgets::primary(widgets::icon_text(
                                 ic::SEARCH,
                                 "Find duplicates",
@@ -828,7 +1034,7 @@ impl App {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui
                     .add_enabled(
-                        !d.selected.is_empty() && !d.recycle.running(),
+                        !d.selected.is_empty() && !d.recycle.running() && !d.cache.from_disk,
                         widgets::danger(widgets::icon_text(
                             ic::CLEAN,
                             &format!("Move {} selected to Recycle Bin", fmt_bytes(sel_bytes)),
@@ -923,6 +1129,37 @@ impl App {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn saved_duplicate_results_roundtrip_and_reject_invalid_roots() {
+        let mut disk = DuplicateDisk {
+            roots: vec![PathBuf::from(r"C:\data")],
+            min_size: 1024 * 1024,
+            groups: Some(vec![DupGroup {
+                size: 4,
+                files: vec![
+                    DupFile {
+                        path: PathBuf::from(r"C:\data\one.bin"),
+                        modified: Some(SystemTime::UNIX_EPOCH),
+                        block: None,
+                    },
+                    DupFile {
+                        path: PathBuf::from(r"C:\data\two.bin"),
+                        modified: Some(SystemTime::UNIX_EPOCH),
+                        block: None,
+                    },
+                ],
+            }]),
+            removed: HashSet::new(),
+            scanned: Some(crate::scan_cache::now()),
+        };
+        let decoded: DuplicateDisk =
+            serde_json::from_slice(&serde_json::to_vec(&disk).unwrap()).unwrap();
+        validate_duplicate_cache(&decoded).unwrap();
+        assert_eq!(decoded.groups.unwrap()[0].files.len(), 2);
+        disk.roots.push(PathBuf::from("relative-path"));
+        assert!(validate_duplicate_cache(&disk).is_err());
+    }
 
     struct TestDir(PathBuf);
     impl TestDir {

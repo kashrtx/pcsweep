@@ -5,7 +5,7 @@ use crate::task::Task;
 use crate::theme::*;
 use crate::util;
 use crate::widgets::{self, ic};
-use eframe::egui::{self, Align, Layout, RichText, ScrollArea, Ui};
+use eframe::egui::{self, RichText, ScrollArea, Ui};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use winreg::enums::*;
@@ -168,7 +168,7 @@ impl Journal {
         let mut ids = HashSet::new();
         for entry in &journal.entries {
             preference(&entry.id)?;
-            if !ids.insert(&entry.id) || entry.after != RawValue::dword(0) {
+            if !ids.insert(&entry.id) || !matches!(entry.after.as_dword(), Some(0 | 1)) {
                 return Err("The privacy undo journal contains an invalid operation".into());
             }
             if let Some(before) = &entry.before {
@@ -224,8 +224,8 @@ impl Store for RegistryStore {
         let root = RegKey::predef(HKEY_CURRENT_USER);
         match value {
             Some(value) => {
-                let key = root
-                    .open_subkey_with_flags(p.key, KEY_SET_VALUE | KEY_QUERY_VALUE)
+                let (key, _) = root
+                    .create_subkey_with_flags(p.key, KEY_SET_VALUE | KEY_QUERY_VALUE)
                     .map_err(|e| e.to_string())?;
                 key.set_raw_value(p.value, &value.to_registry()?)
                     .map_err(|e| e.to_string())?;
@@ -272,7 +272,17 @@ impl Store for RegistryStore {
     }
 }
 
+#[cfg(test)]
 fn apply<S: Store>(store: &mut S, id: &str, expected: Option<RawValue>) -> Result<(), String> {
+    apply_value(store, id, expected, false)
+}
+
+fn apply_value<S: Store>(
+    store: &mut S,
+    id: &str,
+    expected: Option<RawValue>,
+    enabled: bool,
+) -> Result<(), String> {
     preference(id)?;
     let mut journal = store.journal()?;
     if journal.entries.iter().any(|entry| entry.id == id) {
@@ -283,15 +293,20 @@ fn apply<S: Store>(store: &mut S, id: &str, expected: Option<RawValue>) -> Resul
     if store.read(id)? != expected {
         return Err("The preference changed since review. Refresh and try again.".into());
     }
-    let after = RawValue::dword(0);
+    let after = RawValue::dword(u32::from(enabled));
     journal.entries.push(UndoEntry {
         id: id.into(),
-        before: expected,
+        before: expected.clone(),
         after: after.clone(),
     });
     // Persist the original bytes before making the first change. Even an
     // interrupted write leaves enough information to offer a precise undo.
     store.save_journal(&journal)?;
+    if store.read(id)? != expected {
+        return Err(
+            "The preference changed while saving Undo. Its newer value was preserved.".into(),
+        );
+    }
     store.write(id, Some(&after))?;
     if store.read(id)? != Some(after) {
         return Err("Windows did not retain the preference. The undo point is preserved.".into());
@@ -388,14 +403,17 @@ fn available(p: &Preference, build: u32) -> bool {
     build >= 10240 && p.max_build.is_none_or(|max| build <= max)
 }
 
+#[derive(Clone)]
 struct Item {
     id: String,
     value: Option<RawValue>,
     status: String,
     can_disable: bool,
+    can_enable: bool,
     can_undo: bool,
 }
 
+#[derive(Clone)]
 struct Inventory {
     build: u32,
     edition: String,
@@ -421,11 +439,13 @@ fn inventory() -> Inventory {
             .ok()
             .and_then(|j| j.entries.iter().find(|e| e.id == p.id));
         let read = store.read(p.id);
+        let readable = read.is_ok();
         let value = read.as_ref().ok().cloned().flatten();
         let policy = policy_present(p);
         let managed = policy.as_ref().copied().unwrap_or(true);
         let supported = available(p, build);
         let bit = value.as_ref().and_then(RawValue::as_dword);
+        let configurable = readable && (value.is_none() || matches!(bit, Some(0 | 1)));
         let status = if let Err(e) = read {
             format!("Could not read: {e}")
         } else if let Err(e) = policy {
@@ -438,7 +458,8 @@ fn inventory() -> Inventory {
             match bit {
                 Some(0) => "Off (saved preference)".into(),
                 Some(1) => "On (saved preference)".into(),
-                _ => "Not recognized on this PC — review in Windows".into(),
+                _ if value.is_none() => "Not configured · choose On or Off".into(),
+                _ => "Unrecognized value · preserved".into(),
             }
         };
         items.push(Item {
@@ -447,7 +468,14 @@ fn inventory() -> Inventory {
             status,
             can_disable: supported
                 && !managed
-                && bit == Some(1)
+                && configurable
+                && bit != Some(0)
+                && saved.is_none()
+                && journal_error.is_none(),
+            can_enable: supported
+                && !managed
+                && configurable
+                && bit != Some(1)
                 && saved.is_none()
                 && journal_error.is_none(),
             can_undo: !managed && saved.is_some() && journal_error.is_none(),
@@ -504,6 +532,10 @@ fn inventory() -> Inventory {
 #[derive(Clone)]
 pub enum PrivacyAction {
     Disable {
+        id: String,
+        expected: Option<RawValue>,
+    },
+    Enable {
         id: String,
         expected: Option<RawValue>,
     },
@@ -585,6 +617,44 @@ impl Drop for PrivacyLock {
     }
 }
 
+fn set_preference(id: String, expected: Option<RawValue>, enabled: bool) -> Result<String, String> {
+    let p = preference(&id)?;
+    if !available(p, windows_build()) || policy_present(p)? {
+        return Err(
+            "This preference is unavailable or managed. Refresh before changing it.".into(),
+        );
+    }
+    if expected
+        .as_ref()
+        .is_some_and(|v| !matches!(v.as_dword(), Some(0 | 1)))
+    {
+        return Err("The existing value is unrecognized and was preserved.".into());
+    }
+    apply_value(&mut RegistryStore, &id, expected, enabled)?;
+    broadcast_preferences();
+    Ok(format!(
+        "Turned {} {}. Windows may apply the change after sign-out.",
+        if enabled { "on" } else { "off" },
+        p.name
+    ))
+}
+
+fn broadcast_preferences() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::*;
+    let area: Vec<u16> = "ImmersiveColorSet".encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        SendMessageTimeoutW(
+            HWND_BROADCAST,
+            WM_SETTINGCHANGE,
+            0,
+            area.as_ptr() as isize,
+            SMTO_ABORTIFHUNG,
+            1000,
+            std::ptr::null_mut(),
+        );
+    }
+}
+
 fn execute(action: PrivacyAction) -> Result<String, String> {
     let _lock = PrivacyLock::acquire()?;
     match action {
@@ -592,22 +662,8 @@ fn execute(action: PrivacyAction) -> Result<String, String> {
             clear_clipboard()?;
             Ok("Cleared the current clipboard. Windows clipboard history was kept.".into())
         }
-        PrivacyAction::Disable { id, expected } => {
-            let p = preference(&id)?;
-            if !available(p, windows_build()) || policy_present(p)? {
-                return Err(
-                    "This preference is unavailable or managed. Refresh before changing it.".into(),
-                );
-            }
-            if expected.as_ref().and_then(RawValue::as_dword) != Some(1) {
-                return Err("Only a recognized enabled preference can be turned off".into());
-            }
-            apply(&mut RegistryStore, &id, expected)?;
-            Ok(format!(
-                "Turned off {}. Windows may apply the change after sign-out.",
-                p.name
-            ))
-        }
+        PrivacyAction::Disable { id, expected } => set_preference(id, expected, false),
+        PrivacyAction::Enable { id, expected } => set_preference(id, expected, true),
         PrivacyAction::Undo(id) => {
             let p = preference(&id)?;
             if policy_present(p)? {
@@ -616,6 +672,7 @@ fn execute(action: PrivacyAction) -> Result<String, String> {
                 );
             }
             undo(&mut RegistryStore, &id)?;
+            broadcast_preferences();
             Ok(format!("Restored the original {} preference", p.name))
         }
     }
@@ -655,6 +712,7 @@ pub(crate) fn preview_fixture() -> PrivacyState {
                     "On (saved preference)".into()
                 },
                 can_disable: supported && i > 0,
+                can_enable: false,
                 can_undo: i == 0,
             }
         })
@@ -672,6 +730,16 @@ pub(crate) fn preview_fixture() -> PrivacyState {
         }),
         ..Default::default()
     }
+}
+
+#[cfg(test)]
+pub(crate) fn preview_enable_fixture() -> PrivacyState {
+    let mut state = preview_fixture();
+    if let Some(item) = state.inventory.as_mut().and_then(|i| i.items.first_mut()) {
+        item.can_undo = false;
+        item.can_enable = true;
+    }
+    state
 }
 
 impl App {
@@ -717,8 +785,8 @@ impl App {
             self.refresh_privacy(&ctx);
         }
         widgets::page_header(ui, "Privacy and distractions", "Review your account's preferences, reduce suggestions, and keep a precise undo point for each change.");
-        let busy = self.privacy.busy() || self.privacy.load.running();
-        ui.horizontal(|ui| {
+        let busy = self.mutations_running() || self.privacy.load.running();
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(
                     !busy,
@@ -727,6 +795,7 @@ impl App {
                 .clicked()
             {
                 self.refresh_privacy(&ctx);
+                self.refresh_preferences(&ctx);
             }
             if busy {
                 ui.spinner();
@@ -744,7 +813,7 @@ impl App {
                 )));
             }
         });
-        let Some(inv) = &self.privacy.inventory else {
+        let Some(inv) = self.privacy.inventory.as_ref().cloned() else {
             ui.label(widgets::dim(if self.privacy.load.running() {
                 "Reading this account's privacy preferences…"
             } else {
@@ -757,63 +826,57 @@ impl App {
             if let Some(error) = &inv.journal_error {
                 widgets::banner(ui, WARN, ic::WARN, |ui| { ui.label(error); });
             }
-            ui.label(widgets::faint("Preferences are read back after every change. Windows builds and organization policy can affect the visible result; use Review in Windows to inspect it. Existing or unrecognized policy is never overridden."));
+            ui.label(widgets::faint("Change preferences here. Each change saves an exact Undo point and reads the value back. Existing organization policies and unrecognized values are preserved."));
             widgets::section(ui, "Your account preferences");
             for item in &inv.items {
                 let Ok(p) = preference(&item.id) else { continue; };
                 widgets::tight_frame().show(ui, |ui| {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label(widgets::icon(ic::SHIELD, 18.0, ACCENT));
                         ui.label(widgets::strong(p.name, 15.0));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.add(widgets::small("Review in Windows")).clicked() { util::open_uri(p.settings); }
-                            if item.can_undo && ui.add_enabled(!busy, widgets::small("Undo PCSweep change")).clicked() {
-                                requested = Some((format!("Restore {}?", p.name), "Restore the exact value saved before PCSweep changed it. A newer choice made elsewhere will not be overwritten.".into(), PrivacyAction::Undo(item.id.clone()), false));
-                            } else if item.can_disable && ui.add_enabled(!busy, widgets::small("Turn off")).clicked() {
-                                requested = Some((format!("Turn off {}?", p.name), p.description.into(), PrivacyAction::Disable { id: item.id.clone(), expected: item.value.clone() }, false));
-                            }
-                        });
                     });
                     ui.label(widgets::dim(p.description));
                     ui.label(RichText::new(&item.status).color(if item.can_disable { WARN } else { TEXT_DIM }).size(12.5));
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.add_enabled(!busy && item.can_disable, widgets::small("Turn off")).clicked() {
+                            requested = Some((format!("Turn off {}?", p.name), p.description.into(), PrivacyAction::Disable { id: item.id.clone(), expected: item.value.clone() }, false));
+                        }
+                        if ui.add_enabled(!busy && item.can_enable, widgets::small("Turn on")).clicked() {
+                            requested = Some((format!("Turn on {}?", p.name), format!("Allow this Windows account to use {}. The previous value will be saved for Undo.", p.name), PrivacyAction::Enable { id: item.id.clone(), expected: item.value.clone() }, false));
+                        }
+                        if ui.add_enabled(!busy && item.can_undo, widgets::small("Undo PCSweep change")).clicked() {
+                            requested = Some((format!("Restore {}?", p.name), "Restore the exact value saved before PCSweep changed it. A newer choice made elsewhere will not be overwritten.".into(), PrivacyAction::Undo(item.id.clone()), false));
+                        }
+                    });
                 });
                 ui.add_space(4.0);
             }
-            widgets::section(ui, "Personalization and permissions");
+            self.render_direct_preferences(ui, crate::preferences::Section::Privacy);
+            widgets::section(ui, "Clipboard contents");
             widgets::card(ui, |ui| {
-                ui.label(widgets::strong("Personalized offers and optional diagnostics", 15.0));
-                ui.label(widgets::dim("Review personalized offers (formerly Tailored experiences), Settings suggestions and optional diagnostic data. Windows still sends required diagnostic data on Home and Pro. These controls do not remove malware."));
-                ui.horizontal_wrapped(|ui| {
-                    if ui.add(widgets::small("Recommendations and offers")).clicked() { util::open_uri("ms-settings:privacy-general"); }
-                    if ui.add(widgets::small("Diagnostic data")).clicked() { util::open_uri("ms-settings:privacy-feedback"); }
-                    if ui.add(widgets::small("Start recommendations")).clicked() { util::open_uri("ms-settings:personalization-start"); }
-                    if ui.add(widgets::small("Search permissions")).clicked() { util::open_uri("ms-settings:search-permissions"); }
-                });
-                ui.add_space(5.0);
-                ui.label(widgets::strong("App permissions", 15.0));
-                ui.horizontal_wrapped(|ui| {
-                    for (label, uri) in [("Camera", "ms-settings:privacy-webcam"), ("Microphone", "ms-settings:privacy-microphone"), ("Location", "ms-settings:privacy-location")] {
-                        if ui.add(widgets::small(label)).clicked() { util::open_uri(uri); }
-                    }
-                });
-            });
-            widgets::section(ui, "AI privacy");
-            widgets::card(ui, |ui| {
-                ui.label(widgets::strong("Recall and snapshots", 15.0));
-                ui.label(widgets::dim(&inv.recall));
-                ui.label(widgets::faint("Recall is opt-in and processes snapshots locally. Review saving, app/site filters, storage and deletion in Windows. Windows Hello protects changes; PCSweep does not read your snapshots."));
-                if ui.add_enabled(inv.build >= 26100, widgets::small("Review Recall and snapshots")).clicked() { util::open_uri("ms-settings:privacy-recall"); }
-            });
-            widgets::section(ui, "Clipboard privacy");
-            widgets::card(ui, |ui| {
-                ui.label(widgets::strong("Clipboard history and cloud sync", 15.0));
+                ui.label(widgets::strong("Clear the current clipboard", 15.0));
                 ui.label(widgets::dim(&inv.clipboard));
                 ui.label(widgets::faint("History and synchronization are separate choices. Clearing the current clipboard does not delete pinned history or cloud items; review those in Windows."));
                 ui.horizontal_wrapped(|ui| {
-                    if ui.add(widgets::small("Review history and sync")).clicked() { util::open_uri("ms-settings:clipboard"); }
                     if ui.add_enabled(!busy, widgets::small("Clear current clipboard…")).clicked() {
                         requested = Some(("Clear the current clipboard?".into(), "The content currently available for Paste will be removed. Clipboard history and cloud items are kept. This cannot be undone.".into(), PrivacyAction::ClearClipboard, true));
                     }
+                });
+            });
+            egui::CollapsingHeader::new("Advanced permissions and Windows consent").show(ui, |ui| {
+                ui.label(widgets::dim("Per-app camera, microphone and location permissions, Recall enrollment and protected snapshot deletion use Windows' consent interfaces."));
+                ui.label(widgets::faint(&inv.recall));
+                ui.horizontal_wrapped(|ui| {
+                    for (label, uri) in [("Camera permissions", "ms-settings:privacy-webcam"), ("Microphone permissions", "ms-settings:privacy-microphone"), ("Location permissions", "ms-settings:privacy-location"), ("Recall consent and stored snapshots", "ms-settings:privacy-recall")] {
+                        if ui.add(widgets::small(label)).clicked() { util::open_uri(uri); }
+                    }
+                });
+                egui::CollapsingHeader::new("Open an original Windows preference page").show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        for p in PREFERENCES {
+                            if ui.add(widgets::small(p.name)).clicked() { util::open_uri(p.settings); }
+                        }
+                    });
                 });
             });
             ui.add_space(15.0);
@@ -912,6 +975,24 @@ mod tests {
             undo(&mut store, "advertising_id").unwrap();
             assert_eq!(store.read("advertising_id").unwrap(), original);
             assert!(store.journal().unwrap().entries.is_empty());
+        }
+    }
+
+    #[test]
+    fn enabling_a_preference_preserves_off_and_absent_originals_for_undo() {
+        for original in [None, Some(RawValue::dword(0))] {
+            let mut store = MemoryStore::default();
+            if let Some(v) = &original {
+                store.values.insert("advertising_id".into(), v.clone());
+            }
+            apply_value(&mut store, "advertising_id", original.clone(), true).unwrap();
+            assert_eq!(
+                store.read("advertising_id").unwrap(),
+                Some(RawValue::dword(1))
+            );
+            assert_eq!(store.journal().unwrap().entries[0].before, original);
+            undo(&mut store, "advertising_id").unwrap();
+            assert_eq!(store.read("advertising_id").unwrap(), original);
         }
     }
 

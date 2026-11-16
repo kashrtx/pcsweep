@@ -17,7 +17,7 @@ use eframe::egui::{
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Page {
     Dashboard,
     Cleaner,
@@ -41,6 +41,36 @@ pub enum Page {
     FileChanges,
 }
 
+const SESSION_KEY: &str = r"Software\PCSweep\Session";
+
+fn load_session() -> (Page, [f32; 2]) {
+    use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+    let Ok(key) = RegKey::predef(HKEY_CURRENT_USER).open_subkey(SESSION_KEY) else {
+        return (Page::Dashboard, [1320.0, 860.0]);
+    };
+    let page = key
+        .get_value::<String, _>("Page")
+        .ok()
+        .filter(|s| s.len() < 128)
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(Page::Dashboard);
+    let width = key
+        .get_value::<u32, _>("Width")
+        .ok()
+        .filter(|n| (900..=7680).contains(n))
+        .unwrap_or(1320);
+    let height = key
+        .get_value::<u32, _>("Height")
+        .ok()
+        .filter(|n| (520..=4320).contains(n))
+        .unwrap_or(860);
+    (page, [width as f32, height as f32])
+}
+
+pub fn saved_window_size() -> [f32; 2] {
+    load_session().1
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ToastKind {
     Info,
@@ -62,6 +92,7 @@ pub enum Origin {
 
 /// Everything that changes the system goes through a confirmation dialog first.
 pub enum Action {
+    QuitApp,
     CleanJunk,
     Recycle {
         items: Vec<(PathBuf, u64)>,
@@ -74,6 +105,7 @@ pub enum Action {
     RunTool(usize),
     Uninstall(crate::apps::InstalledApp),
     Privacy(crate::privacy::PrivacyAction),
+    Preferences(crate::preferences::PreferencesAction),
     Security(crate::security::SecurityAction),
     Background(crate::background::BackgroundAction),
     Update(crate::updates::UpdateAction),
@@ -109,6 +141,7 @@ pub struct App {
     pub tools: ToolsState,
     pub mem: MemState,
     pub privacy: crate::privacy::PrivacyState,
+    pub preferences: crate::preferences::PreferencesState,
     pub security: crate::security::SecurityState,
     pub background: crate::background::BackgroundState,
     pub updates: crate::updates::UpdateState,
@@ -129,18 +162,107 @@ pub struct App {
     /// When the current confirmation first appeared; its action stays disarmed
     /// briefly so a click or key press meant for the page can't confirm it.
     modal_since: Option<Instant>,
+    last_window_size: [f32; 2],
+    tray: crate::tray::Tray,
+    keep_background: bool,
+    background_hidden: bool,
+    app_options_open: bool,
+    tray_error: Option<String>,
+    pub(crate) force_exit: bool,
 }
 
 /// How long a new confirmation ignores its confirm button.
 const MODAL_ARMING: Duration = Duration::from_millis(400);
 
+fn hide_on_close(force_exit: bool, keep_background: bool, tray_available: bool) -> bool {
+    !force_exit && keep_background && tray_available
+}
+
 impl App {
+    fn show_from_background(&mut self, ctx: &egui::Context) {
+        self.background_hidden = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    fn poll_tray(&mut self, ctx: &egui::Context) {
+        for event in self.tray.poll() {
+            match event {
+                crate::tray::TrayEvent::Ready => self.tray_error = None,
+                crate::tray::TrayEvent::Failed(reason) => {
+                    self.tray_error = Some(reason);
+                    if self.background_hidden {
+                        self.show_from_background(ctx);
+                    }
+                }
+                crate::tray::TrayEvent::Show => self.show_from_background(ctx),
+                crate::tray::TrayEvent::CheckUpdates => {
+                    self.show_from_background(ctx);
+                    self.page = Page::Updates;
+                    self.begin_update_check(ctx);
+                }
+                crate::tray::TrayEvent::Quit => {
+                    if self.mutations_running() {
+                        self.show_from_background(ctx);
+                        self.modal = Some(Modal {
+                            title: "Quit while an operation is running?".into(),
+                            body: "An active cleanup, download or Windows change may be interrupted. Completed changes remain applied; unfinished history may be uncertain. You can keep PCSweep running in the background until it finishes.".into(),
+                            details: Vec::new(), note: None, confirm: "Quit anyway".into(), danger: true, action: Action::QuitApp,
+                        });
+                    } else {
+                        self.force_exit = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                }
+            }
+        }
+    }
+
+    fn app_options_ui(&mut self, ctx: &egui::Context) {
+        if !self.app_options_open || self.modal.is_some() {
+            return;
+        }
+        let mut open = self.app_options_open;
+        let mut keep = self.keep_background;
+        let mut automatic = self.updates.automatic_checks();
+        egui::Window::new("PCSweep options").open(&mut open).collapsible(false).resizable(false).default_width(480.0).show(ctx, |ui| {
+            ui.add(egui::Label::new("Choose how PCSweep stays available. No background cleanup, speed tests or Windows changes run automatically.").wrap());
+            ui.add_space(8.0);
+            ui.add_enabled(self.tray.available(), egui::Checkbox::new(&mut keep, "Keep running in the notification area when I close the window"));
+            ui.add(egui::Label::new("Use the PCSweep notification icon to show the window, check for updates, or Quit. The normal Minimize button also keeps the app running.").wrap());
+            if let Some(reason) = &self.tray_error { ui.colored_label(WARN, format!("Notification icon unavailable: {reason}")); }
+            else if !self.tray.available() { ui.label(widgets::dim("Starting the notification icon…")); }
+            ui.add_space(10.0);
+            ui.checkbox(&mut automatic, "Check for PCSweep updates automatically once a day");
+            ui.add(egui::Label::new("Works while the window is open or PCSweep is running in the background. Checks contact GitHub; updates install only when you choose. PCSweep does not add itself to Windows startup.").wrap());
+            if ui.add(widgets::small("Open Updates")).clicked() { self.page = Page::Updates; }
+        });
+        self.app_options_open = open;
+        if keep != self.keep_background {
+            self.keep_background = keep;
+            if let Ok((key, _)) =
+                winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER).create_subkey(SESSION_KEY)
+            {
+                let _ = key.set_value("KeepBackground", &u32::from(keep));
+            }
+        }
+        if automatic != self.updates.automatic_checks() {
+            self.set_automatic_update_checks(automatic);
+        }
+    }
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::setup_fonts(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx);
         let is_admin = system::is_admin();
+        let (page, last_window_size) = load_session();
+        let keep_background = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
+            .open_subkey(SESSION_KEY)
+            .and_then(|k| k.get_value::<u32, _>("KeepBackground"))
+            .ok()
+            == Some(1);
         let mut app = Self {
-            page: Page::Dashboard,
+            page,
             is_admin,
             sys: SysMon::new(),
             cleaner: CleanerState::new(),
@@ -151,6 +273,7 @@ impl App {
             tools: ToolsState::default(),
             mem: MemState::default(),
             privacy: Default::default(),
+            preferences: Default::default(),
             security: Default::default(),
             background: Default::default(),
             updates: Default::default(),
@@ -169,6 +292,13 @@ impl App {
             last_nav_page: None,
             reveal_nav_frames: 0,
             modal_since: None,
+            last_window_size,
+            tray: crate::tray::Tray::start(&cc.egui_ctx),
+            keep_background,
+            background_hidden: false,
+            app_options_open: false,
+            tray_error: None,
+            force_exit: false,
         };
         util::load_log_history();
         util::log(format!(
@@ -177,8 +307,9 @@ impl App {
             if is_admin { " as administrator" } else { "" }
         ));
         app.startup.reload();
-        app.start_junk_scan(&cc.egui_ctx);
+        app.restore_scan_caches(&cc.egui_ctx);
         app.start_apps_load(&cc.egui_ctx);
+        app.refresh_windows_controls(&cc.egui_ctx);
         app
     }
 
@@ -233,11 +364,15 @@ impl App {
 
     fn execute(&mut self, action: Action, ctx: &egui::Context) {
         let resolving_dns = matches!(&action, Action::Ads(action) if action.is_resolution());
-        if self.mutations_running() && !resolving_dns {
+        if self.mutations_running() && !resolving_dns && !matches!(action, Action::QuitApp) {
             self.toast(ToastKind::Info, "An operation is already running. Wait for it to finish before starting another change.");
             return;
         }
         match action {
+            Action::QuitApp => {
+                self.force_exit = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
             Action::CleanJunk => self.start_clean(ctx),
             Action::Recycle { items, origin } => self.start_recycle(items, origin, ctx),
             Action::Kill { pids, name } => {
@@ -263,6 +398,7 @@ impl App {
             Action::RunTool(i) => self.start_tool(i, ctx),
             Action::Uninstall(app) => self.launch_uninstall(&app),
             Action::Privacy(action) => self.execute_privacy(action, ctx),
+            Action::Preferences(action) => self.execute_preferences(action, ctx),
             Action::Security(action) => self.execute_security(action, ctx),
             Action::Background(action) => self.execute_background(action, ctx),
             Action::Update(action) => self.execute_update(action, ctx),
@@ -279,6 +415,7 @@ impl App {
 
     fn poll(&mut self, ctx: &egui::Context) {
         self.poll_history();
+        self.poll_scan_caches(ctx);
         self.poll_cleaner(ctx);
         self.poll_analyzer();
         self.poll_duplicates();
@@ -286,6 +423,7 @@ impl App {
         self.poll_tools();
         self.poll_memory();
         self.poll_privacy(ctx);
+        self.poll_preferences(ctx);
         self.poll_security(ctx);
         self.poll_background(ctx);
         self.poll_updates(ctx);
@@ -300,6 +438,7 @@ impl App {
             match r {
                 Ok(true) => {
                     util::log("Restarting as administrator");
+                    self.force_exit = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 _ => self.toast(ToastKind::Info, "Restart as administrator was cancelled."),
@@ -314,6 +453,7 @@ impl App {
             || self.apps.busy()
             || self.mem.job.running()
             || self.privacy.busy()
+            || self.preferences.busy()
             || self.security.busy()
             || self.background.busy()
             || self.ads.busy()
@@ -426,7 +566,7 @@ impl App {
         let reveal_selected = self.reveal_nav_frames > 0;
         self.reveal_nav_frames = self.reveal_nav_frames.saturating_sub(1);
         self.last_nav_page = Some(self.page);
-        let nav_height = (ui.available_height() - 100.0).max(100.0);
+        let nav_height = (ui.available_height() - 134.0).max(100.0);
         let mut navigation = ScrollArea::vertical()
             .id_salt("navigation_scroll")
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
@@ -453,6 +593,7 @@ impl App {
                     let badge = match page {
                         Page::Cleaner => junk_badge.as_deref(),
                         Page::Startup => startup_badge.as_deref(),
+                        Page::Updates if self.updates.has_available_update() => Some("New"),
                         _ => None,
                     };
                     let response =
@@ -478,6 +619,10 @@ impl App {
                 env!("CARGO_PKG_VERSION")
             )));
             ui.add_space(6.0);
+            if ui.add(widgets::small("App options")).clicked() {
+                self.app_options_open = true;
+            }
+            ui.add_space(4.0);
             if is_admin {
                 ui.horizontal(|ui| {
                     ui.label(widgets::icon(ic::SHIELD, 13.0, GOOD));
@@ -548,6 +693,7 @@ impl App {
             tools: Default::default(),
             mem: crate::processes::preview_fixture(),
             privacy: crate::privacy::preview_fixture(),
+            preferences: crate::preferences::preview_fixture(),
             security: crate::security::preview_fixture(),
             background: crate::background::preview_fixture(),
             updates: crate::updates::preview_fixture(),
@@ -566,6 +712,13 @@ impl App {
             last_nav_page: None,
             reveal_nav_frames: 0,
             modal_since: None,
+            last_window_size: [1320.0, 860.0],
+            tray: crate::tray::Tray::inert(),
+            keep_background: false,
+            background_hidden: false,
+            app_options_open: false,
+            tray_error: None,
+            force_exit: false,
         }
     }
 
@@ -787,7 +940,26 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_tray(ctx);
+        if ctx.input(|i| i.viewport().close_requested())
+            && hide_on_close(self.force_exit, self.keep_background, self.tray.available())
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.background_hidden = true;
+        }
+        if self.background_hidden {
+            self.poll(ctx);
+            self.toasts
+                .retain(|t| t.born.elapsed() < Duration::from_secs(7));
+            ctx.request_repaint_after(Duration::from_secs(if self.any_running() { 1 } else { 30 }));
+            return;
+        }
         theme::fit_to_viewport(ctx);
+        let size = ctx.screen_rect().size() * ctx.zoom_factor();
+        if size.x.is_finite() && size.y.is_finite() && size.x >= 900.0 && size.y >= 520.0 {
+            self.last_window_size = [size.x, size.y];
+        }
         // Re-apply the theme if Windows switches light/dark mode underneath us.
         if ctx.style().visuals.panel_fill != theme::BG {
             theme::apply(ctx);
@@ -833,17 +1005,43 @@ impl eframe::App for App {
             });
 
         self.modal_ui(ctx);
+        self.app_options_ui(ctx);
         self.toasts_ui(ctx);
         crate::updates::confirm_update_startup();
 
         let ms = if self.any_running() { 120 } else { 1000 };
         ctx.request_repaint_after(Duration::from_millis(ms));
     }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+        if let Ok((key, _)) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(SESSION_KEY) {
+            if let Ok(page) = serde_json::to_string(&self.page) {
+                let _ = key.set_value("Page", &page);
+            }
+            let _ = key.set_value(
+                "Width",
+                &(self.last_window_size[0].round().clamp(900.0, 7680.0) as u32),
+            );
+            let _ = key.set_value(
+                "Height",
+                &(self.last_window_size[1].round().clamp(520.0, 4320.0) as u32),
+            );
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_close_never_traps_forced_updates_quit_or_failed_tray() {
+        assert!(hide_on_close(false, true, true));
+        assert!(!hide_on_close(true, true, true));
+        assert!(!hide_on_close(false, true, false));
+        assert!(!hide_on_close(false, false, true));
+    }
 
     #[test]
     fn elevation_cannot_interrupt_an_active_operation() {

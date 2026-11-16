@@ -21,3 +21,11 @@ Official GitHub update checks/downloads, consented WinGet/Defender operations, o
 ## Windows change records
 
 Windows file-change and audit views read existing local records on request. They do not enable new global auditing. Some paths/program evidence is sensitive; the results remain local. Journal retention and audit coverage are limited, so absent entries do not prove that nothing changed.
+
+## Saved scans and background mode
+
+Analyzer, cleaner and duplicate snapshots are stored locally in the scan-cache folder beside the activity log. They can contain filenames and folder paths. Snapshots have bounded retention, are not uploaded, and are shown with their saved time. A refresh is required before destructive actions from restored results. The last page, window size and close-to-notification-area preference are saved locally.
+
+Notification-area mode is optional. It keeps this process running; it does not install a service or Windows startup entry. Optional daily GitHub update checks can continue while the window is hidden. Installation remains explicit. Update-reminder dismissal and the last recorded Windows installation age are local preferences; no missing-update catalog lookup runs automatically.
+
+Native application artwork is read from local app resources or the Windows Shell on workers. PCSweep does not launch an uninstaller or contact an icon-download service to obtain it.

@@ -262,18 +262,21 @@ fn populate_page_fixture(app: &mut App, page: Page) {
         .into_iter()
         .enumerate()
     {
-        app.cleaner.results[i] = Some(crate::cleaner::CatResult {
-            files: vec![crate::cleaner::JunkFile {
-                path: format!(r"C:\Users\Preview\AppData\Local\Temp\review-{i}.tmp").into(),
-                size,
-                modified: None,
-                created: None,
-            }],
-            bytes: size,
-            count: 1,
-            roots_found: 1,
-            ..Default::default()
-        });
+        app.cleaner.results[i] = Some(
+            crate::cleaner::CatResult {
+                files: vec![crate::cleaner::JunkFile {
+                    path: format!(r"C:\Users\Preview\AppData\Local\Temp\review-{i}.tmp").into(),
+                    size,
+                    modified: None,
+                    created: None,
+                }],
+                bytes: size,
+                count: 1,
+                roots_found: 1,
+                ..Default::default()
+            }
+            .into(),
+        );
     }
     if page == Page::Analyzer {
         let gb = 1024u64.pow(3);
@@ -294,44 +297,50 @@ fn populate_page_fixture(app: &mut App, page: Page) {
             children: Vec::new(),
         })
         .collect();
-        app.analyzer.result = Some(ScanResult {
-            root_path: r"C:\".into(),
-            root: Node {
-                name: "C:".into(),
-                size: 350 * gb,
-                files: 2_202_656,
-                kind: NodeKind::Dir,
-                modified: None,
-                children,
-            },
-            big: vec![FileRec {
-                path: r"C:\Users\Preview\Videos\recording.mp4".into(),
-                lower: r"c:\users\preview\videos\recording.mp4".into(),
-                size: gb,
-                modified: None,
-                block: None,
-            }],
-            exts: Vec::new(),
-            cats: vec![(FileCat::Video, gb, 1)],
-            elapsed: Duration::from_millis(97_500),
-            denied: 23,
-            dirs: 343_873,
-            cancelled: false,
-        });
+        app.analyzer.result = Some(
+            ScanResult {
+                root_path: r"C:\".into(),
+                root: Node {
+                    name: "C:".into(),
+                    size: 350 * gb,
+                    files: 2_202_656,
+                    kind: NodeKind::Dir,
+                    modified: None,
+                    children,
+                },
+                big: vec![FileRec {
+                    path: r"C:\Users\Preview\Videos\recording.mp4".into(),
+                    lower: r"c:\users\preview\videos\recording.mp4".into(),
+                    size: gb,
+                    modified: None,
+                    block: None,
+                }],
+                exts: Vec::new(),
+                cats: vec![(FileCat::Video, gb, 1)],
+                elapsed: Duration::from_millis(97_500),
+                denied: 23,
+                dirs: 343_873,
+                cancelled: false,
+            }
+            .into(),
+        );
     }
     if page == Page::Duplicates {
         app.dups.roots = vec![r"C:\Users\Preview\Videos".into()];
-        app.dups.groups = Some(vec![DupGroup {
-            size: 124_000_000,
-            files: ["original.mp4", "backup-copy.mp4", "another-copy.mp4"]
-                .into_iter()
-                .map(|name| DupFile {
-                    path: format!(r"C:\Users\Preview\Videos\{name}").into(),
-                    modified: None,
-                    block: None,
-                })
-                .collect(),
-        }]);
+        app.dups.groups = Some(
+            vec![DupGroup {
+                size: 124_000_000,
+                files: ["original.mp4", "backup-copy.mp4", "another-copy.mp4"]
+                    .into_iter()
+                    .map(|name| DupFile {
+                        path: format!(r"C:\Users\Preview\Videos\{name}").into(),
+                        modified: None,
+                        block: None,
+                    })
+                    .collect(),
+            }]
+            .into(),
+        );
     }
     if page == Page::Startup {
         app.startup.items = [
@@ -451,6 +460,15 @@ fn render_page(page: Page, size: [u32; 2], path: &Path, pending_dns: bool) {
                 for expected in [crate::startup::STARTUP_INFO, "Windows startup settings"] {
                     text_rect(&output, expected);
                 }
+            }
+            if page == Page::Ads && !pending_dns {
+                let apply = text_rect(&output, "Apply AdGuard DNS…");
+                text_rect(&output, "Restart as administrator to apply DNS");
+                let browsers = visible_texts(&output, "Browser extensions");
+                assert!(
+                    browsers.iter().all(|r| r.top() > apply.bottom()),
+                    "DNS controls precede browser setup at every supported size"
+                );
             }
             let mut primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
             scale_primitives(&mut primitives, output.pixels_per_point);
@@ -1046,13 +1064,16 @@ fn full_page_file_review_fills_the_window_and_filters_without_rebuilding_rows() 
         })
         .collect();
     let bytes = files.iter().map(|f| f.size).sum();
-    app.cleaner.results[0] = Some(crate::cleaner::CatResult {
-        files,
-        bytes,
-        count: file_count,
-        roots_found: 1,
-        ..Default::default()
-    });
+    app.cleaner.results[0] = Some(
+        crate::cleaner::CatResult {
+            files,
+            bytes,
+            count: file_count,
+            roots_found: 1,
+            ..Default::default()
+        }
+        .into(),
+    );
     app.cleaner.review = Some(crate::cleaner::FileReview::new(0));
     app.page = Page::Cleaner;
     let mut painter = CpuPainter::default();
@@ -1187,4 +1208,711 @@ fn cleanup_history_page_lists_every_outcome_from_a_fixture() {
             "{expected} must be visible"
         );
     }
+}
+
+/// Render the actual shared page shell without polling workers. Tests may press
+/// review buttons and Cancel, but never a confirmation's mutation button.
+fn shipment_frame(
+    ctx: &egui::Context,
+    app: &mut App,
+    size: [u32; 2],
+    events: Vec<egui::Event>,
+) -> egui::FullOutput {
+    ctx.run(
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                Pos2::ZERO,
+                egui::vec2(size[0] as f32, size[1] as f32) / ctx.zoom_factor(),
+            )),
+            events,
+            ..Default::default()
+        },
+        |ctx| {
+            theme::fit_to_viewport(ctx);
+            let enabled = app.modal.is_none();
+            egui::SidePanel::left("shipment_navigation")
+                .exact_width(236.0)
+                .resizable(false)
+                .frame(
+                    Frame::none()
+                        .fill(theme::SIDEBAR)
+                        .inner_margin(Margin::symmetric(14.0, 20.0)),
+                )
+                .show(ctx, |ui| {
+                    ui.add_enabled_ui(enabled, |ui| app.sidebar(ui));
+                });
+            egui::CentralPanel::default()
+                .frame(
+                    Frame::none()
+                        .fill(theme::BG)
+                        .inner_margin(Margin::symmetric(30.0, 22.0)),
+                )
+                .show(ctx, |ui| {
+                    ui.add_enabled_ui(enabled, |ui| app.render_page(ui));
+                });
+            app.modal_ui(ctx);
+        },
+    )
+}
+
+fn upload_preview_textures(painter: &mut CpuPainter, output: &egui::FullOutput) {
+    for (id, delta) in &output.textures_delta.set {
+        painter.set_texture(*id, delta);
+    }
+}
+fn save_shipment_preview(
+    ctx: &egui::Context,
+    painter: &CpuPainter,
+    output: &egui::FullOutput,
+    size: [u32; 2],
+    name: &str,
+) {
+    let mut primitives = ctx.tessellate(output.shapes.clone(), output.pixels_per_point);
+    scale_primitives(&mut primitives, output.pixels_per_point);
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/ui-previews");
+    std::fs::create_dir_all(&directory).unwrap();
+    painter
+        .render(size, &primitives)
+        .save(directory.join(name))
+        .unwrap();
+}
+fn has_visible_text_containing(output: &egui::FullOutput, needle: &str) -> bool {
+    fn check(shape: &Shape, clip: Rect, needle: &str) -> bool {
+        match shape {
+            Shape::Text(text) if text.galley.job.text.contains(needle) => {
+                clip.contains_rect(text.galley.rect.translate(text.pos.to_vec2()))
+            }
+            Shape::Vec(shapes) => shapes.iter().any(|shape| check(shape, clip, needle)),
+            _ => false,
+        }
+    }
+    output
+        .shapes
+        .iter()
+        .any(|shape| check(&shape.shape, shape.clip_rect, needle))
+}
+
+fn visible_texts(output: &egui::FullOutput, expected: &str) -> Vec<Rect> {
+    let mut found = Vec::new();
+    for shape in &output.shapes {
+        matching_text_rects(&shape.shape, shape.clip_rect, expected, &mut found);
+    }
+    found
+        .into_iter()
+        .filter_map(|(text, clip)| clip.contains_rect(text).then_some(text))
+        .collect()
+}
+
+#[test]
+fn adguard_apply_is_prominent_and_opens_review_without_changing_dns() {
+    let ctx = egui::Context::default();
+    theme::setup_fonts(&ctx);
+    theme::apply(&ctx);
+    let size = [1040, 680];
+    let mut app = App::test_fixture();
+    app.page = Page::Ads;
+    app.is_admin = true;
+    let mut painter = CpuPainter::default();
+    let mut last = None;
+    for _ in 0..8 {
+        let output = shipment_frame(&ctx, &mut app, size, Vec::new());
+        upload_preview_textures(&mut painter, &output);
+        last = Some(output);
+    }
+    let output = last.unwrap();
+    let apply = text_rect(&output, "Apply AdGuard DNS…");
+    let heading = text_rect(&output, "DNS ad and tracker filtering");
+    assert!(apply.top() > heading.bottom());
+    let browser = visible_texts(&output, "Browser extensions");
+    assert!(
+        browser.iter().all(|rect| rect.top() > apply.bottom()),
+        "DNS action must precede browser setup"
+    );
+    assert!(visible_texts(
+        &output,
+        "Select a connected physical Wi-Fi or Ethernet adapter."
+    )
+    .is_empty());
+    save_shipment_preview(&ctx, &painter, &output, size, "adguard-direct-apply.png");
+    let output = shipment_frame(&ctx, &mut app, size, click_at(apply.center()));
+    upload_preview_textures(&mut painter, &output);
+    let modal = app
+        .modal
+        .as_ref()
+        .expect("Apply must prepare a reviewed DNS trial");
+    match &modal.action {
+        Action::Ads(crate::ads::AdsAction::Begin { desired, .. }) => {
+            assert_eq!(desired, &crate::dns::adguard())
+        }
+        _ => panic!("The primary DNS button must prepare the AdGuard trial"),
+    }
+    assert!(
+        !app.mutations_running(),
+        "reviewing cannot change DNS or start its watchdog"
+    );
+    let mut cancel = None;
+    for _ in 0..5 {
+        let output = shipment_frame(&ctx, &mut app, size, Vec::new());
+        upload_preview_textures(&mut painter, &output);
+        cancel = Some(text_rect(&output, "Cancel").center());
+        save_shipment_preview(&ctx, &painter, &output, size, "adguard-direct-review.png");
+    }
+    let _ = shipment_frame(&ctx, &mut app, size, click_at(cancel.unwrap()));
+    assert!(app.modal.is_none());
+    assert!(!app.mutations_running());
+}
+
+#[test]
+fn account_privacy_on_off_and_undo_are_real_review_actions() {
+    let ctx = egui::Context::default();
+    theme::setup_fonts(&ctx);
+    theme::apply(&ctx);
+    let mut app = App::test_fixture();
+    app.page = Page::Privacy;
+    app.privacy = crate::privacy::preview_enable_fixture();
+    let size = [1040, 680];
+    let mut output = None;
+    for _ in 0..7 {
+        output = Some(shipment_frame(&ctx, &mut app, size, Vec::new()));
+    }
+    let output = output.unwrap();
+    let advertising = text_rect(&output, "Advertising ID");
+    let on = visible_texts(&output, "Turn on")
+        .into_iter()
+        .find(|r| r.top() > advertising.bottom())
+        .expect("On must remain reachable for a recognized Off preference");
+    let _ = shipment_frame(&ctx, &mut app, size, click_at(on.center()));
+    let modal = app
+        .modal
+        .as_ref()
+        .expect("On prepares an account preference review");
+    assert!(
+        matches!(&modal.action, Action::Privacy(crate::privacy::PrivacyAction::Enable { id, .. }) if id == "advertising_id")
+    );
+    assert!(!app.mutations_running());
+    app.modal = None;
+    let output = shipment_frame(&ctx, &mut app, size, Vec::new());
+    let tips = text_rect(&output, "Windows tips and suggestions");
+    let welcome = text_rect(&output, "Windows welcome suggestions");
+    let off = visible_texts(&output, "Turn off")
+        .into_iter()
+        .find(|r| r.top() > tips.bottom() && r.bottom() < welcome.top())
+        .expect("Off is available for the enabled tips preference");
+    let _ = shipment_frame(&ctx, &mut app, size, click_at(off.center()));
+    assert!(
+        matches!(app.modal.as_ref().map(|m| &m.action), Some(Action::Privacy(crate::privacy::PrivacyAction::Disable { id, .. })) if id == "windows_tips")
+    );
+    assert!(!app.mutations_running());
+    app.modal = None;
+    app.privacy = crate::privacy::preview_fixture();
+    let output = shipment_frame(&ctx, &mut app, size, Vec::new());
+    let undo = visible_texts(&output, "Undo PCSweep change")
+        .into_iter()
+        .next()
+        .expect("Saved exact Undo stays visible");
+    let _ = shipment_frame(&ctx, &mut app, size, click_at(undo.center()));
+    assert!(
+        matches!(app.modal.as_ref().map(|m| &m.action), Some(Action::Privacy(crate::privacy::PrivacyAction::Undo(id))) if id == "advertising_id")
+    );
+    assert!(!app.mutations_running());
+}
+
+#[test]
+fn direct_game_mode_choice_prepares_a_preference_change_inside_the_app() {
+    let ctx = egui::Context::default();
+    theme::setup_fonts(&ctx);
+    theme::apply(&ctx);
+    let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1040.0, 680.0));
+    let mut app = App::test_fixture();
+    let mut last = None;
+    let render = |ctx: &egui::Context, app: &mut App, events| {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(
+                        Frame::none()
+                            .fill(theme::BG)
+                            .inner_margin(Margin::same(24.0)),
+                    )
+                    .show(ctx, |ui| {
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            app.render_direct_preferences(
+                                ui,
+                                crate::preferences::Section::Performance,
+                            )
+                        });
+                    });
+            },
+        )
+    };
+    for _ in 0..7 {
+        last = Some(render(&ctx, &mut app, Vec::new()));
+    }
+    let output = last.unwrap();
+    let game = text_rect(&output, "Game Mode");
+    let next = text_rect(&output, "Background game recording");
+    let off = visible_texts(&output, "Turn off…")
+        .into_iter()
+        .find(|r| r.top() > game.bottom() && r.bottom() < next.top())
+        .expect("Game Mode's Off control is visible inside its card");
+    let _ = render(&ctx, &mut app, click_at(off.center()));
+    assert!(
+        matches!(app.modal.as_ref().map(|m| &m.action), Some(Action::Preferences(crate::preferences::PreferencesAction::Set { id, enabled: false, .. })) if id == "game_mode")
+    );
+    assert!(!app.mutations_running());
+}
+
+fn collect_image_rects(shape: &Shape, clip: Rect, found: &mut Vec<Rect>) {
+    match shape {
+        Shape::Mesh(mesh) if mesh.texture_id != TextureId::Managed(0) => {
+            let rect = mesh.calc_bounds();
+            if clip.contains_rect(rect) {
+                found.push(rect);
+            }
+        }
+        Shape::Vec(shapes) => {
+            for shape in shapes {
+                collect_image_rects(shape, clip, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn installed_app_icons_keep_consistent_space_and_do_not_overlap_row_actions() {
+    for size in [[1040, 680], [1320, 860]] {
+        let ctx = egui::Context::default();
+        theme::setup_fonts(&ctx);
+        theme::apply(&ctx);
+        let mut app = App::test_fixture();
+        app.page = Page::Apps;
+        let mut output = None;
+        for _ in 0..7 {
+            output = Some(shipment_frame(&ctx, &mut app, size, Vec::new()));
+        }
+        let output = output.unwrap();
+        let mut icons = Vec::new();
+        for shape in &output.shapes {
+            collect_image_rects(&shape.shape, shape.clip_rect, &mut icons);
+        }
+        assert!(
+            icons.len() >= 4,
+            "visible app rows need actual icon textures, not only fallback text"
+        );
+        for icon in &icons {
+            assert!(
+                (icon.width() - 28.0).abs() < 0.5 && (icon.height() - 28.0).abs() < 0.5,
+                "icons use consistent 28-point bounds: {icon:?}"
+            );
+            assert!(
+                icon.left() >= 266.0 && icon.right() < 390.0,
+                "icon column stays inside the app row"
+            );
+        }
+        for name in ["Visual Studio Code", "Mozilla Firefox", "Microsoft Photos"] {
+            let label = text_rect(&output, name);
+            assert!(
+                icons.iter().any(|icon| icon.right() < label.left()
+                    && (icon.center().y - label.center().y).abs() < 28.0),
+                "{name} must have a separate icon before its name"
+            );
+        }
+        assert!(!app.mutations_running());
+    }
+}
+
+#[test]
+fn windows_update_modes_prepare_direct_actions_without_leaving_the_app() {
+    let size = [1320, 860];
+    for (control, label) in [
+        ("pause", "Pause for up to 35 days…"),
+        ("automatic", "Automatic…"),
+        ("notify", "Notify before download…"),
+        ("manual", "Manual — turn automatic updates off…"),
+    ] {
+        let ctx = egui::Context::default();
+        theme::setup_fonts(&ctx);
+        theme::apply(&ctx);
+        let mut app = App::test_fixture();
+        app.page = Page::WindowsControls;
+        app.is_admin = true;
+        let mut painter = CpuPainter::default();
+        let mut output = None;
+        for _ in 0..7 {
+            let frame = shipment_frame(&ctx, &mut app, size, Vec::new());
+            upload_preview_textures(&mut painter, &frame);
+            output = Some(frame);
+        }
+        let output = output.unwrap();
+        let button = text_rect(&output, label);
+        if control == "pause" {
+            save_shipment_preview(
+                &ctx,
+                &painter,
+                &output,
+                size,
+                "windows-direct-update-controls.png",
+            );
+        }
+        let output = shipment_frame(&ctx, &mut app, size, click_at(button.center()));
+        upload_preview_textures(&mut painter, &output);
+        let modal = app
+            .modal
+            .as_ref()
+            .expect("Update behavior button must open an in-app review");
+        assert!(
+            matches!(&modal.action,Action::WindowsControls(crate::windows_controls::WindowsControlsAction::Set{control: prepared,..})if prepared==control)
+        );
+        assert!(
+            !app.mutations_running(),
+            "Review cannot write update policy"
+        );
+        let confirm = modal.confirm.clone();
+        let mut last = None;
+        for _ in 0..5 {
+            let frame = shipment_frame(&ctx, &mut app, size, Vec::new());
+            upload_preview_textures(&mut painter, &frame);
+            last = Some(frame);
+        }
+        let output = last.unwrap();
+        let cancel = text_rect(&output, "Cancel");
+        text_rect(&output, &confirm);
+        if matches!(control, "pause" | "manual") {
+            save_shipment_preview(
+                &ctx,
+                &painter,
+                &output,
+                size,
+                &format!("windows-update-{control}-review.png"),
+            );
+        }
+        let _ = shipment_frame(&ctx, &mut app, size, click_at(cancel.center()));
+        assert!(
+            app.modal.is_none() && !app.mutations_running(),
+            "Cancel must leave Windows unchanged"
+        );
+    }
+}
+
+#[test]
+fn home_service_choice_and_restore_are_direct_and_managed_controls_stay_disabled() {
+    let size = [1320, 860];
+    for (disabled, managed, label) in [
+        (false, false, "Turn Windows Update service off…"),
+        (true, false, "Restore Windows Update service…"),
+        (false, true, "Turn Windows Update service off…"),
+    ] {
+        let ctx = egui::Context::default();
+        theme::setup_fonts(&ctx);
+        theme::apply(&ctx);
+        let mut app = App::test_fixture();
+        app.page = Page::WindowsControls;
+        app.is_admin = true;
+        app.windows_controls =
+            crate::windows_controls::preview_fixture_variant(true, managed, disabled);
+        let mut painter = CpuPainter::default();
+        let mut last = None;
+        for _ in 0..7 {
+            let frame = shipment_frame(&ctx, &mut app, size, Vec::new());
+            upload_preview_textures(&mut painter, &frame);
+            last = Some(frame);
+        }
+        let output = last.unwrap();
+        let button = text_rect(&output, label);
+        if managed {
+            text_rect(
+                &output,
+                "Organization-managed update services are preserved.",
+            );
+        }
+        if disabled {
+            text_rect(&output, "Dismiss this reminder");
+            text_rect(&output, "Remind me in 7 days");
+            text_rect(&output, "Don't show update reminders");
+        }
+        save_shipment_preview(
+            &ctx,
+            &painter,
+            &output,
+            size,
+            if managed {
+                "windows-managed-controls.png"
+            } else if disabled {
+                "windows-home-restore-reminder.png"
+            } else {
+                "windows-home-service-choice.png"
+            },
+        );
+        let output = shipment_frame(&ctx, &mut app, size, click_at(button.center()));
+        upload_preview_textures(&mut painter, &output);
+        if managed {
+            assert!(
+                app.modal.is_none(),
+                "A managed service's disabled action cannot open a mutation review"
+            );
+        } else {
+            let modal = app
+                .modal
+                .as_ref()
+                .expect("Home service choice opens a direct review");
+            assert!(if disabled {
+                matches!(
+                    modal.action,
+                    Action::WindowsControls(
+                        crate::windows_controls::WindowsControlsAction::RestoreService { .. }
+                    )
+                )
+            } else {
+                matches!(
+                    modal.action,
+                    Action::WindowsControls(
+                        crate::windows_controls::WindowsControlsAction::DisableService { .. }
+                    )
+                )
+            });
+            assert_eq!(
+                modal.danger, !disabled,
+                "Turning the service off has a distinct advanced warning"
+            );
+            if !disabled {
+                assert!(
+                    modal.body.contains("wuauserv") && modal.body.contains("repair or re-enable")
+                );
+            }
+            let mut output = None;
+            for _ in 0..5 {
+                let frame = shipment_frame(&ctx, &mut app, size, Vec::new());
+                upload_preview_textures(&mut painter, &frame);
+                output = Some(frame);
+            }
+            let output = output.unwrap();
+            let cancel = text_rect(&output, "Cancel");
+            if !disabled {
+                save_shipment_preview(
+                    &ctx,
+                    &painter,
+                    &output,
+                    size,
+                    "windows-service-disable-review.png",
+                );
+            }
+            let _ = shipment_frame(&ctx, &mut app, size, click_at(cancel.center()));
+            assert!(app.modal.is_none());
+        }
+        assert!(
+            !app.mutations_running(),
+            "Review-only UI cases never configure a service"
+        );
+    }
+}
+
+fn analyzer_selection_fixture(app: &mut App) {
+    use crate::analyzer::{Node, NodeKind, ScanResult};
+    let mb = 1024 * 1024;
+    let children = vec![
+        Node {
+            name: "zebra.tmp".into(),
+            size: mb,
+            files: 1,
+            kind: NodeKind::File,
+            modified: None,
+            children: Vec::new(),
+        },
+        Node {
+            name: "alpha.tmp".into(),
+            size: 5 * mb,
+            files: 1,
+            kind: NodeKind::File,
+            modified: None,
+            children: Vec::new(),
+        },
+        Node {
+            name: "archive".into(),
+            size: 20 * mb,
+            files: 3,
+            kind: NodeKind::Dir,
+            modified: None,
+            children: Vec::new(),
+        },
+        Node {
+            name: "7 smaller files".into(),
+            size: 9 * mb,
+            files: 7,
+            kind: NodeKind::SmallFiles,
+            modified: None,
+            children: Vec::new(),
+        },
+        Node {
+            name: "pagefile.sys".into(),
+            size: 2 * mb,
+            files: 1,
+            kind: NodeKind::File,
+            modified: None,
+            children: Vec::new(),
+        },
+    ];
+    app.page = Page::Analyzer;
+    app.analyzer.result = Some(
+        ScanResult {
+            root_path: r"C:\Users\Preview\Videos".into(),
+            root: Node {
+                name: "Videos".into(),
+                size: 37 * mb,
+                files: 13,
+                kind: NodeKind::Dir,
+                modified: None,
+                children,
+            },
+            big: Vec::new(),
+            exts: Vec::new(),
+            cats: Vec::new(),
+            elapsed: std::time::Duration::from_secs(1),
+            denied: 0,
+            dirs: 2,
+            cancelled: false,
+        }
+        .into(),
+    );
+}
+
+#[test]
+fn analyzer_filter_sort_and_multi_selection_review_only_shown_eligible_files() {
+    let size = [1320, 860];
+    let ctx = egui::Context::default();
+    theme::setup_fonts(&ctx);
+    theme::apply(&ctx);
+    let mut app = App::test_fixture();
+    analyzer_selection_fixture(&mut app);
+    let mut painter = CpuPainter::default();
+    let mut output = None;
+    for _ in 0..7 {
+        let frame = shipment_frame(&ctx, &mut app, size, Vec::new());
+        upload_preview_textures(&mut painter, &frame);
+        output = Some(frame);
+    }
+    let output = output.unwrap();
+    let select = text_rect(&output, "Select shown");
+    let _ = shipment_frame(&ctx, &mut app, size, click_at(select.center()));
+    assert_eq!(
+        app.analyzer.selected.len(),
+        3,
+        "aggregates and protected Windows files cannot be selected"
+    );
+    assert!(!app
+        .analyzer
+        .selected
+        .iter()
+        .any(|p| p.ends_with("pagefile.sys") || p.ends_with("7 smaller files")));
+    let output = shipment_frame(&ctx, &mut app, size, Vec::new());
+    let clear = text_rect(&output, "Clear selection");
+    let _ = shipment_frame(&ctx, &mut app, size, click_at(clear.center()));
+    assert!(app.analyzer.selected.is_empty());
+    app.analyzer.filter = "tmp".into();
+    let output = shipment_frame(&ctx, &mut app, size, Vec::new());
+    text_rect(&output, "2 of 5 entries in this folder");
+    let name = text_rect(&output, "Name");
+    let _ = shipment_frame(&ctx, &mut app, size, click_at(name.center()));
+    assert!(app.analyzer.sort == crate::analyzer::ASort::Name);
+    let output = shipment_frame(&ctx, &mut app, size, Vec::new());
+    let alpha = visible_texts(&output, "alpha.tmp")
+        .into_iter()
+        .last()
+        .unwrap();
+    let zebra = visible_texts(&output, "zebra.tmp")
+        .into_iter()
+        .last()
+        .unwrap();
+    assert!(alpha.top() < zebra.top(), "name sorting changes row order");
+    let select = text_rect(&output, "Select shown");
+    let _ = shipment_frame(&ctx, &mut app, size, click_at(select.center()));
+    assert_eq!(
+        app.analyzer.selected.len(),
+        2,
+        "selection is scoped to the filtered rows"
+    );
+    assert!(app
+        .analyzer
+        .selected
+        .iter()
+        .all(|p| p.extension().is_some_and(|e| e == "tmp")));
+    let output = shipment_frame(&ctx, &mut app, size, Vec::new());
+    upload_preview_textures(&mut painter, &output);
+    save_shipment_preview(
+        &ctx,
+        &painter,
+        &output,
+        size,
+        "analyzer-filtered-multiselect.png",
+    );
+    let recycle = text_rect(&output, "Move selected to Recycle Bin…");
+    let output = shipment_frame(&ctx, &mut app, size, click_at(recycle.center()));
+    upload_preview_textures(&mut painter, &output);
+    let modal = app
+        .modal
+        .as_ref()
+        .expect("multi-selection opens a reviewed Recycle Bin action");
+    match &modal.action {
+        Action::Recycle {
+            items,
+            origin: crate::app::Origin::Analyzer,
+        } => assert_eq!(items.len(), 2),
+        _ => panic!("expected analyzer recycling review"),
+    }
+    assert!(
+        modal.details.iter().any(|s| s.contains("alpha.tmp"))
+            && modal.details.iter().any(|s| s.contains("zebra.tmp"))
+    );
+    assert!(!app.mutations_running());
+    let mut last = None;
+    for _ in 0..5 {
+        let frame = shipment_frame(&ctx, &mut app, size, Vec::new());
+        upload_preview_textures(&mut painter, &frame);
+        last = Some(frame);
+    }
+    let output = last.unwrap();
+    let cancel = text_rect(&output, "Cancel");
+    save_shipment_preview(
+        &ctx,
+        &painter,
+        &output,
+        size,
+        "analyzer-multiselect-review.png",
+    );
+    let _ = shipment_frame(&ctx, &mut app, size, click_at(cancel.center()));
+    assert!(app.modal.is_none());
+    crate::analyzer::mark_preview_saved(&mut app.analyzer);
+    let mut last = None;
+    for _ in 0..5 {
+        let frame = shipment_frame(&ctx, &mut app, size, Vec::new());
+        upload_preview_textures(&mut painter, &frame);
+        last = Some(frame);
+    }
+    let output = last.unwrap();
+    assert!(
+        has_visible_text_containing(&output, "Saved map · Refresh before moving files."),
+        "restored maps must show their freshness limitation before file actions"
+    );
+    let recycle = text_rect(&output, "Move selected to Recycle Bin…");
+    save_shipment_preview(
+        &ctx,
+        &painter,
+        &output,
+        size,
+        "analyzer-saved-map-review.png",
+    );
+    let _ = shipment_frame(&ctx, &mut app, size, click_at(recycle.center()));
+    assert!(
+        app.modal.is_none() && !app.mutations_running(),
+        "a restored saved map requires Refresh before destructive actions"
+    );
+    assert!(
+        !app.analyzer.scan.running(),
+        "reading and filtering saved data cannot start a rescan"
+    );
 }

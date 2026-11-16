@@ -8,6 +8,7 @@ use eframe::egui::{
     ScrollArea, Sense, Ui,
 };
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::windows::fs::MetadataExt;
@@ -21,7 +22,7 @@ const CHILD_FILE: u64 = 1024 * 1024;
 /// Files at least this big are tracked for the "Largest" and "Old" views.
 const BIG_FILE: u64 = 10 * 1024 * 1024;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeKind {
     Dir,
     File,
@@ -38,15 +39,17 @@ pub struct Node {
     pub children: Vec<Node>,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct FileRec {
     pub path: PathBuf,
     pub lower: String,
     pub size: u64,
     pub modified: Option<SystemTime>,
+    #[serde(skip)]
     pub block: Option<&'static str>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FileCat {
     Video,
     Image,
@@ -128,6 +131,19 @@ fn ext_of(name: &str) -> String {
     }
 }
 
+fn sort_file_indices(res: &ScanResult, indexes: &mut [usize], sort: ASort) {
+    indexes.sort_by(|&i, &j| {
+        let (left, right) = (&res.big[i], &res.big[j]);
+        match sort {
+            ASort::Name => left.lower.cmp(&right.lower),
+            ASort::Modified => right.modified.cmp(&left.modified),
+            ASort::Size | ASort::Files => right.size.cmp(&left.size),
+        }
+        .then_with(|| left.path.cmp(&right.path))
+    });
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct ExtStat {
     pub ext: String,
     pub bytes: u64,
@@ -154,6 +170,8 @@ pub struct Progress {
     pub bytes: AtomicU64,
     pub cancel: AtomicBool,
     pub current: Mutex<String>,
+    cache_stamp: AtomicU64,
+    cache_error: Mutex<Option<String>>,
 }
 
 struct Shared<'a> {
@@ -614,12 +632,375 @@ fn treemap(ui: &mut Ui, node: &Node, height: f32) -> Option<usize> {
 
 // ---------------------------------------------------------------- state & page
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ATab {
     Folders,
     Largest,
     Types,
     Old,
+}
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ASort {
+    #[default]
+    Size,
+    Name,
+    Modified,
+    Files,
+}
+
+const RECENT_MAPS: usize = 3;
+const DISK_MAPS: usize = 8;
+const MAP_BYTE_BUDGET: u64 = 512 * 1024 * 1024;
+static MAP_INDEX_WRITER: Mutex<()> = Mutex::new(());
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct MapView {
+    nav: Vec<usize>,
+    tab: ATab,
+    filter: String,
+    old_months: u32,
+    old_min: u64,
+    removed: HashSet<PathBuf>,
+    #[serde(default)]
+    sort: ASort,
+}
+impl MapView {
+    fn capture(a: &AnalyzerState) -> Self {
+        Self {
+            nav: a.nav.clone(),
+            tab: a.tab,
+            filter: a.filter.clone(),
+            old_months: a.old_months,
+            old_min: a.old_min,
+            removed: a.removed.clone(),
+            sort: a.sort,
+        }
+    }
+}
+struct SavedMap {
+    result: Arc<ScanResult>,
+    stamp: u64,
+    view: MapView,
+    read_only: bool,
+}
+impl Clone for SavedMap {
+    fn clone(&self) -> Self {
+        Self {
+            result: self.result.clone(),
+            stamp: self.stamp,
+            view: self.view.clone(),
+            read_only: self.read_only,
+        }
+    }
+}
+#[derive(Default)]
+pub struct AnalyzerCache {
+    load: Task<Result<Option<LoadedMaps>, String>>,
+    save: Task<Result<Vec<MapIndex>, String>>,
+    requested: Option<PathBuf>,
+    disk_index: Vec<MapIndex>,
+    recent: Vec<SavedMap>,
+    stamp: Option<u64>,
+    read_only: bool,
+    dirty: Option<Instant>,
+    error: Option<String>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct MapIndex {
+    root: PathBuf,
+    stamp: u64,
+    view: MapView,
+}
+#[derive(Serialize, Deserialize)]
+struct DiskNode {
+    parent: Option<usize>,
+    name: String,
+    size: u64,
+    files: u64,
+    kind: NodeKind,
+    modified: Option<SystemTime>,
+}
+#[derive(Deserialize)]
+struct DiskMap {
+    root_path: PathBuf,
+    nodes: Vec<DiskNode>,
+    big: Vec<FileRec>,
+    exts: Vec<ExtStat>,
+    cats: Vec<(FileCat, u64, u64)>,
+    elapsed: Duration,
+    denied: u64,
+    dirs: u64,
+    cancelled: bool,
+}
+#[derive(Serialize)]
+struct DiskMapRef<'a> {
+    root_path: &'a Path,
+    nodes: Vec<DiskNode>,
+    big: &'a [FileRec],
+    exts: &'a [ExtStat],
+    cats: &'a [(FileCat, u64, u64)],
+    elapsed: Duration,
+    denied: u64,
+    dirs: u64,
+    cancelled: bool,
+}
+fn map_file(root: &Path, stamp: u64) -> String {
+    format!(
+        "map-{:032x}-{stamp}.json",
+        xxhash_rust::xxh3::xxh3_128(util::norm(root).as_bytes())
+    )
+}
+fn map_ref(result: &ScanResult) -> DiskMapRef<'_> {
+    let mut nodes = Vec::new();
+    let mut stack = vec![(None, &result.root)];
+    while let Some((parent, node)) = stack.pop() {
+        let id = nodes.len();
+        nodes.push(DiskNode {
+            parent,
+            name: node.name.clone(),
+            size: node.size,
+            files: node.files,
+            kind: node.kind,
+            modified: node.modified,
+        });
+        stack.extend(node.children.iter().rev().map(|n| (Some(id), n)));
+    }
+    DiskMapRef {
+        root_path: &result.root_path,
+        nodes,
+        big: &result.big,
+        exts: &result.exts,
+        cats: &result.cats,
+        elapsed: result.elapsed,
+        denied: result.denied,
+        dirs: result.dirs,
+        cancelled: result.cancelled,
+    }
+}
+fn restore_map(disk: DiskMap) -> Result<ScanResult, String> {
+    if !disk.root_path.is_absolute()
+        || disk.nodes.is_empty()
+        || disk.nodes.len() > 1_000_000
+        || disk.big.len() > 500_000
+        || disk.exts.len() > 100_000
+        || disk.cats.len() > 16
+    {
+        return Err("Saved map is invalid or too large.".into());
+    }
+    let mut parents = Vec::with_capacity(disk.nodes.len());
+    let mut depths = Vec::with_capacity(disk.nodes.len());
+    let mut nodes = Vec::with_capacity(disk.nodes.len());
+    for (i, n) in disk.nodes.into_iter().enumerate() {
+        if n.name.len() > 32768
+            || (i == 0 && n.parent.is_some())
+            || (i > 0 && !n.parent.is_some_and(|p| p < i))
+            || (i > 0
+                && (n.name.is_empty()
+                    || n.name == "."
+                    || n.name == ".."
+                    || n.name.contains(['\\', '/', ':'])))
+        {
+            return Err("Saved map contains an invalid folder identity.".into());
+        }
+        let depth = n.parent.map_or(0usize, |p| depths[p] + 1);
+        if depth > 202 {
+            return Err("Saved map nesting exceeds the scan limit.".into());
+        }
+        depths.push(depth);
+        parents.push(n.parent);
+        nodes.push(Some(Node {
+            name: n.name,
+            size: n.size,
+            files: n.files,
+            kind: n.kind,
+            modified: n.modified,
+            children: Vec::new(),
+        }));
+    }
+    for i in (1..nodes.len()).rev() {
+        let mut node = nodes[i].take().ok_or("Incomplete saved map")?;
+        node.children.reverse();
+        let bytes = node
+            .children
+            .iter()
+            .try_fold(0u64, |sum, n| sum.checked_add(n.size));
+        let files = node
+            .children
+            .iter()
+            .try_fold(0u64, |sum, n| sum.checked_add(n.files));
+        if bytes.is_none_or(|n| n > node.size) || files.is_none_or(|n| n > node.files) {
+            return Err("Saved folder totals are inconsistent.".into());
+        }
+        nodes[parents[i].ok_or("Invalid saved parent")?]
+            .as_mut()
+            .ok_or("Invalid saved parent order")?
+            .children
+            .push(node);
+    }
+    let mut root = nodes[0].take().ok_or("Saved map has no root")?;
+    root.children.reverse();
+    if root
+        .children
+        .iter()
+        .try_fold(0u64, |sum, n| sum.checked_add(n.size))
+        .is_none_or(|n| n > root.size)
+        || root
+            .children
+            .iter()
+            .try_fold(0u64, |sum, n| sum.checked_add(n.files))
+            .is_none_or(|n| n > root.files)
+    {
+        return Err("Saved map totals are inconsistent.".into());
+    }
+    let root_norm = util::norm(&disk.root_path);
+    let mut big = disk.big;
+    if big.iter().any(|f| {
+        !f.path.is_absolute()
+            || !util::is_within(&util::norm(&f.path), &root_norm)
+            || f.path.as_os_str().len() > 32768
+    }) {
+        return Err("Saved file identity is outside its map.".into());
+    }
+    let mut paths = HashSet::new();
+    if big.iter().any(|f| !paths.insert(util::norm(&f.path)))
+        || big
+            .iter()
+            .try_fold(0u64, |sum, f| sum.checked_add(f.size))
+            .is_none_or(|n| n > root.size)
+        || disk.exts.iter().any(|e| e.ext.len() > 32)
+        || disk
+            .exts
+            .iter()
+            .try_fold(0u64, |sum, e| sum.checked_add(e.bytes))
+            .is_none_or(|n| n > root.size)
+        || disk
+            .cats
+            .iter()
+            .try_fold(0u64, |sum, (_, bytes, _)| sum.checked_add(*bytes))
+            .is_none_or(|n| n > root.size)
+    {
+        return Err("Saved map file totals are inconsistent.".into());
+    }
+    for f in &mut big {
+        f.lower = f.path.to_string_lossy().to_lowercase();
+        f.block = util::block_reason_fast(&f.path);
+    }
+    Ok(ScanResult {
+        root_path: disk.root_path,
+        root,
+        big,
+        exts: disk.exts,
+        cats: disk.cats,
+        elapsed: disk.elapsed,
+        denied: disk.denied,
+        dirs: disk.dirs,
+        cancelled: disk.cancelled,
+    })
+}
+struct LoadedMaps {
+    maps: Vec<SavedMap>,
+    index: Vec<MapIndex>,
+}
+fn load_indexed_map(item: &MapIndex) -> Result<SavedMap, String> {
+    if !item.root.is_absolute()
+        || item.root.as_os_str().len() > 32768
+        || item.view.nav.len() > 256
+        || item.view.filter.len() > 8192
+        || item.view.removed.len() > 500_000
+    {
+        return Err("Saved map index is invalid.".into());
+    }
+    let stored = crate::scan_cache::load::<DiskMap>(&map_file(&item.root, item.stamp))?
+        .ok_or("This saved map is no longer available.")?;
+    if stored.saved != item.stamp {
+        return Err("Saved map identity changed.".into());
+    }
+    let result = restore_map(stored.data)?;
+    if util::norm(&result.root_path) != util::norm(&item.root) {
+        return Err("Saved map root changed.".into());
+    }
+    Ok(SavedMap {
+        result: Arc::new(result),
+        stamp: item.stamp,
+        view: item.view.clone(),
+        read_only: true,
+    })
+}
+fn load_maps() -> Result<Option<LoadedMaps>, String> {
+    let Some(index) = crate::scan_cache::load::<Vec<MapIndex>>("maps-index.json")? else {
+        return Ok(None);
+    };
+    if index.data.len() > DISK_MAPS {
+        return Err("Saved map index is invalid.".into());
+    }
+    // Restore one map immediately. Other roots remain as lightweight index
+    // entries and are loaded only when selected, without remapping their files.
+    let first = index
+        .data
+        .iter()
+        .find_map(|item| load_indexed_map(item).ok());
+    Ok(Some(LoadedMaps {
+        maps: first.into_iter().collect(),
+        index: index.data,
+    }))
+}
+fn save_maps(maps: Vec<SavedMap>, mut index: Vec<MapIndex>) -> Result<Vec<MapIndex>, String> {
+    let _writer = MAP_INDEX_WRITER
+        .lock()
+        .map_err(|_| "Saved map publisher is unavailable")?;
+    // A delayed metadata save must never replace a newer completed scan.
+    if let Ok(Some(latest)) = crate::scan_cache::load::<Vec<MapIndex>>("maps-index.json") {
+        if latest.data.len() <= DISK_MAPS {
+            for item in latest.data.into_iter().rev() {
+                if !index.iter().any(|old| {
+                    util::norm(&old.root) == util::norm(&item.root) && old.stamp > item.stamp
+                }) {
+                    index.retain(|old| util::norm(&old.root) != util::norm(&item.root));
+                    index.insert(0, item);
+                }
+            }
+        }
+    }
+    for item in maps.iter().rev() {
+        if index.iter().any(|old| {
+            util::norm(&old.root) == util::norm(&item.result.root_path) && old.stamp > item.stamp
+        }) {
+            continue;
+        }
+        let name = map_file(&item.result.root_path, item.stamp);
+        if !crate::scan_cache::exists(&name) {
+            crate::scan_cache::save(&name, item.stamp, &map_ref(&item.result))?;
+        }
+        index.retain(|m| util::norm(&m.root) != util::norm(&item.result.root_path));
+        index.insert(
+            0,
+            MapIndex {
+                root: item.result.root_path.clone(),
+                stamp: item.stamp,
+                view: item.view.clone(),
+            },
+        );
+    }
+    let mut bytes = 0u64;
+    let mut kept = Vec::new();
+    let mut files = HashSet::new();
+    for item in index {
+        if kept.len() == DISK_MAPS {
+            break;
+        }
+        let file = map_file(&item.root, item.stamp);
+        let Some(size) = crate::scan_cache::file_size(&file)? else {
+            continue;
+        };
+        if bytes.saturating_add(size) > MAP_BYTE_BUDGET {
+            continue;
+        }
+        bytes += size;
+        files.insert(file);
+        kept.push(item);
+    }
+    crate::scan_cache::save("maps-index.json", crate::scan_cache::now(), &kept)?;
+    crate::scan_cache::prune_maps(&files)?;
+    Ok(kept)
 }
 
 pub struct AnalyzerState {
@@ -627,9 +1008,11 @@ pub struct AnalyzerState {
     pub progress: Option<Arc<Progress>>,
     pub scan_root: Option<PathBuf>,
     pub started: Option<Instant>,
-    pub result: Option<ScanResult>,
+    pub result: Option<Arc<ScanResult>>,
+    pub cache: AnalyzerCache,
     pub nav: Vec<usize>,
     pub tab: ATab,
+    pub sort: ASort,
     pub filter: String,
     pub selected: HashSet<PathBuf>,
     pub removed: HashSet<PathBuf>,
@@ -647,8 +1030,10 @@ impl Default for AnalyzerState {
             scan_root: None,
             started: None,
             result: None,
+            cache: AnalyzerCache::default(),
             nav: Vec::new(),
             tab: ATab::Folders,
+            sort: ASort::Size,
             filter: String::new(),
             selected: HashSet::new(),
             removed: HashSet::new(),
@@ -660,13 +1045,61 @@ impl Default for AnalyzerState {
     }
 }
 
+impl AnalyzerState {
+    fn activate_saved(&mut self, root: &Path) -> bool {
+        let Some(index) = self
+            .cache
+            .recent
+            .iter()
+            .position(|m| util::norm(&m.result.root_path) == util::norm(root))
+        else {
+            return false;
+        };
+        let saved = self.cache.recent.remove(index);
+        self.result = Some(saved.result.clone());
+        self.scan_root = Some(saved.result.root_path.clone());
+        self.tab = saved.view.tab;
+        self.sort = saved.view.sort;
+        self.filter = saved.view.filter.clone();
+        self.old_months = saved.view.old_months;
+        self.old_min = saved.view.old_min;
+        self.removed = saved.view.removed.clone();
+        self.nav.clear();
+        let mut node = &saved.result.root;
+        for &i in &saved.view.nav {
+            let Some(child) = node.children.get(i) else {
+                break;
+            };
+            if child.kind != NodeKind::Dir {
+                break;
+            }
+            self.nav.push(i);
+            node = child;
+        }
+        self.selected.clear();
+        self.cache.stamp = Some(saved.stamp);
+        self.cache.read_only = saved.read_only;
+        self.cache.recent.insert(0, saved);
+        self.cache.dirty = Some(Instant::now());
+        true
+    }
+}
+
+#[cfg(test)]
+pub fn mark_preview_saved(state: &mut AnalyzerState) {
+    state.cache.stamp = Some(crate::scan_cache::now());
+    state.cache.read_only = true;
+}
+
 enum AAct {
     Go(Page),
     DismissJournalError,
     Scan(PathBuf),
+    Rescan(PathBuf),
     PickFolder,
     Cancel,
     Tab(ATab),
+    Sort(ASort),
     Up,
     Truncate(usize),
     Enter(usize),
@@ -683,7 +1116,166 @@ enum AAct {
 }
 
 impl App {
+    fn remember_analyzer(&mut self) {
+        let a = &mut self.analyzer;
+        let (Some(result), Some(stamp)) = (a.result.as_ref(), a.cache.stamp) else {
+            return;
+        };
+        let view = MapView::capture(a);
+        if let Some(index) = a
+            .cache
+            .recent
+            .iter()
+            .position(|m| Arc::ptr_eq(&m.result, result))
+        {
+            if a.cache.recent[index].view == view {
+                return;
+            }
+            a.cache.recent[index].view = view;
+        } else {
+            let (retained, old): (Vec<_>, Vec<_>) = std::mem::take(&mut a.cache.recent)
+                .into_iter()
+                .partition(|m| util::norm(&m.result.root_path) != util::norm(&result.root_path));
+            a.cache.recent = retained;
+            if !old.is_empty() {
+                let _ = std::thread::Builder::new()
+                    .name("pcsweep-release-old-map".into())
+                    .spawn(move || drop(old));
+            }
+            a.cache.recent.insert(
+                0,
+                SavedMap {
+                    result: result.clone(),
+                    stamp,
+                    view,
+                    read_only: a.cache.read_only,
+                },
+            );
+            if a.cache.recent.len() > RECENT_MAPS {
+                let evicted = a.cache.recent.split_off(RECENT_MAPS);
+                let _ = std::thread::Builder::new()
+                    .name("pcsweep-release-map-cache".into())
+                    .spawn(move || drop(evicted));
+            }
+        }
+        a.cache.dirty = Some(Instant::now());
+    }
+    pub(crate) fn restore_analyzer_cache(&mut self, ctx: &egui::Context) {
+        self.analyzer.cache.load = Task::spawn(ctx, load_maps);
+    }
+    pub(crate) fn poll_analyzer_cache(&mut self, ctx: &egui::Context) {
+        if let Some(result) = self.analyzer.cache.load.poll() {
+            let requested = self.analyzer.cache.requested.take();
+            match result.and_then(|r| r) {
+                Ok(Some(loaded)) => {
+                    if !loaded.index.is_empty() {
+                        self.analyzer.cache.disk_index = loaded.index;
+                    }
+                    for map in loaded.maps {
+                        self.analyzer.cache.recent.retain(|m| {
+                            util::norm(&m.result.root_path) != util::norm(&map.result.root_path)
+                        });
+                        self.analyzer.cache.recent.insert(0, map);
+                    }
+                    if !self.analyzer.scan.running()
+                        && (requested.is_some() || self.analyzer.result.is_none())
+                    {
+                        let target = requested.clone().or_else(|| {
+                            self.analyzer
+                                .cache
+                                .recent
+                                .first()
+                                .map(|m| m.result.root_path.clone())
+                        });
+                        if let Some(path) = target {
+                            if self.analyzer.activate_saved(&path) {
+                                self.analyzer.cache.dirty = None;
+                            } else if requested.is_some() {
+                                self.force_analyze(path, ctx);
+                            }
+                        }
+                    }
+                    if self.analyzer.cache.recent.len() > RECENT_MAPS {
+                        let old = self.analyzer.cache.recent.split_off(RECENT_MAPS);
+                        let _ = std::thread::Builder::new()
+                            .name("pcsweep-release-map-cache".into())
+                            .spawn(move || drop(old));
+                    }
+                }
+                Ok(None) => {
+                    if let Some(path) = requested {
+                        self.force_analyze(path, ctx);
+                    }
+                }
+                Err(e) => {
+                    self.analyzer.cache.error = Some(e);
+                    if let Some(path) = requested {
+                        self.force_analyze(path, ctx);
+                    }
+                }
+            }
+        }
+        if let Some(result) = self.analyzer.cache.save.poll() {
+            match result.and_then(|r| r) {
+                Ok(index) => {
+                    self.analyzer.cache.disk_index = index;
+                    self.analyzer.cache.error = None;
+                }
+                Err(e) => self.analyzer.cache.error = Some(e),
+            }
+        }
+        if !self.analyzer.cache.save.running()
+            && self
+                .analyzer
+                .cache
+                .dirty
+                .is_some_and(|at| at.elapsed() >= Duration::from_millis(350))
+        {
+            let maps = self.analyzer.cache.recent.clone();
+            let index = self.analyzer.cache.disk_index.clone();
+            self.analyzer.cache.dirty = None;
+            self.analyzer.cache.save = Task::spawn(ctx, move || save_maps(maps, index));
+        }
+    }
     pub fn start_analyze(&mut self, path: PathBuf, ctx: &egui::Context) {
+        self.page = Page::Analyzer;
+        if self.analyzer.cache.load.running() {
+            self.toast(
+                ToastKind::Info,
+                "A saved map is loading. It will be ready shortly.",
+            );
+            return;
+        }
+        if !self.analyzer.scan.running() && !self.analyzer.recycle.running() {
+            self.remember_analyzer();
+            if self.analyzer.activate_saved(&path) {
+                return;
+            }
+            if let Some(item) = self
+                .analyzer
+                .cache
+                .disk_index
+                .iter()
+                .find(|m| util::norm(&m.root) == util::norm(&path))
+                .cloned()
+            {
+                self.analyzer.scan_root = Some(path.clone());
+                self.analyzer.cache.requested = Some(path);
+                self.analyzer.cache.load = Task::spawn(ctx, move || {
+                    load_indexed_map(&item).map(|map| {
+                        Some(LoadedMaps {
+                            maps: vec![map],
+                            index: Vec::new(),
+                        })
+                    })
+                });
+                return;
+            }
+        }
+        self.force_analyze(path, ctx);
+    }
+
+    fn force_analyze(&mut self, path: PathBuf, ctx: &egui::Context) {
         self.page = Page::Analyzer;
         if self.analyzer.scan.running() || self.analyzer.recycle.running() {
             self.toast(
@@ -692,6 +1284,9 @@ impl App {
             );
             return;
         }
+        self.remember_analyzer();
+        self.analyzer.cache.read_only = false;
+        self.analyzer.cache.stamp = None;
         let progress = Arc::new(Progress::default());
         let p2 = progress.clone();
         let root = path.clone();
@@ -701,7 +1296,44 @@ impl App {
         });
         let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
         let threads = scan_threads(hdd, cores);
-        self.analyzer.scan = Task::spawn(ctx, move || scan_bounded(root, p2, threads));
+        let mut older = self.analyzer.cache.recent.clone();
+        let disk_index = self.analyzer.cache.disk_index.clone();
+        self.analyzer.scan = Task::spawn(ctx, move || {
+            let result = Arc::new(scan_bounded(root, p2.clone(), threads));
+            let stamp = crate::scan_cache::now();
+            if !result.cancelled {
+                if let Ok(mut current) = p2.current.lock() {
+                    *current = "Saving this map for next time…".into();
+                }
+                older.retain(|m| util::norm(&m.result.root_path) != util::norm(&result.root_path));
+                older.insert(
+                    0,
+                    SavedMap {
+                        result: result.clone(),
+                        stamp,
+                        view: MapView {
+                            nav: Vec::new(),
+                            tab: ATab::Folders,
+                            filter: String::new(),
+                            old_months: 12,
+                            old_min: 100 * 1024 * 1024,
+                            removed: HashSet::new(),
+                            sort: ASort::Size,
+                        },
+                        read_only: false,
+                    },
+                );
+                older.truncate(RECENT_MAPS);
+                if let Err(error) = save_maps(older, disk_index) {
+                    if let Ok(mut message) = p2.cache_error.lock() {
+                        *message = Some(error);
+                    }
+                }
+            }
+            p2.cache_stamp.store(stamp, Ordering::Relaxed);
+            Arc::try_unwrap(result)
+                .unwrap_or_else(|_| unreachable!("Only the scan worker retains this result"))
+        });
         self.analyzer.progress = Some(progress);
         self.analyzer.scan_root = Some(path.clone());
         self.analyzer.started = Some(Instant::now());
@@ -729,7 +1361,22 @@ impl App {
                         fmt_num(res.root.files),
                         res.elapsed.as_secs_f32()
                     ));
-                    self.analyzer.result = Some(res);
+                    self.analyzer.cache.stamp = Some(
+                        self.analyzer
+                            .progress
+                            .as_ref()
+                            .map(|p| p.cache_stamp.load(Ordering::Relaxed))
+                            .filter(|n| *n > 0)
+                            .unwrap_or_else(crate::scan_cache::now),
+                    );
+                    self.analyzer.cache.error = self
+                        .analyzer
+                        .progress
+                        .as_ref()
+                        .and_then(|p| p.cache_error.lock().ok().and_then(|m| m.clone()));
+                    self.analyzer.cache.read_only = false;
+                    self.analyzer.result = Some(Arc::new(res));
+                    self.remember_analyzer();
                 }
                 Err(e) => self.toast(ToastKind::Error, format!("Scan failed: {e}")),
             }
@@ -792,6 +1439,7 @@ impl App {
                 AAct::Go(page) => self.page = page,
                 AAct::DismissJournalError => self.analyzer.journal_error = None,
                 AAct::Scan(p) => self.start_analyze(p, &ctx),
+                AAct::Rescan(p) => self.force_analyze(p, &ctx),
                 AAct::PickFolder => {
                     if let Some(p) = rfd::FileDialog::new()
                         .set_title("Choose a folder to analyze")
@@ -806,13 +1454,20 @@ impl App {
                     }
                 }
                 AAct::Tab(t) => self.analyzer.tab = t,
+                AAct::Sort(sort) => self.analyzer.sort = sort,
                 AAct::Up => {
                     self.analyzer.nav.pop();
                 }
                 AAct::Truncate(n) => self.analyzer.nav.truncate(n),
                 AAct::Enter(i) => self.analyzer.nav.push(i),
                 AAct::Show(p) => util::show_in_explorer(&p),
-                AAct::Open(p) => util::open_path(&p),
+                AAct::Open(p) => {
+                    if p.is_dir() {
+                        util::open_path(&p);
+                    } else {
+                        self.toast(ToastKind::Info, "This folder is unavailable or changed. Refresh the map to see current files.");
+                    }
+                }
                 AAct::Copy(s) => ctx.output_mut(|o| o.copied_text = s),
                 AAct::Select(p, on) => {
                     if on {
@@ -823,16 +1478,34 @@ impl App {
                 }
                 AAct::SelectMany(v) => self.analyzer.selected.extend(v),
                 AAct::ClearSel => self.analyzer.selected.clear(),
-                AAct::AskRecycle(items) => self.ask_recycle(items, Origin::Analyzer),
+                AAct::AskRecycle(items) => {
+                    if self.analyzer.cache.read_only {
+                        self.toast(ToastKind::Info, "Refresh this saved map before moving files. Saved results are a view of an earlier scan.");
+                    } else {
+                        self.ask_recycle(items, Origin::Analyzer);
+                    }
+                }
                 AAct::OldMonths(m) => self.analyzer.old_months = m,
                 AAct::OldMin(b) => self.analyzer.old_min = b,
                 AAct::Filter(s) => self.analyzer.filter = s,
             }
         }
+        self.remember_analyzer();
     }
 
     /// Shared confirmation for moving user files to the Recycle Bin.
     pub fn ask_recycle(&mut self, items: Vec<(PathBuf, u64)>, origin: Origin) {
+        if origin == Origin::Analyzer && self.analyzer.cache.read_only {
+            self.toast(
+                ToastKind::Info,
+                "Refresh this saved map before moving files, then review the current results.",
+            );
+            return;
+        }
+        if origin == Origin::Duplicates && self.dups.saved_requires_refresh() {
+            self.toast(ToastKind::Info, "Refresh the saved duplicate scan before moving files, then review the current results.");
+            return;
+        }
         let items: Vec<(PathBuf, u64)> = items
             .into_iter()
             .filter(|(p, _)| util::block_reason_fast(p).is_none())
@@ -915,7 +1588,7 @@ impl App {
                 }
             });
         }
-        let scanning = a.scan.running();
+        let scanning = a.scan.running() || a.cache.load.running();
 
         // Source picker
         ui.horizontal_wrapped(|ui| {
@@ -968,7 +1641,14 @@ impl App {
         });
         ui.add_space(8.0);
 
-        if scanning {
+        if a.cache.load.running() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(widgets::dim("Restoring saved disk maps…"));
+            });
+            return;
+        }
+        if a.scan.running() {
             if let Some(p) = &a.progress {
                 widgets::card(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -1029,10 +1709,24 @@ impl App {
             return;
         };
 
+        if let Some(stamp) = a.cache.stamp {
+            ui.label(widgets::dim(format!(
+                "Scan from {}. {}",
+                crate::scan_cache::saved_label(stamp),
+                if a.cache.read_only {
+                    "Saved map · Refresh before moving files."
+                } else {
+                    "Refresh when files change; switching drives keeps their maps."
+                }
+            )));
+        }
+        if let Some(error) = &a.cache.error {
+            ui.label(widgets::faint(format!("Saved map unavailable: {error}")));
+        }
         // Summary line
         ui.horizontal_wrapped(|ui| {
             if ui.add_enabled(!a.recycle.running(), widgets::small("Rescan")).on_hover_text("Refresh this map after files have changed").clicked() {
-                acts.push(AAct::Scan(res.root_path.clone()));
+                acts.push(AAct::Rescan(res.root_path.clone()));
             }
             ui.label(RichText::new(fmt_bytes(res.root.size)).font(widgets::light(30.0)).color(TEXT));
             ui.label(widgets::dim(format!(
@@ -1079,41 +1773,57 @@ impl App {
         });
         ui.add_space(6.0);
 
+        if matches!(a.tab, ATab::Largest | ATab::Old) {
+            ui.horizontal_wrapped(|ui| {
+                let mut filter = a.filter.clone();
+                if widgets::search_box(ui, &mut filter, "Search files in this scan", 240.0)
+                    .changed()
+                {
+                    acts.push(AAct::Filter(filter));
+                }
+                for (sort, label) in [
+                    (ASort::Size, "Size"),
+                    (ASort::Name, "Name"),
+                    (ASort::Modified, "Modified"),
+                ] {
+                    if ui.add(widgets::chip(label, a.sort == sort)).clicked() {
+                        acts.push(AAct::Sort(sort));
+                    }
+                }
+            });
+        }
         match a.tab {
             ATab::Folders => self.render_folders(ui, res, acts),
             ATab::Largest => {
                 let filter = a.filter.to_lowercase();
-                let idx: Vec<usize> = (0..res.big.len())
+                let mut idx: Vec<usize> = (0..res.big.len())
                     .filter(|&i| !path_removed(&res.big[i].path, &a.removed))
                     .filter(|&i| filter.is_empty() || res.big[i].lower.contains(&filter))
-                    .take(1000)
                     .collect();
-                ui.horizontal(|ui| {
-                    let mut f = a.filter.clone();
-                    if widgets::search_box(ui, &mut f, "Filter by name or folder", 280.0).changed()
-                    {
-                        acts.push(AAct::Filter(f));
-                    }
-                    ui.label(widgets::faint(format!(
-                        "Files of 10 MB and up, {} shown",
-                        fmt_num(idx.len() as u64)
-                    )));
-                });
+                sort_file_indices(res, &mut idx, a.sort);
+                idx.truncate(1000);
+                ui.label(widgets::faint(format!(
+                    "Files of 10 MB and up · up to 1,000 matches · {} shown",
+                    fmt_num(idx.len() as u64)
+                )));
                 self.render_file_list(ui, res, &idx, acts);
             }
             ATab::Old => {
                 let min_days = a.old_months as f64 * 30.4;
-                let idx: Vec<usize> = (0..res.big.len())
+                let needle = a.filter.trim().to_lowercase();
+                let mut idx: Vec<usize> = (0..res.big.len())
                     .filter(|&i| {
                         let f = &res.big[i];
                         f.size >= a.old_min
+                            && (needle.is_empty() || f.lower.contains(&needle))
                             && !path_removed(&f.path, &a.removed)
                             && f.modified
                                 .map(|m| util::age_days(m) >= min_days)
                                 .unwrap_or(false)
                     })
-                    .take(1000)
                     .collect();
+                sort_file_indices(res, &mut idx, a.sort);
+                idx.truncate(1000);
                 ui.horizontal_wrapped(|ui| {
                     ui.label(widgets::dim("Not changed in"));
                     for (m, label) in [
@@ -1198,6 +1908,7 @@ impl App {
                     acts.push(AAct::Truncate(depth + 1));
                 }
             }
+            if ui.add_enabled(!a.recycle.running(), widgets::small("Refresh this folder")).on_hover_text("Scan only this folder to get current results. Your saved full-drive map stays available.").clicked() { acts.push(AAct::Rescan(cur_path.clone())); }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui
                     .add(widgets::small(widgets::icon_text(
@@ -1213,37 +1924,124 @@ impl App {
             });
         });
 
-        let map_h = (ui.available_height() * 0.45).clamp(220.0, 420.0);
+        let map_h = (ui.available_height() * 0.32).clamp(120.0, 300.0);
         if let Some(i) = treemap(ui, node, map_h) {
             acts.push(AAct::Enter(i));
         }
         ui.add_space(6.0);
 
+        let needle = a.filter.trim().to_lowercase();
+        let mut visible: Vec<usize> = (0..node.children.len())
+            .filter(|&i| {
+                needle.is_empty() || node.children[i].name.to_lowercase().contains(&needle)
+            })
+            .collect();
+        visible.sort_by(|&i, &j| {
+            let (left, right) = (&node.children[i], &node.children[j]);
+            match a.sort {
+                ASort::Size => right.size.cmp(&left.size),
+                ASort::Name => left.name.to_lowercase().cmp(&right.name.to_lowercase()),
+                ASort::Modified => right.modified.cmp(&left.modified),
+                ASort::Files => right.files.cmp(&left.files),
+            }
+            .then_with(|| left.name.cmp(&right.name))
+        });
+        ui.horizontal_wrapped(|ui| {
+            let mut filter = a.filter.clone();
+            if widgets::search_box(ui, &mut filter, "Search this folder", 220.0).changed() {
+                acts.push(AAct::Filter(filter));
+            }
+            ui.label(widgets::faint(format!(
+                "{} of {} entries in this folder",
+                visible.len(),
+                node.children.len()
+            )));
+            for (sort, label) in [
+                (ASort::Size, "Size"),
+                (ASort::Name, "Name"),
+                (ASort::Modified, "Modified"),
+                (ASort::Files, "File count"),
+            ] {
+                if ui.add(widgets::chip(label, a.sort == sort)).clicked() {
+                    acts.push(AAct::Sort(sort));
+                }
+            }
+        });
+        let actionable = |index: usize| {
+            let child = &node.children[index];
+            let p = cur_path.join(&child.name);
+            (matches!(child.kind, NodeKind::Dir | NodeKind::File)
+                && !path_removed(&p, &a.removed)
+                && util::block_reason_fast(&p).is_none())
+            .then_some((p, child.size))
+        };
+        let selected: Vec<_> = visible
+            .iter()
+            .filter_map(|&i| actionable(i))
+            .filter(|(p, _)| a.selected.contains(p))
+            .collect();
+        let selected_bytes: u64 = selected.iter().map(|(_, bytes)| *bytes).sum();
+        ui.horizontal_wrapped(|ui| {
+            if ui.add(widgets::small("Select shown")).clicked() {
+                acts.push(AAct::SelectMany(
+                    visible
+                        .iter()
+                        .filter_map(|&i| actionable(i))
+                        .map(|(p, _)| p)
+                        .collect(),
+                ));
+            }
+            if ui
+                .add_enabled(!a.selected.is_empty(), widgets::small("Clear selection"))
+                .clicked()
+            {
+                acts.push(AAct::ClearSel);
+            }
+            ui.label(widgets::dim(format!(
+                "{} selected here · {}",
+                selected.len(),
+                fmt_bytes(selected_bytes)
+            )));
+            if ui
+                .add_enabled(
+                    !selected.is_empty() && !a.recycle.running() && !a.cache.read_only,
+                    widgets::danger("Move selected to Recycle Bin…"),
+                )
+                .clicked()
+            {
+                acts.push(AAct::AskRecycle(selected.clone()));
+            }
+        });
         let parent = node.size.max(1) as f32;
+        let compact = ui.available_width() < 900.0;
         ScrollArea::vertical()
             .id_salt("folder_rows")
             .auto_shrink([false, false])
-            .show_rows(ui, 34.0, node.children.len(), |ui, range| {
-                for idx in range {
+            .show_rows(ui, 38.0, visible.len(), |ui, range| {
+                for &idx in &visible[range] {
                     let child = &node.children[idx];
                     let child_path = cur_path.join(&child.name);
                     let removed = path_removed(&child_path, &a.removed);
-                    widgets::row(ui, 34.0, |ui| {
+                    widgets::row(ui, 38.0, |ui| {
+                        let block = if matches!(child.kind, NodeKind::Dir | NodeKind::File) { util::block_reason_fast(&child_path) } else { Some("This is an aggregate or inaccessible entry. Open its parent to review real files.") };
+                        let mut selected = a.selected.contains(&child_path);
+                        let checkbox = ui.add_enabled(block.is_none() && !removed, egui::Checkbox::new(&mut selected, ""));
+                        if let Some(reason) = block { checkbox.on_disabled_hover_text(reason); }
+                        else if checkbox.changed() { acts.push(AAct::Select(child_path.clone(), selected)); }
                         let (icon_c, col) = match child.kind {
                             NodeKind::Dir => (ic::FOLDER, PALETTE[idx % PALETTE.len()]),
                             NodeKind::File => (ic::FILE, classify(&ext_of(&child.name)).color()),
                             NodeKind::SmallFiles => (ic::FILE, TEXT_FAINT),
                             NodeKind::Denied => (ic::LOCK, TEXT_FAINT),
                         };
-                        ui.label(widgets::icon(icon_c, 16.0, col));
+                        ui.label(widgets::icon(if block.is_some() { ic::LOCK } else { icon_c }, 16.0, col));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             ui.add_space(6.0);
                             let actionable =
                                 matches!(child.kind, NodeKind::Dir | NodeKind::File) && !removed;
                             if actionable {
-                                let block = util::block_reason_fast(&child_path);
                                 let btn = ui.add_enabled(
-                                    block.is_none(),
+                                    block.is_none() && !a.cache.read_only,
                                     widgets::small(widgets::icon(ic::CLEAN, 13.0, TEXT_DIM)),
                                 );
                                 let btn = match block {
@@ -1264,28 +2062,28 @@ impl App {
                                     acts.push(AAct::Show(child_path.clone()));
                                 }
                             }
-                            ui.add_sized(
+                            if !compact { ui.add_sized(
                                 [96.0, 20.0],
                                 Label::new(widgets::faint(fmt_age(child.modified))),
-                            );
+                            ); }
                             let files = if child.kind == NodeKind::Denied {
                                 "no access".to_string()
                             } else {
                                 format!("{} files", fmt_num(child.files))
                             };
-                            ui.add_sized([96.0, 20.0], Label::new(widgets::faint(files)));
-                            ui.add_sized(
+                            if !compact { ui.add_sized([96.0, 20.0], Label::new(widgets::faint(files))); }
+                            if !compact { ui.add_sized(
                                 [50.0, 20.0],
                                 Label::new(widgets::faint(format!(
                                     "{:.0}%",
                                     child.size as f32 / parent * 100.0
                                 ))),
-                            );
+                            ); }
                             ui.add_sized(
                                 [84.0, 20.0],
                                 Label::new(widgets::strong(fmt_bytes(child.size), 14.0)),
                             );
-                            widgets::bar(ui, child.size as f32 / parent, col, vec2(110.0, 6.0));
+                            if !compact { widgets::bar(ui, child.size as f32 / parent, col, vec2(110.0, 6.0)); }
                             ui.add_space(8.0);
                             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                                 let enterable =
@@ -1360,7 +2158,7 @@ impl App {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui
                     .add_enabled(
-                        !sel_items.is_empty() && !a.recycle.running(),
+                        !sel_items.is_empty() && !a.recycle.running() && !a.cache.read_only,
                         widgets::danger(widgets::icon_text(
                             ic::CLEAN,
                             "Move selected to Recycle Bin",
@@ -1524,6 +2322,165 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn map_fixture(root: &str) -> ScanResult {
+        ScanResult {
+            root_path: root.into(),
+            root: Node {
+                name: root.into(),
+                size: 20,
+                files: 1,
+                kind: NodeKind::Dir,
+                modified: None,
+                children: vec![Node {
+                    name: "nested".into(),
+                    size: 20,
+                    files: 1,
+                    kind: NodeKind::Dir,
+                    modified: None,
+                    children: vec![Node {
+                        name: "example.bin".into(),
+                        size: 20,
+                        files: 1,
+                        kind: NodeKind::File,
+                        modified: None,
+                        children: Vec::new(),
+                    }],
+                }],
+            },
+            big: Vec::new(),
+            exts: Vec::new(),
+            cats: Vec::new(),
+            elapsed: Duration::from_secs(1),
+            denied: 0,
+            dirs: 2,
+            cancelled: false,
+        }
+    }
+    #[test]
+    fn saved_map_roundtrip_restores_tree_without_recursive_json() {
+        let scan = map_fixture(r"C:\");
+        let json = serde_json::to_vec(&map_ref(&scan)).unwrap();
+        let restored = restore_map(serde_json::from_slice(&json).unwrap()).unwrap();
+        assert_eq!(restored.root_path, scan.root_path);
+        assert_eq!(restored.root.children[0].children[0].name, "example.bin");
+        assert_eq!(restored.root.size, 20);
+        let mut broken: DiskMap = serde_json::from_slice(&json).unwrap();
+        broken.nodes[1].parent = Some(1);
+        assert!(
+            restore_map(broken).is_err(),
+            "self/cyclic parents must never be followed"
+        );
+        let mut broken: DiskMap = serde_json::from_slice(&json).unwrap();
+        broken.nodes[1].name = "..".into();
+        assert!(
+            restore_map(broken).is_err(),
+            "cached child names cannot escape the scan root"
+        );
+    }
+    #[test]
+    fn switching_c_d_c_restores_saved_map_and_view_without_a_scan() {
+        let mut a = AnalyzerState::default();
+        for (root, filter, tab) in [
+            (r"C:\", "example", ATab::Largest),
+            (r"D:\", "backup", ATab::Old),
+        ] {
+            let mut view = MapView::capture(&a);
+            view.filter = filter.into();
+            view.tab = tab;
+            view.nav = vec![0];
+            a.cache.recent.push(SavedMap {
+                result: Arc::new(map_fixture(root)),
+                stamp: 1,
+                view,
+                read_only: true,
+            });
+        }
+        let c = a.cache.recent[0].result.clone();
+        assert!(a.activate_saved(Path::new(r"C:\")));
+        assert!(a.activate_saved(Path::new(r"D:\")));
+        assert_eq!(a.filter, "backup");
+        assert!(a.activate_saved(Path::new(r"C:\")));
+        assert_eq!(a.filter, "example");
+        assert!(a.tab == ATab::Largest);
+        assert_eq!(a.nav, vec![0]);
+        assert!(Arc::ptr_eq(a.result.as_ref().unwrap(), &c));
+        assert!(!a.scan.running());
+        assert!(a.cache.read_only);
+        assert!(!a.activate_saved(Path::new(r"E:\")));
+    }
+    #[test]
+    fn fourth_drive_loads_its_saved_map_without_starting_a_scan() {
+        let ctx = egui::Context::default();
+        let mut app = App::test_fixture();
+        app.analyzer = AnalyzerState::default();
+        let stamp = crate::scan_cache::now();
+        let maps: Vec<_> = [
+            r"C:\cache-cycle",
+            r"D:\cache-cycle",
+            r"E:\cache-cycle",
+            r"S:\cache-cycle",
+        ]
+        .into_iter()
+        .map(|root| SavedMap {
+            result: Arc::new(map_fixture(root)),
+            stamp,
+            view: MapView::capture(&app.analyzer),
+            read_only: true,
+        })
+        .collect();
+        let index = save_maps(maps.clone(), Vec::new()).unwrap();
+        for root in [
+            r"C:\cache-cycle",
+            r"D:\cache-cycle",
+            r"E:\cache-cycle",
+            r"S:\cache-cycle",
+        ] {
+            assert!(index
+                .iter()
+                .any(|item| util::norm(&item.root) == util::norm(Path::new(root))));
+        }
+        app.analyzer.cache.disk_index = index;
+        app.analyzer.cache.recent = maps.into_iter().take(RECENT_MAPS).collect();
+        for root in [
+            r"S:\cache-cycle",
+            r"C:\cache-cycle",
+            r"D:\cache-cycle",
+            r"E:\cache-cycle",
+            r"S:\cache-cycle",
+            r"C:\cache-cycle",
+        ] {
+            app.start_analyze(PathBuf::from(root), &ctx);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while app.analyzer.cache.load.running() {
+                app.poll_analyzer_cache(&ctx);
+                assert!(Instant::now() < deadline, "cached map read timed out");
+                std::thread::yield_now();
+            }
+            assert!(
+                !app.analyzer.scan.running(),
+                "a known drive must load its snapshot, not enumerate disk files again"
+            );
+            assert_eq!(
+                app.analyzer.result.as_ref().unwrap().root_path,
+                PathBuf::from(root)
+            );
+            assert!(app.analyzer.cache.recent.len() <= RECENT_MAPS);
+        }
+    }
+    #[test]
+    fn cached_map_recycle_requires_a_fresh_scan() {
+        let mut app = App::test_fixture();
+        mark_preview_saved(&mut app.analyzer);
+        app.ask_recycle(
+            vec![(PathBuf::from(r"C:\data\old.bin"), 20)],
+            Origin::Analyzer,
+        );
+        assert!(
+            app.modal.is_none(),
+            "a saved map must not authorize file mutations"
+        );
+    }
 
     #[test]
     fn removed_folder_hides_descendants_but_not_neighbors() {

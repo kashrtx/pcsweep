@@ -67,7 +67,7 @@ struct Inventory {
 }
 fn inventory() -> Result<Inventory, String> {
     let all = network::query_adapters()?;
-    let adapters = all
+    let mut adapters: Vec<_> = all
         .iter()
         .filter(|a| a.is_physical())
         .map(|a| AdapterView {
@@ -76,6 +76,13 @@ fn inventory() -> Result<Inventory, String> {
             guard: dns::eligibility(a, &all).err(),
         })
         .collect();
+    adapters.sort_by_key(|view| {
+        (
+            view.guard.is_some(),
+            view.config.is_err(),
+            view.adapter.recommended_order(),
+        )
+    });
     Ok(Inventory {
         browsers: browsers(),
         adapters,
@@ -104,47 +111,94 @@ struct Probe {
     message: String,
     filter: String,
 }
-fn probe_script(config: &Config) -> Result<String, String> {
-    let server = config
-        .v4
-        .servers
-        .first()
-        .or_else(|| config.v6.servers.first())
-        .ok_or("No selected resolver is available for a direct test.")?;
-    let _: std::net::IpAddr = server.parse().map_err(|_| "Invalid resolver address")?;
+fn probe_script(config: &Config, adapter: &AdapterInfo) -> Result<String, String> {
+    let servers = |family: &dns::Family,
+                   v6: bool,
+                   enabled: Option<bool>|
+     -> Result<String, String> {
+        if enabled == Some(false) {
+            return Ok(String::new());
+        }
+        family
+            .servers
+            .iter()
+            .map(|server| {
+                let address: std::net::IpAddr =
+                    server.parse().map_err(|_| "Invalid resolver address")?;
+                if address.is_ipv6() != v6 {
+                    return Err("Resolver address family does not match its configuration".into());
+                }
+                Ok(platform::ps_quote(server))
+            })
+            .collect::<Result<Vec<_>, String>>()
+            .map(|values| values.join(","))
+    };
+    let v4 = servers(&config.v4, false, adapter.ipv4_enabled)?;
+    let v6 = servers(&config.v6, true, adapter.ipv6_enabled)?;
+    if v4.is_empty() && v6.is_empty() {
+        return Err("No enabled protocol has a selected resolver to check.".into());
+    }
     Ok(format!(
         r#"
-$server={server}
-$usable=$false;$message='';$filter='Not confirmed'
-try {{
-    $test=@(Resolve-DnsName -Name 'www.microsoft.com' -Server $server -DnsOnly -NoHostsFile -QuickTimeout -ErrorAction Stop | Where-Object {{ $_.IPAddress }})
-    if($test.Count -eq 0){{throw 'The selected resolver returned no addresses.'}}
-    $system=[Net.Dns]::BeginGetHostAddresses('www.microsoft.com',$null,$null)
-    if(-not $system.AsyncWaitHandle.WaitOne(5000)){{throw 'Windows lookup timed out.'}}
-    if([Net.Dns]::EndGetHostAddresses($system).Count -eq 0){{throw 'Windows lookup returned no addresses.'}}
-    $usable=$true;$message='The selected resolver and Windows resolved a normal website. This is not a complete internet or browser test.'
-}} catch {{ $message=$_.Exception.Message }}
-try {{
-    $ads=@(Resolve-DnsName -Name 'doubleclick.net' -Server $server -DnsOnly -NoHostsFile -QuickTimeout -ErrorAction Stop | Where-Object {{ $_.IPAddress }})
-    if($ads.Count -gt 0 -and @($ads | Where-Object {{$_.IPAddress -ne '0.0.0.0' -and $_.IPAddress -ne '::'}}).Count -eq 0){{$filter='Selected resolver returned blocked addresses for the ad-domain probe'}}
-    else{{$filter='The selected resolver did not confirm blocking this probe. Browser blocking remains separate.'}}
-}} catch {{
-    if($_.Exception.NativeErrorCode -eq 9003){{$filter='Selected resolver returned no such name for the ad-domain probe'}}
-    else{{$filter='Ad-domain probe could not be confirmed; a timeout is not evidence of blocking'}}
+$server4=@({v4});$server6=@({v6})
+$passed4=0;$passed6=0;$messages=New-Object 'System.Collections.Generic.List[string]'
+$filters=New-Object 'System.Collections.Generic.List[string]'
+foreach($family in @(4,6)){{
+    $servers=$(if($family -eq 4){{$server4}}else{{$server6}})
+    foreach($server in $servers){{
+        try{{
+            $test=@(Resolve-DnsName -Name 'www.microsoft.com' -Type A -Server $server -DnsOnly -NoHostsFile -QuickTimeout -ErrorAction Stop | Where-Object {{$_.IPAddress}})
+            if($test.Count -eq 0){{throw 'No addresses returned'}}
+            if($family -eq 4){{$passed4++}}else{{$passed6++}}
+            $messages.Add(('IPv'+$family+' '+$server+': resolved a normal website'))
+        }}catch{{$messages.Add(('IPv'+$family+' '+$server+': not confirmed - '+$_.Exception.Message))}}
+        try{{
+            $ads=@(Resolve-DnsName -Name 'doubleclick.net' -Type A -Server $server -DnsOnly -NoHostsFile -QuickTimeout -ErrorAction Stop | Where-Object {{$_.IPAddress}})
+            if($ads.Count -gt 0 -and @($ads|Where-Object {{$_.IPAddress -ne '0.0.0.0' -and $_.IPAddress -ne '::'}}).Count -eq 0){{$filters.Add(($server+': ad-domain probe blocked'))}}
+            else{{$filters.Add(($server+': ad-domain blocking not confirmed'))}}
+        }}catch{{
+            if($_.Exception.NativeErrorCode -eq 9003 -or $_.FullyQualifiedErrorId -like 'DNS_ERROR_RCODE_NAME_ERROR*'){{$filters.Add(($server+': ad-domain probe returned no such name'))}}
+            else{{$filters.Add(($server+': ad-domain probe not confirmed; a timeout does not prove blocking'))}}
+        }}
+    }}
 }}
-[pscustomobject]@{{usable=$usable;message=$message;filter=$filter}}|ConvertTo-Json -Compress
+$systemOk=$false
+try{{
+    $system=[Net.Dns]::BeginGetHostAddresses('www.microsoft.com',$null,$null)
+    if(-not $system.AsyncWaitHandle.WaitOne(5000)){{throw 'Windows lookup timed out'}}
+    $systemOk=([Net.Dns]::EndGetHostAddresses($system).Count -gt 0)
+    if(-not $systemOk){{throw 'Windows returned no addresses'}}
+    $messages.Add('Windows system lookup: resolved a normal website')
+}}catch{{$messages.Add(('Windows system lookup: not confirmed - '+$_.Exception.Message))}}
+$required4={required4};$required6={required6}
+$usable=$systemOk -and ($passed4+$passed6 -gt 0) -and (-not $required4 -or $passed4 -gt 0) -and (-not $required6 -or $passed6 -gt 0)
+if($server4.Count -gt 0 -and -not $required4){{$messages.Add('IPv4 has no reported default gateway; unreachable IPv4 servers may need a route before they can be used')}}
+if($server6.Count -gt 0 -and -not $required6){{$messages.Add('IPv6 has no reported default gateway; unreachable IPv6 servers may need a route before they can be used')}}
+$messages.Add('Resolver checks do not prove complete internet access or browser ad blocking')
+[pscustomobject]@{{usable=[bool]$usable;message=($messages -join "`n");filter=($filters -join "`n")}}|ConvertTo-Json -Compress
 "#,
-        server = platform::ps_quote(server)
+        required4 = if !adapter.ipv4_gateways.is_empty() && !v4.is_empty() {
+            "$true"
+        } else {
+            "$false"
+        },
+        required6 = if !adapter.ipv6_gateways.is_empty() && !v6.is_empty() {
+            "$true"
+        } else {
+            "$false"
+        },
     ))
 }
-fn probe(config: Config) -> Result<Probe, String> {
+fn probe(config: Config, adapter: AdapterInfo) -> Result<Probe, String> {
     #[derive(serde::Deserialize)]
     struct Response {
         usable: bool,
         message: String,
         filter: String,
     }
-    let s = platform::powershell(&probe_script(&config)?, Duration::from_secs(25))?;
+    // Every selected server is queried, including IPv6. The outer process has a
+    // fixed deadline; its termination cannot leave an unbounded UI worker.
+    let s = platform::powershell(&probe_script(&config, &adapter)?, Duration::from_secs(65))?;
     let r: Response =
         serde_json::from_str(&s).map_err(|_| "The DNS check returned unreadable results")?;
     Ok(Probe {
@@ -153,6 +207,18 @@ fn probe(config: Config) -> Result<Probe, String> {
         filter: r.filter,
     })
 }
+fn preferred_adapter(adapters: &[AdapterView]) -> Option<&AdapterView> {
+    adapters
+        .iter()
+        .filter(|view| view.guard.is_none() && view.config.is_ok())
+        .min_by_key(|view| view.adapter.recommended_order())
+        .or_else(|| {
+            adapters
+                .iter()
+                .min_by_key(|view| view.adapter.recommended_order())
+        })
+}
+
 pub struct AdsState {
     load: Task<Result<Inventory, String>>,
     change: Task<Result<String, String>>,
@@ -181,7 +247,7 @@ impl Default for AdsState {
             selected: None,
             custom: false,
             custom_text: String::new(),
-            trial: dns::read_trial().ok().flatten(),
+            trial: None,
             probe: None,
             probe_token: None,
             error: None,
@@ -228,13 +294,13 @@ impl App {
             self.ads.loaded = true;
             match r.and_then(|r| r) {
                 Ok(i) => {
-                    if self.ads.selected.is_none() {
-                        self.ads.selected = i
-                            .adapters
-                            .iter()
-                            .find(|a| a.adapter.connected())
-                            .map(|a| a.adapter.guid.clone());
+                    if self.ads.selected.as_ref().is_none_or(|selected| {
+                        !i.adapters.iter().any(|v| &v.adapter.guid == selected)
+                    }) {
+                        self.ads.selected =
+                            preferred_adapter(&i.adapters).map(|v| v.adapter.guid.clone());
                     }
+                    self.ads.error = None;
                     self.ads.trial = i.trial.clone();
                     self.ads.inventory = Some(i)
                 }
@@ -290,7 +356,8 @@ impl App {
                 self.ads.probe = None;
                 self.ads.probe_token = Some(t.token.clone());
                 let config = t.applied.clone();
-                self.ads.checks = Task::spawn(ctx, move || probe(config));
+                let adapter = t.adapter.clone();
+                self.ads.checks = Task::spawn(ctx, move || probe(config, adapter));
             }
         }
     }
@@ -336,6 +403,7 @@ impl App {
 
         let mut ask = None;
         let mut dismiss = None;
+        let mut restart_admin = false;
 
         let busy = self.ads.change.running();
 
@@ -369,16 +437,29 @@ impl App {
                             18.0,
                         ));
                         ui.label(widgets::dim("The separate recovery process restores the previous settings unless you keep this trial. Closing PCSweep does not keep it."));
+                        if !t.result.is_empty() {
+                            ui.label(widgets::faint(&t.result));
+                        }
 
                         if self.ads.checks.running() {
                             ui.horizontal(|ui| {
                                 ui.spinner();
-                                ui.label("Checking the selected resolver and Windows lookup…");
+                                ui.label("Checking selected IPv4/IPv6 resolvers and Windows lookup…");
                             });
                         }
                         if let Some(p) = &self.ads.probe {
-                            ui.label(widgets::dim(&p.message));
-                            ui.label(widgets::faint(&p.filter));
+                            ui.label(widgets::dim(if p.usable {
+                                "Windows lookup and a selected resolver for each routed protocol responded."
+                            } else {
+                                "Connection checks did not pass. Review the details or restore the original DNS."
+                            }));
+                            egui::CollapsingHeader::new("Resolver check details")
+                                .id_salt(("dns_probe_details", &t.token))
+                                .default_open(false)
+                                .show(ui, |ui| {
+                                    ui.label(widgets::dim(&p.message));
+                                    ui.label(widgets::faint(&p.filter));
+                                });
                         }
 
                         ui.horizontal_wrapped(|ui| {
@@ -441,64 +522,7 @@ impl App {
                 });
             });
 
-            widgets::section(ui, "Browser blocking");
-
-            let fallback = browsers();
-            let browsers = self
-                .ads
-                .inventory
-                .as_ref()
-                .map(|i| &i.browsers)
-                .unwrap_or(&fallback);
-
-            for browser in browsers {
-                widgets::card(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(widgets::strong(
-                            format!("{} · {}", browser.name, browser.blocker),
-                            16.0,
-                        ));
-                        widgets::badge(
-                            ui,
-                            if browser.path.is_some() {
-                                "Browser found"
-                            } else {
-                                "Not detected"
-                            },
-                            TEXT_DIM,
-                        );
-                    });
-
-                    ui.label(widgets::dim(if browser.name == "Firefox" {
-                        "Full uBlock Origin is supported on Firefox. Install from the official Mozilla listing."
-                    } else {
-                        "uBlock Origin Lite supports current Manifest V3 browsers. The browser explains site permissions and filtering modes."
-                    }));
-
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.add(widgets::small("Open official listing")).clicked() {
-                            if !self.is_admin {
-                                if let Some(path) = &browser.path {
-                                    let _ =
-                                        std::process::Command::new(path).arg(&browser.url).spawn();
-                                } else {
-                                    util::open_uri(&browser.url);
-                                }
-                            } else {
-                                util::open_uri(&browser.url);
-                            }
-                        }
-
-                        if ui.add(widgets::small("Copy store link")).clicked() {
-                            ui.output_mut(|o| o.copied_text = browser.url.clone());
-                        }
-                    });
-
-                    ui.label(widgets::faint("Install and confirm permissions in that browser. PCSweep does not force extensions, edit profiles or claim they are active without browser verification."));
-                });
-            }
-
-            widgets::section(ui, "Optional DNS filtering");
+            widgets::section(ui, "DNS ad and tracker filtering");
 
             ui.horizontal_wrapped(|ui| {
                 if ui
@@ -524,7 +548,8 @@ impl App {
                     if ui
                         .selectable_label(
                             self.ads.selected.as_ref() == Some(&view.adapter.guid),
-                            format!("{} · {}", view.adapter.name, view.adapter.description),
+                            format!("{} · {} · {}{}", view.adapter.name, view.adapter.description, view.adapter.status,
+                                if preferred_adapter(&inventory.adapters).is_some_and(|preferred|preferred.adapter.guid == view.adapter.guid) && view.guard.is_none() { " · Recommended" } else { "" }),
                         )
                         .clicked()
                     {
@@ -545,6 +570,7 @@ impl App {
                         match &view.config {
                             Ok(c) => {
                                 ui.label(widgets::dim(config_label(c)));
+                                if c == &dns::adguard() { widgets::badge(ui,"AdGuard DNS configured",GOOD); }
                             }
                             Err(e) => {
                                 ui.colored_label(WARN, e);
@@ -553,9 +579,17 @@ impl App {
 
                         if let Some(g) = &view.guard {
                             ui.colored_label(WARN, g);
+                            if let Some(preferred) = preferred_adapter(&inventory.adapters).filter(|v|v.guard.is_none() && v.adapter.guid != view.adapter.guid) {
+                                if ui.add(widgets::small(format!("Use recommended adapter: {}",preferred.adapter.name))).clicked() {
+                                    self.ads.selected = Some(preferred.adapter.guid.clone());
+                                }
+                            }
                         }
                         ui.add_space(4.0);
 
+                        if view.adapter.ipv4_enabled == Some(false) || view.adapter.ipv6_enabled == Some(false) {
+                            ui.label(widgets::faint("A network protocol is disabled on this adapter. AdGuard applies to enabled protocols; the disabled protocol's saved DNS stays unchanged."));
+                        }
                         ui.radio_value(&mut self.ads.custom, false, "AdGuard public DNS · ad/tracker domain filtering");
                         ui.radio_value(
                             &mut self.ads.custom,
@@ -590,7 +624,8 @@ impl App {
                         });
 
                         if !self.is_admin {
-                            ui.label(widgets::dim("Restart as administrator to start a DNS trial. No router settings, VPNs or IP addresses are changed."));
+                            ui.label(widgets::dim("Administrator access is needed to apply DNS. Your IP addresses, router and VPN configuration stay as they are."));
+                            if ui.add_enabled(!globally_busy,widgets::small("Restart as administrator to apply DNS")).clicked() { restart_admin = true; }
                         }
 
                         let enabled = self.is_admin
@@ -599,14 +634,14 @@ impl App {
                             && view.config.is_ok();
 
                         if ui
-                            .add_enabled(enabled, widgets::primary("Review 90-second DNS trial…"))
+                            .add_enabled(enabled, widgets::primary(if self.ads.custom { "Apply custom DNS…" } else { "Apply AdGuard DNS…" }))
                             .clicked()
                         {
                             if let Ok(before) = &view.config {
                                 let desired = if self.ads.custom {
-                                    dns::custom(&self.ads.custom_text, before)
+                                    dns::custom_for(&self.ads.custom_text, &view.adapter, before)
                                 } else {
-                                    Ok(dns::adguard())
+                                    Ok(dns::adguard_for(&view.adapter,before))
                                 };
                                 match desired {
                                     Ok(desired) => {
@@ -616,13 +651,79 @@ impl App {
                                 }
                             }
                         }
+                        ui.label(widgets::faint("A 90-second safety trial starts after confirmation. Keep it to make the change persistent, or restore automatically."));
                     });
                 } else {
-                    ui.label(widgets::dim("No physical Wi-Fi or Ethernet adapter was found. Browser blocking is still available."));
+                    ui.label(widgets::dim("No physical Wi-Fi or Ethernet adapter was found. Refresh after connecting a device. Browser blocking is still available."));
                 }
             }
+            widgets::section(ui, "Browser extensions");
+            ui.label(widgets::dim("DNS filtering works across apps. Add a browser extension too for page-level ads; the browser requires you to confirm its installation and permissions."));
+
+            let fallback: Vec<Browser> = BROWSERS.iter().map(|(name, _, blocker, url)| Browser { name: (*name).into(), blocker: (*blocker).into(), url: (*url).into(), path: None }).collect();
+            let browser_detection_complete = self.ads.inventory.is_some();
+            let browsers = self
+                .ads
+                .inventory
+                .as_ref()
+                .map(|i| &i.browsers)
+                .unwrap_or(&fallback);
+
+            for browser in browsers {
+                widgets::card(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(widgets::strong(
+                            format!("{} · {}", browser.name, browser.blocker),
+                            16.0,
+                        ));
+                        widgets::badge(
+                            ui,
+                            if browser.path.is_some() {
+                                "Browser found"
+                            } else if browser_detection_complete {
+                                "Not detected"
+                            } else {
+                                "Checking…"
+                            },
+                            TEXT_DIM,
+                        );
+                    });
+
+                    ui.label(widgets::dim(if browser.name == "Firefox" {
+                        "Full uBlock Origin is supported on Firefox. Install from the official Mozilla listing."
+                    } else {
+                        "uBlock Origin Lite supports current Manifest V3 browsers. The browser explains site permissions and filtering modes."
+                    }));
+
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.add(widgets::small("Add browser extension…")).clicked() {
+                            if !self.is_admin {
+                                if let Some(path) = &browser.path {
+                                    let _ =
+                                        std::process::Command::new(path).arg(&browser.url).spawn();
+                                } else {
+                                    util::open_uri(&browser.url);
+                                }
+                            } else {
+                                util::open_uri(&browser.url);
+                            }
+                        }
+
+                        if ui.add(widgets::small("Copy store link")).clicked() {
+                            ui.output_mut(|o| o.copied_text = browser.url.clone());
+                        }
+                    });
+
+
+                });
+            }
+
+
         });
 
+        if restart_admin {
+            self.relaunch_admin(&ctx);
+        }
         if refresh {
             self.ads.error = None;
             self.refresh_ads(&ctx);
@@ -677,6 +778,8 @@ pub(crate) fn preview_fixture() -> AdsState {
         physical: true,
         hardware: true,
         status: "Up".into(),
+        oper_status: Some(1),
+        default_route: true,
         interface_type: 71,
         domain_member: Some(false),
         pnp_device_id: "PCI\\Preview".into(),
@@ -732,6 +835,33 @@ pub(crate) fn trial_preview_fixture() -> AdsState {
 mod tests {
     use super::*;
     #[test]
+    fn default_selection_uses_an_eligible_active_route_not_the_first_nic() {
+        let mut spare = AdapterInfo {
+            name: "Ethernet 2".into(),
+            oper_status: Some(2),
+            ..Default::default()
+        };
+        let mut active = spare.clone();
+        active.name = "Wi-Fi".into();
+        active.oper_status = Some(1);
+        active.default_route = true;
+        spare.guid = "spare".into();
+        active.guid = "active".into();
+        let views = vec![
+            AdapterView {
+                adapter: spare,
+                config: Ok(Config::default()),
+                guard: Some("Cable disconnected".into()),
+            },
+            AdapterView {
+                adapter: active,
+                config: Ok(Config::default()),
+                guard: None,
+            },
+        ];
+        assert_eq!(preferred_adapter(&views).unwrap().adapter.guid, "active");
+    }
+    #[test]
     fn only_official_store_targets_are_used() {
         assert!(BROWSERS[0].3.starts_with("https://addons.mozilla.org/"));
         assert!(BROWSERS[1].3.contains("ddkjiahejlhfcafbddmgiahcphecmpfh"));
@@ -741,10 +871,47 @@ mod tests {
     fn probe_does_not_accept_executable_server_text() {
         let mut c = Config::default();
         c.v4.servers.push("1.1.1.1';throw 'oops".into());
-        assert!(probe_script(&c).is_err());
-        assert!(probe_script(&dns::adguard())
+        let adapter = AdapterInfo::default();
+        assert!(probe_script(&c, &adapter).is_err());
+        assert!(probe_script(&dns::adguard(), &adapter)
             .unwrap()
-            .contains("not a complete internet"));
+            .contains("do not prove complete internet"));
+    }
+    #[test]
+    fn probes_include_every_selected_server_but_skip_disabled_protocols() {
+        let mut adapter = AdapterInfo::default();
+        let script = probe_script(&dns::adguard(), &adapter).unwrap();
+        for address in dns::adguard()
+            .v4
+            .servers
+            .iter()
+            .chain(dns::adguard().v6.servers.iter())
+        {
+            assert!(
+                script.contains(address),
+                "every selected resolver must be checked"
+            );
+        }
+        adapter.ipv6_enabled = Some(false);
+        let script = probe_script(&dns::adguard(), &adapter).unwrap();
+        assert!(script.contains("94.140.14.14"));
+        assert!(
+            !script.contains("2a10:50c0"),
+            "dormant IPv6 DNS must not affect Keep eligibility"
+        );
+        adapter.ipv4_enabled = Some(false);
+        assert!(probe_script(&dns::adguard(), &adapter).is_err());
+    }
+    #[test]
+    fn native_dns_probe_script_parses_without_sending_queries() {
+        let script = probe_script(&dns::adguard(), &AdapterInfo::default()).unwrap();
+        let parser = format!("$tokens=$null;$errors=$null;[void][System.Management.Automation.Language.Parser]::ParseInput({},[ref]$tokens,[ref]$errors);if($errors.Count){{throw (($errors|ForEach-Object {{$_.Message}})-join '; ')}};'syntax-ok'",platform::ps_quote(&script));
+        assert_eq!(
+            platform::powershell(&parser, Duration::from_secs(20))
+                .unwrap()
+                .trim(),
+            "syntax-ok"
+        );
     }
     #[test]
     fn pending_resolution_can_bypass_only_its_own_guard() {

@@ -23,12 +23,25 @@ $configs = @{}
 try { Get-NetIPConfiguration -All -ErrorAction Stop | ForEach-Object { $configs[[string]$_.InterfaceIndex] = $_ } } catch { }
 $domain = $null
 try { $domain = [bool](Get-CimInstance Win32_ComputerSystem -Property PartOfDomain -ErrorAction Stop).PartOfDomain } catch { }
+$bindings = @{}
+try { Get-NetAdapterBinding -IncludeHidden -AllBindings -ErrorAction Stop | Where-Object { $_.ComponentID -eq 'ms_tcpip' -or $_.ComponentID -eq 'ms_tcpip6' } | ForEach-Object { $bindings[([string]$_.Name)+':'+([string]$_.ComponentID)]=[bool]$_.Enabled } } catch { }
+$pnp = @{}
+try { Get-CimInstance Win32_NetworkAdapter -Property GUID,PNPDeviceID -ErrorAction Stop | ForEach-Object { if($_.GUID) { $pnp[([string]$_.GUID).Trim('{}').ToLowerInvariant()] = [string]$_.PNPDeviceID } } } catch { }
+$routes = @{}
+try { Get-NetRoute -PolicyStore ActiveStore -ErrorAction Stop | Where-Object { $_.DestinationPrefix -eq '0.0.0.0/0' -or $_.DestinationPrefix -eq '::/0' } | ForEach-Object {
+    $key=[string]$_.InterfaceIndex
+    $metric=[uint64]$_.RouteMetric + [uint64]$_.InterfaceMetric
+    if(-not $routes.ContainsKey($key) -or $metric -lt $routes[$key]) { $routes[$key]=$metric }
+} } catch { }
 $statistics = @{}
 $statisticsError = $null
 try { Get-NetAdapterStatistics -IncludeHidden -ErrorAction Stop | ForEach-Object { $statistics[[string]$_.Name] = $_ } } catch { $statisticsError = $_.Exception.Message }
 $rows = @(Get-NetAdapter -IncludeHidden -ErrorAction Stop | ForEach-Object {
     $a = $_
     $config = $configs[[string]$a.ifIndex]
+    $adapterGuid=([string]$a.InterfaceGuid).Trim('{}').ToLowerInvariant()
+    $pnpId=[string]$a.PnPDeviceID
+    if([string]::IsNullOrWhiteSpace($pnpId)) { $pnpId=$pnp[$adapterGuid] }
     $stats = $statistics[[string]$a.Name]
     $statsError = $statisticsError
     if ($null -eq $stats -and $null -eq $statsError) { $statsError = 'Windows did not publish counters for this adapter.' }
@@ -37,11 +50,14 @@ $rows = @(Get-NetAdapter -IncludeHidden -ErrorAction Stop | ForEach-Object {
     $rate = $rx
     if ($rate -eq 0 -or ($tx -gt 0 -and $tx -lt $rate)) { $rate = $tx }
     [pscustomobject]@{
-        guid=([string]$a.InterfaceGuid).Trim('{}').ToLowerInvariant(); index=[uint32]$a.ifIndex;
+        guid=$adapterGuid; index=[uint32]$a.ifIndex;
         name=[string]$a.Name; description=[string]$a.InterfaceDescription; status=[string]$a.Status;
         physical=[bool]$a.HardwareInterface; hardware=[bool]$a.HardwareInterface; virtual_adapter=[bool]$a.Virtual;
-        interface_type=[uint32]$a.ifType; physical_medium=[uint32]$a.NdisPhysicalMedium;
-        mac=[string]$a.MacAddress; pnp_device_id=[string]$a.PnPDeviceID;
+        interface_type=[uint32]$a.InterfaceType; physical_medium=[uint32]$a.NdisPhysicalMedium;
+        mac=[string]$a.MacAddress; pnp_device_id=[string]$pnpId;
+        default_route=$routes.ContainsKey([string]$a.ifIndex); route_metric=$(if($routes.ContainsKey([string]$a.ifIndex)){$routes[[string]$a.ifIndex]}else{$null});
+        ipv4_enabled=$(if($bindings.ContainsKey(([string]$a.Name)+':ms_tcpip')){$bindings[([string]$a.Name)+':ms_tcpip']}else{$null});
+        ipv6_enabled=$(if($bindings.ContainsKey(([string]$a.Name)+':ms_tcpip6')){$bindings[([string]$a.Name)+':ms_tcpip6']}else{$null});
         link_bps=$rate; receive_link_bps=$rx; transmit_link_bps=$tx;
         driver_version=[string]$a.DriverVersionString; driver_date=[string]$a.DriverDate; driver_provider=[string]$a.DriverProvider;
         ipv4_gateways=@($config.IPv4DefaultGateway | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.NextHop });
@@ -66,6 +82,14 @@ pub struct AdapterInfo {
     pub name: String,
     pub description: String,
     pub status: String,
+    /// Native IF_OPER_STATUS; never infer connectivity from localized display text.
+    pub oper_status: Option<u32>,
+    pub media_state: Option<u32>,
+    pub native_error: Option<String>,
+    pub default_route: bool,
+    pub route_metric: Option<u64>,
+    pub ipv4_enabled: Option<bool>,
+    pub ipv6_enabled: Option<bool>,
     pub physical: bool,
     pub hardware: bool,
     pub virtual_adapter: bool,
@@ -100,10 +124,18 @@ pub struct AdapterInfo {
 }
 impl AdapterInfo {
     pub fn connected(&self) -> bool {
-        self.status.eq_ignore_ascii_case("Up")
+        self.oper_status == Some(1) && self.media_state != Some(2)
     }
     pub fn is_physical(&self) -> bool {
         self.physical && self.hardware && !self.virtual_adapter
+    }
+    pub fn recommended_order(&self) -> (bool, bool, u64, String) {
+        (
+            !self.connected(),
+            !self.default_route,
+            self.route_metric.unwrap_or(u64::MAX),
+            self.name.to_lowercase(),
+        )
     }
     fn wireless(&self) -> bool {
         self.interface_type == 71 || matches!(self.physical_medium, 1 | 9)
@@ -257,7 +289,7 @@ fn parse_adapters(text: &str) -> Result<Vec<AdapterInfo>, String> {
     {
         return Err("Windows returned an incomplete adapter identity. Refresh before reviewing adapter settings.".into());
     }
-    rows.sort_by_key(|a| (!a.connected(), !a.is_physical(), a.name.to_lowercase()));
+    rows.sort_by_key(|a| a.recommended_order());
     Ok(rows)
 }
 
@@ -271,9 +303,75 @@ pub fn query_adapters() -> Result<Vec<AdapterInfo>, String> {
     let remote = remote_session();
     for adapter in &mut rows {
         adapter.remote_session = remote;
+        read_native_link(adapter);
         wifi_details(adapter);
     }
+    rows.sort_by_key(|a| a.recommended_order());
     Ok(rows)
+}
+
+fn read_native_link(adapter: &mut AdapterInfo) {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{GetIfEntry2, MIB_IF_ROW2};
+    let mut row: MIB_IF_ROW2 = unsafe { std::mem::zeroed() };
+    row.InterfaceIndex = adapter.index;
+    let status = unsafe { GetIfEntry2(&mut row) };
+    if status != 0 {
+        adapter.oper_status = None;
+        adapter.media_state = None;
+        adapter.native_error = Some(format!("Windows could not read this adapter's current link state (code {status}). Refresh adapters before applying DNS."));
+        return;
+    }
+    let Some(expected) = guid(&adapter.guid) else {
+        return;
+    };
+    if row.InterfaceGuid.data1 != expected.data1
+        || row.InterfaceGuid.data2 != expected.data2
+        || row.InterfaceGuid.data3 != expected.data3
+        || row.InterfaceGuid.data4 != expected.data4
+    {
+        adapter.oper_status = None;
+        adapter.native_error =
+            Some("The interface index was reused by another adapter. Refresh adapters.".into());
+        return;
+    }
+    apply_native_link(adapter, &row);
+}
+
+fn apply_native_link(
+    adapter: &mut AdapterInfo,
+    row: &windows_sys::Win32::NetworkManagement::IpHelper::MIB_IF_ROW2,
+) {
+    let flags = row.InterfaceAndOperStatusFlags._bitfield;
+    adapter.oper_status = Some(row.OperStatus as u32);
+    adapter.media_state = Some(if flags & 0x10 != 0 {
+        2
+    } else {
+        row.MediaConnectState as u32
+    });
+    adapter.native_error = None;
+    adapter.hardware = flags & 1 != 0;
+    adapter.physical = adapter.hardware && flags & (2 | 0x80) == 0;
+    adapter.virtual_adapter = !adapter.physical;
+    adapter.interface_type = row.Type;
+    adapter.physical_medium = row.PhysicalMediumType as u32;
+    adapter.receive_link_bps = row.ReceiveLinkSpeed;
+    adapter.transmit_link_bps = row.TransmitLinkSpeed;
+    adapter.link_bps = match (row.ReceiveLinkSpeed, row.TransmitLinkSpeed) {
+        (0, tx) => tx,
+        (rx, 0) => rx,
+        (rx, tx) => rx.min(tx),
+    };
+    adapter.status = match (row.OperStatus, adapter.media_state.unwrap_or(0)) {
+        (1, 2) => "Media disconnected",
+        (1, _) => "Connected",
+        (2, _) => "Disconnected / disabled",
+        (3, _) => "Testing",
+        (5, _) => "Dormant",
+        (6, _) => "Not present",
+        (7, _) => "Lower-layer disconnected",
+        _ => "Link state unavailable",
+    }
+    .into();
 }
 
 #[derive(Clone, Deserialize)]
@@ -680,6 +778,7 @@ pub(crate) fn preview_fixture() -> NetworkState {
             .into(),
         description: "Example 2.5GbE PCI Express Network Adapter".into(),
         status: "Up".into(),
+        oper_status: Some(1),
         physical: true,
         hardware: true,
         interface_type: 6,
@@ -715,6 +814,7 @@ mod tests {
             index: 4,
             name: "Ethernet [example]".into(),
             status: "Up".into(),
+            oper_status: Some(1),
             physical: true,
             hardware: true,
             interface_type: 6,
@@ -722,6 +822,70 @@ mod tests {
             ipv4_gateways: vec!["192.0.2.1".into()],
             ..Default::default()
         }
+    }
+    #[test]
+    fn native_state_corrects_missing_provider_type_and_localized_status() {
+        use windows_sys::Win32::NetworkManagement::IpHelper::MIB_IF_ROW2;
+        let mut a = adapter();
+        a.interface_type = 0;
+        a.status = "Verbunden".into();
+        a.oper_status = None;
+        let mut row: MIB_IF_ROW2 = unsafe { std::mem::zeroed() };
+        row.InterfaceAndOperStatusFlags._bitfield = 1;
+        row.Type = 6;
+        row.OperStatus = 1;
+        row.MediaConnectState = 1;
+        row.ReceiveLinkSpeed = 2_500_000_000;
+        row.TransmitLinkSpeed = 2_500_000_000;
+        apply_native_link(&mut a, &row);
+        assert!(a.connected());
+        assert!(a.is_physical());
+        assert_eq!(a.interface_type, 6);
+        assert_eq!(a.link_bps, 2_500_000_000);
+        // Media disconnect wins over a stale operational-Up report.
+        row.MediaConnectState = 2;
+        apply_native_link(&mut a, &row);
+        assert!(!a.connected());
+        row.MediaConnectState = 1;
+        row.InterfaceAndOperStatusFlags._bitfield = 2;
+        apply_native_link(&mut a, &row);
+        assert!(!a.is_physical());
+        row.InterfaceAndOperStatusFlags._bitfield = 1 | 0x80;
+        apply_native_link(&mut a, &row);
+        assert!(
+            !a.is_physical(),
+            "endpoint devices are not external network adapters"
+        );
+        row.InterfaceAndOperStatusFlags._bitfield = 1 | 0x10;
+        apply_native_link(&mut a, &row);
+        assert!(!a.connected());
+        assert_eq!(a.status, "Media disconnected");
+    }
+    #[test]
+    fn native_connection_state_wins_over_friendly_text() {
+        let mut a = adapter();
+        a.status = "2".into();
+        assert!(a.connected());
+        a.oper_status = Some(2);
+        a.status = "Up".into();
+        assert!(!a.connected());
+        a.oper_status = None;
+        assert!(!a.connected());
+    }
+    #[test]
+    fn recommended_connection_prefers_active_default_route_then_metric() {
+        let mut spare = adapter();
+        spare.name = "Ethernet 2".into();
+        let mut active = adapter();
+        active.name = "Wi-Fi".into();
+        active.default_route = true;
+        active.route_metric = Some(20);
+        assert!(active.recommended_order() < spare.recommended_order());
+        spare.default_route = true;
+        spare.route_metric = Some(10);
+        assert!(spare.recommended_order() < active.recommended_order());
+        spare.oper_status = Some(2);
+        assert!(active.recommended_order() < spare.recommended_order());
     }
     #[test]
     fn parses_structured_adapters_with_physical_virtual_and_domain_guards() {
@@ -762,6 +926,7 @@ mod tests {
         .iter()
         .any(|f| f.title.contains("Packet error")));
         a.status = "Disconnected".into();
+        a.oper_status = Some(2);
         assert!(findings(&a, None).iter().all(|f| !f.warning));
     }
     #[test]
@@ -826,6 +991,10 @@ mod tests {
         for row in rows {
             assert!(guid(&row.guid).is_some());
             assert!(row.index > 0);
+            assert!(
+                row.oper_status.is_some() || row.native_error.is_some(),
+                "Native link read must return a status or an explicit error"
+            );
         }
     }
     #[test]

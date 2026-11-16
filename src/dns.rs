@@ -135,6 +135,31 @@ pub fn adguard() -> Config {
         },
     }
 }
+/// Do not fail an IPv4-only connection by trying to configure an unbound
+/// protocol. Preserve its previous dormant configuration for exact Undo.
+pub fn adguard_for(adapter: &AdapterInfo, before: &Config) -> Config {
+    let mut desired = adguard();
+    if adapter.ipv4_enabled == Some(false) {
+        desired.v4 = before.v4.clone();
+    }
+    if adapter.ipv6_enabled == Some(false) {
+        desired.v6 = before.v6.clone();
+    }
+    desired
+}
+fn validate_enabled_protocols(
+    adapter: &AdapterInfo,
+    before: &Config,
+    desired: &Config,
+) -> Result<(), String> {
+    if adapter.ipv4_enabled == Some(false) && desired.v4 != before.v4 {
+        return Err("IPv4 is disabled on this adapter. Remove the custom IPv4 addresses or choose an adapter with IPv4 enabled; its saved DNS was kept.".into());
+    }
+    if adapter.ipv6_enabled == Some(false) && desired.v6 != before.v6 {
+        return Err("IPv6 is disabled on this adapter. Remove the custom IPv6 addresses or choose an adapter with IPv6 enabled; its saved DNS was kept.".into());
+    }
+    Ok(())
+}
 pub fn custom(text: &str, before: &Config) -> Result<Config, String> {
     let mut c = Config::default();
     for s in text
@@ -162,6 +187,11 @@ pub fn custom(text: &str, before: &Config) -> Result<Config, String> {
     }
     validate_config(&c)?;
     Ok(c)
+}
+pub fn custom_for(text: &str, adapter: &AdapterInfo, before: &Config) -> Result<Config, String> {
+    let desired = custom(text, before)?;
+    validate_enabled_protocols(adapter, before, &desired)?;
+    Ok(desired)
 }
 
 fn secure_key() -> Result<RegKey, String> {
@@ -373,14 +403,32 @@ $blocked|ConvertTo-Json -Compress
 "#
     )
 }
-pub fn eligibility(adapter: &AdapterInfo, all: &[AdapterInfo]) -> Result<(), String> {
-    if !adapter.is_physical()
-        || !adapter.connected()
-        || !matches!(adapter.interface_type, 6 | 71)
-        || adapter.pnp_device_id.is_empty()
-    {
-        return Err("Select a connected physical Wi-Fi or Ethernet adapter.".into());
+/// Pure adapter checks are shared by the preview and the final apply path.
+/// Keep individual causes visible instead of rejecting every metadata failure as
+/// a disconnected adapter.
+fn adapter_eligibility(adapter: &AdapterInfo) -> Result<(), String> {
+    if let Some(error) = &adapter.native_error {
+        return Err(error.clone());
     }
+    if !adapter.is_physical() {
+        return Err("This is a virtual or filtered interface. Choose the physical Ethernet or Wi-Fi adapter carrying your connection.".into());
+    }
+    if !matches!(adapter.interface_type, 6 | 71) {
+        return Err(format!("This adapter reports interface type {}; DNS trials support Ethernet and Wi-Fi. Refresh if the device was just connected.",adapter.interface_type));
+    }
+    if !adapter.connected() {
+        return Err(format!("{} is {}. Connect its cable or Wi-Fi first, or choose the recommended connected adapter.",adapter.name,adapter.status.to_lowercase()));
+    }
+    if adapter.ipv4_enabled == Some(false) && adapter.ipv6_enabled == Some(false) {
+        return Err("Both IPv4 and IPv6 are disabled on this adapter. Choose the adapter carrying your internet connection.".into());
+    }
+    if adapter.pnp_device_id.is_empty() {
+        return Err("Windows did not report this device's hardware identity. Refresh adapters; DNS was kept unchanged.".into());
+    }
+    Ok(())
+}
+pub fn eligibility(adapter: &AdapterInfo, all: &[AdapterInfo]) -> Result<(), String> {
+    adapter_eligibility(adapter)?;
     if adapter.remote_session {
         return Err("DNS changes are unavailable in a remote desktop session.".into());
     }
@@ -556,9 +604,39 @@ fn fresh(original: &AdapterInfo) -> Result<AdapterInfo, String> {
         })
         .ok_or("The adapter identity changed. No other adapter will be changed.".into())
 }
-fn reset(adapter: &AdapterInfo) -> Result<(), String> {
-    let script=format!("$a=@(Get-NetAdapter -IncludeHidden | Where-Object {{ ([string]$_.InterfaceGuid).Trim('{{}}') -eq {} -and $_.PnPDeviceID -ceq {} }}); if($a.Count -ne 1){{throw 'Adapter identity changed'}}; Set-DnsClientServerAddress -InterfaceIndex $a[0].ifIndex -ResetServerAddresses -ErrorAction Stop",platform::ps_quote(&adapter.guid),platform::ps_quote(&adapter.pnp_device_id));
-    platform::powershell(&script, Duration::from_secs(30))?;
+fn reset_script(adapter: &AdapterInfo, v6: bool) -> String {
+    format!(
+        r#"
+$a=@(Get-NetAdapter -IncludeHidden -ErrorAction Stop | Where-Object {{ ([string]$_.InterfaceGuid).Trim('{{}}') -eq {guid} }})
+if($a.Count -ne 1){{throw 'Adapter identity changed'}}
+$pnp=[string]$a[0].PnPDeviceID
+if([string]::IsNullOrWhiteSpace($pnp)){{
+    $devices=@(Get-CimInstance Win32_NetworkAdapter -Property GUID,PNPDeviceID -ErrorAction Stop | Where-Object {{ ([string]$_.GUID).Trim('{{}}') -eq {guid} }})
+    if($devices.Count -eq 1){{$pnp=[string]$devices[0].PNPDeviceID}}
+}}
+if($pnp -ine {pnp}){{throw 'Adapter hardware identity changed'}}
+$dns=@(Get-DnsClientServerAddress -InterfaceIndex $a[0].ifIndex -AddressFamily {family} -ErrorAction Stop)
+if($dns.Count -ne 1){{throw 'The adapter DNS address family is unavailable'}}
+if([uint32]$dns[0].InterfaceIndex -ne [uint32]$a[0].ifIndex -or [uint32]$dns[0].AddressFamily -ne {family_number}){{throw 'The DNS family identity changed'}}
+Set-DnsClientServerAddress -InputObject $dns[0] -ResetServerAddresses -ErrorAction Stop
+"#,
+        family = if v6 { "IPv6" } else { "IPv4" },
+        family_number = if v6 { 23 } else { 2 },
+        guid = platform::ps_quote(&adapter.guid),
+        pnp = platform::ps_quote(&adapter.pnp_device_id)
+    )
+}
+fn reset(adapter: &AdapterInfo, v6: bool) -> Result<(), String> {
+    platform::powershell(&reset_script(adapter, v6), Duration::from_secs(30))?;
+    Ok(())
+}
+fn clear_resolver_cache() -> Result<(), String> {
+    // A successful server change must not keep relying on cached answers from
+    // the previous resolver. This clears only Windows' transient resolver cache.
+    platform::powershell(
+        "Clear-DnsClientCache -ErrorAction Stop",
+        Duration::from_secs(10),
+    )?;
     Ok(())
 }
 fn compatible_recovery(current: &Config, t: &Trial) -> bool {
@@ -583,7 +661,7 @@ fn compatible_recovery(current: &Config, t: &Trial) -> bool {
 }
 trait Recovery {
     fn capture(&mut self) -> Result<Config, String>;
-    fn reset(&mut self) -> Result<(), String>;
+    fn reset(&mut self, v6: bool) -> Result<(), String>;
     fn set(&mut self, family: &Family, v6: bool) -> Result<(), String>;
     fn save(&mut self, trial: &Trial) -> Result<(), String>;
 }
@@ -593,8 +671,8 @@ impl Recovery for WindowsRecovery {
         ensure_no_profile_dns(&self.0)?;
         capture(&self.0)
     }
-    fn reset(&mut self) -> Result<(), String> {
-        reset(&self.0)
+    fn reset(&mut self, v6: bool) -> Result<(), String> {
+        reset(&self.0, v6)
     }
     fn set(&mut self, family: &Family, v6: bool) -> Result<(), String> {
         set_family(&self.0, family, v6)
@@ -611,15 +689,33 @@ fn restore_transaction(backend: &mut impl Recovery, t: &mut Trial) -> Result<Str
         backend.save(t)?;
         return Err(t.result.clone());
     }
+    let initial = current;
+    let mut wrote = false;
     t.phase = "Restoring".into();
     backend.save(t)?;
-    if current != t.before {
-        backend.reset()?;
-        if !t.before.v4.automatic() {
-            backend.set(&t.before.v4, false)?;
-        }
-        if !t.before.v6.automatic() {
-            backend.set(&t.before.v6, true)?;
+    // Reset automatic sources first, then restore static sources. Re-read
+    // between operations instead of assuming a provider affected only one
+    // family. This also repairs an older interrupted all-family reset without
+    // leaving a previously static opposite family on DHCP.
+    for automatic in [true, false] {
+        for v6 in [false, true] {
+            let observed = backend.capture()?;
+            if (!wrote && observed != initial) || !compatible_recovery(&observed, t) {
+                t.phase = "Conflict".into();
+                t.result = "DNS changed while restoring. The newer configuration was preserved; the original record was kept.".into();
+                backend.save(t)?;
+                return Err(t.result.clone());
+            }
+            let before = if v6 { &t.before.v6 } else { &t.before.v4 };
+            let current = if v6 { &observed.v6 } else { &observed.v4 };
+            if before.automatic() == automatic && current != before {
+                if automatic {
+                    backend.reset(v6)?;
+                } else {
+                    backend.set(before, v6)?;
+                }
+                wrote = true;
+            }
         }
     }
     if backend.capture()? != t.before {
@@ -639,7 +735,14 @@ pub fn restore(token: &str) -> Result<String, String> {
     let result = fresh(&t.adapter)
         .and_then(|adapter| restore_transaction(&mut WindowsRecovery(adapter), &mut t));
     match result {
-        Ok(message) => Ok(message),
+        Ok(message) => match clear_resolver_cache() {
+            Ok(()) => Ok(message),
+            Err(_) => {
+                t.result = format!("{message} Windows could not clear its resolver cache; previously cached answers may remain until they expire.");
+                save_trial(&t)?;
+                Ok(t.result)
+            }
+        },
         Err(e) => {
             if t.phase != "Conflict" {
                 // A failed restore must not leave the UI permanently locked. Keep
@@ -692,10 +795,15 @@ pub fn begin(adapter: AdapterInfo, expected: Config, desired: Config) -> Result<
         .find(|a| a.guid == adapter.guid && a.pnp_device_id == adapter.pnp_device_id)
         .ok_or("The selected adapter changed. Refresh first.")?;
     eligibility(current, &all)?;
+    if current.ipv4_enabled != adapter.ipv4_enabled || current.ipv6_enabled != adapter.ipv6_enabled
+    {
+        return Err("The adapter's enabled network protocols changed after review. Refresh adapters and try again.".into());
+    }
     let before = capture(current)?;
     if before != expected {
         return Err("DNS changed after review. Refresh before starting a trial.".into());
     }
+    validate_enabled_protocols(current, &before, &desired)?;
     if before == desired {
         return Err("This adapter already has those DNS settings.".into());
     }
@@ -773,15 +881,19 @@ pub fn begin(adapter: AdapterInfo, expected: Config, desired: Config) -> Result<
         }
         t.phase = "Applying".into();
         save_trial(&t)?;
-        if !t.applied.v4.automatic() {
+        if t.applied.v4 != t.before.v4 && !t.applied.v4.automatic() {
             set_family(current, &t.applied.v4, false)?;
         }
-        if !t.applied.v6.automatic() {
+        if t.applied.v6 != t.before.v6 && !t.applied.v6.automatic() {
             set_family(current, &t.applied.v6, true)?;
         }
         if capture(current)? != t.applied {
             return Err("Windows did not confirm both DNS settings.".into());
         }
+        t.result = match clear_resolver_cache() {
+            Ok(()) => "DNS servers applied and Windows' resolver cache cleared. Already-open sites or apps may need to reconnect.".into(),
+            Err(_) => "DNS servers applied. Windows could not clear its resolver cache; previous answers may remain until they expire. Already-open sites or apps may need to reconnect.".into(),
+        };
         t.phase = "Applied".into();
         save_trial(&t)?;
         Ok(t.clone())
@@ -849,6 +961,7 @@ pub(crate) fn preview_trial() -> Trial {
             physical: true,
             hardware: true,
             status: "Up".into(),
+            oper_status: Some(1),
             interface_type: 71,
             pnp_device_id: "PCI\\Preview".into(),
             domain_member: Some(false),
@@ -873,6 +986,8 @@ mod tests {
         journal: Option<Trial>,
         fail_save: bool,
         fail_v6: bool,
+        reset_both: bool,
+        change_after_save: Option<Config>,
         writes: usize,
     }
     impl FakeRecovery {
@@ -882,6 +997,8 @@ mod tests {
                 journal: None,
                 fail_save: false,
                 fail_v6: false,
+                reset_both: false,
+                change_after_save: None,
                 writes: 0,
             }
         }
@@ -890,9 +1007,17 @@ mod tests {
         fn capture(&mut self) -> Result<Config, String> {
             Ok(self.current.clone())
         }
-        fn reset(&mut self) -> Result<(), String> {
+        fn reset(&mut self, v6: bool) -> Result<(), String> {
             self.writes += 1;
-            self.current = Config::default();
+            if self.reset_both {
+                self.current = Config::default();
+                return Ok(());
+            }
+            if v6 {
+                self.current.v6 = Family::default();
+            } else {
+                self.current.v4 = Family::default();
+            }
             Ok(())
         }
         fn set(&mut self, family: &Family, v6: bool) -> Result<(), String> {
@@ -912,6 +1037,9 @@ mod tests {
                 return Err("injected persistence failure".into());
             }
             self.journal = Some(trial.clone());
+            if let Some(outside) = self.change_after_save.take() {
+                self.current = outside;
+            }
             Ok(())
         }
     }
@@ -949,6 +1077,27 @@ mod tests {
         assert!(t.validate().is_err());
         assert!(custom("example.com", &Config::default()).is_err());
         assert!(custom("0.0.0.0", &Config::default()).is_err());
+    }
+    #[test]
+    fn adguard_retains_a_disabled_protocols_dormant_configuration() {
+        let before = record().before;
+        let mut a = preview_trial().adapter;
+        a.ipv6_enabled = Some(false);
+        let desired = adguard_for(&a, &before);
+        assert_eq!(desired.v4, adguard().v4);
+        assert_eq!(desired.v6, before.v6);
+        a.ipv6_enabled = Some(true);
+        assert_eq!(adguard_for(&a, &before), adguard());
+    }
+    #[test]
+    fn custom_dns_cannot_change_a_disabled_protocols_dormant_source() {
+        let before = record().before;
+        let mut adapter = preview_trial().adapter;
+        adapter.ipv6_enabled = Some(false);
+        assert!(custom_for("192.168.1.2", &adapter, &before).is_ok());
+        assert!(custom_for("192.168.1.2,2001:db8::53", &adapter, &before)
+            .unwrap_err()
+            .contains("IPv6 is disabled"));
     }
     #[test]
     fn omitted_custom_family_retains_original_source() {
@@ -1004,6 +1153,40 @@ mod tests {
         assert_eq!(backend.journal.unwrap().phase, "Restored");
     }
     #[test]
+    fn rollback_only_changes_the_address_family_that_needs_restoration() {
+        let mut t = record();
+        t.applied.v6 = t.before.v6.clone();
+        let mut backend = FakeRecovery::new(t.applied.clone());
+        restore_transaction(&mut backend, &mut t).unwrap();
+        assert_eq!(backend.current, t.before);
+        assert_eq!(backend.writes, 1);
+    }
+    #[test]
+    fn rollback_repairs_an_opposite_family_reset_in_the_same_operation() {
+        let mut t = record();
+        t.before = Config {
+            v4: Family {
+                servers: vec!["192.168.1.2".into()],
+            },
+            v6: Family::default(),
+        };
+        let mut backend = FakeRecovery::new(t.applied.clone());
+        backend.reset_both = true;
+        restore_transaction(&mut backend, &mut t).unwrap();
+        assert_eq!(backend.current, t.before);
+        assert_eq!(t.phase, "Restored");
+    }
+    #[test]
+    fn outside_automatic_change_before_the_first_restore_write_is_preserved() {
+        let mut t = record();
+        let mut backend = FakeRecovery::new(t.applied.clone());
+        backend.change_after_save = Some(Config::default());
+        assert!(restore_transaction(&mut backend, &mut t).is_err());
+        assert_eq!(backend.current, Config::default());
+        assert_eq!(backend.writes, 0);
+        assert_eq!(t.phase, "Conflict");
+    }
+    #[test]
     fn failed_rollback_keeps_backup_and_can_retry_partial_restore() {
         let mut t = record();
         let original = t.before.clone();
@@ -1033,9 +1216,56 @@ mod tests {
         assert_eq!(t.phase, "Conflict");
     }
     #[test]
+    fn adapter_rejection_reports_the_actual_problem() {
+        let mut a = preview_trial().adapter;
+        assert!(adapter_eligibility(&a).is_ok());
+        a.interface_type = 0;
+        assert!(adapter_eligibility(&a)
+            .unwrap_err()
+            .contains("interface type 0"));
+        a.interface_type = 6;
+        a.oper_status = Some(2);
+        a.status = "Disconnected".into();
+        assert!(adapter_eligibility(&a)
+            .unwrap_err()
+            .contains("cable or Wi-Fi"));
+        a.oper_status = Some(1);
+        a.pnp_device_id.clear();
+        assert!(adapter_eligibility(&a)
+            .unwrap_err()
+            .contains("hardware identity"));
+        a.native_error = Some("native error retained".into());
+        assert_eq!(
+            adapter_eligibility(&a).unwrap_err(),
+            "native error retained"
+        );
+    }
+    #[test]
+    fn legacy_recovery_records_do_not_require_new_inventory_fields() {
+        let t = record();
+        let mut value = serde_json::to_value(&t).unwrap();
+        let adapter = value.get_mut("adapter").unwrap().as_object_mut().unwrap();
+        for key in [
+            "oper_status",
+            "media_state",
+            "native_error",
+            "default_route",
+            "route_metric",
+            "ipv4_enabled",
+            "ipv6_enabled",
+        ] {
+            adapter.remove(key);
+        }
+        let loaded: Trial = serde_json::from_value(value).unwrap();
+        assert!(loaded.validate().is_ok());
+        assert_eq!(loaded.before, t.before);
+        assert_eq!(loaded.adapter.pnp_device_id, t.adapter.pnp_device_id);
+    }
+    #[test]
     fn managed_virtual_remote_and_unknown_domain_are_guarded() {
         let mut a = record().adapter;
         a.status = "Up".into();
+        a.oper_status = Some(1);
         a.physical = true;
         a.hardware = true;
         a.interface_type = 6;
@@ -1051,7 +1281,16 @@ mod tests {
         let _ = load_setter();
         let adapters = network::query_adapters().unwrap();
         let script = vpn_guard_script(&adapters);
+        let reset = reset_script(&record().adapter, false);
         let parser = format!("$tokens=$null;$errors=$null;[void][System.Management.Automation.Language.Parser]::ParseInput({},[ref]$tokens,[ref]$errors);if($errors.Count){{throw (($errors|ForEach-Object {{$_.Message}})-join '; ')}};'syntax-ok'", platform::ps_quote(&script));
+        assert_eq!(
+            platform::powershell(&parser, Duration::from_secs(20))
+                .unwrap()
+                .trim(),
+            "syntax-ok"
+        );
+        // Parse the mutation script but never execute it on the runner's network.
+        let parser = format!("$tokens=$null;$errors=$null;[void][System.Management.Automation.Language.Parser]::ParseInput({},[ref]$tokens,[ref]$errors);if($errors.Count){{throw (($errors|ForEach-Object {{$_.Message}})-join '; ')}};'syntax-ok'", platform::ps_quote(&reset));
         assert_eq!(
             platform::powershell(&parser, Duration::from_secs(20))
                 .unwrap()
@@ -1065,5 +1304,36 @@ mod tests {
             let _ = ensure_no_profile_dns(a);
             let _ = capture(a);
         }
+    }
+    #[test]
+    fn native_dns_family_instances_have_distinct_cim_identities() {
+        // A family-specific InputObject must identify a distinct provider
+        // instance. This checks the real cmdlet/provider contract read-only;
+        // it deliberately does not reset the runner's DNS.
+        let script = r#"
+$command=Get-Command Set-DnsClientServerAddress -ErrorAction Stop
+if(-not $command.Parameters.ContainsKey('InputObject')){throw 'Windows has no DNS instance setter'}
+$rows=@(Get-DnsClientServerAddress -ErrorAction Stop)
+foreach($group in ($rows|Group-Object InterfaceIndex)){
+    $v4=@($group.Group|Where-Object {[uint32]$_.AddressFamily -eq 2})
+    $v6=@($group.Group|Where-Object {[uint32]$_.AddressFamily -eq 23})
+    if($v4.Count -eq 1 -and $v6.Count -eq 1){
+        $identity=@()
+        foreach($instance in @($v4[0],$v6[0])){
+            $keys=@($instance.CimInstanceProperties|Where-Object {($_.Flags -band [Microsoft.Management.Infrastructure.CimFlags]::Key) -ne 0}|Sort-Object Name|ForEach-Object {([string]$_.Name)+'='+([string]$_.Value)})
+            if($keys.Count -eq 0){throw 'Windows returned a DNS instance without its identity'}
+            $identity+=($keys -join ';')
+        }
+        if($identity[0] -eq $identity[1]){throw 'Windows did not distinguish IPv4 and IPv6 DNS instances'}
+    }
+}
+'family-contract-ok'
+"#;
+        assert_eq!(
+            platform::powershell(script, Duration::from_secs(25))
+                .unwrap()
+                .trim(),
+            "family-contract-ok"
+        );
     }
 }

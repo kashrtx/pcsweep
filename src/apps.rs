@@ -1,11 +1,13 @@
 use crate::app::{Action, App, Modal, ToastKind};
+use crate::app_icons::{IconCache, IconSource};
 use crate::app_packages::{self, AppUpgrade, PackageAction, PackageResult, StorePackage};
 use crate::task::Task;
 use crate::theme::*;
 use crate::util::{self, fmt_bytes, fmt_num};
-use crate::widgets::{self, ic};
+use crate::widgets;
 use chrono::NaiveDate;
 use eframe::egui::{self, Align, Label, Layout, RichText, ScrollArea, Ui};
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::os::windows::process::CommandExt;
 use std::process::Command;
@@ -31,6 +33,7 @@ pub struct InstalledApp {
     pub kind: AppKind,
     pub running: Option<bool>,
     pub startup: Option<bool>,
+    pub icon: IconSource,
 }
 
 pub fn list() -> Vec<InstalledApp> {
@@ -101,6 +104,19 @@ pub fn list() -> Vec<InstalledApp> {
             )) {
                 continue;
             }
+            let location: String = k
+                .get_value::<String, _>("InstallLocation")
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let icon = IconSource::desktop(
+                k.get_value::<String, _>("DisplayIcon").unwrap_or_default(),
+                uninstall_command(&uninstall)
+                    .map(|(exe, _)| exe)
+                    .unwrap_or_default(),
+                location.clone(),
+                &version,
+            );
             out.push(InstalledApp {
                 name,
                 version: version.trim().to_string(),
@@ -109,14 +125,11 @@ pub fn list() -> Vec<InstalledApp> {
                 installed,
                 uninstall,
                 scope,
-                location: k
-                    .get_value::<String, _>("InstallLocation")
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string(),
+                location,
                 kind: AppKind::Desktop,
                 running: None,
                 startup: None,
+                icon,
             });
         }
     }
@@ -260,6 +273,11 @@ fn inventory() -> AppInventory {
                 uninstall: String::new(),
                 scope: "Your account",
                 location: p.location.clone(),
+                icon: IconSource::Store {
+                    family: p.family.clone(),
+                    location: p.location.clone(),
+                    identity: p.full_name.clone(),
+                },
                 kind: AppKind::Store(p),
                 running: None,
                 startup: None,
@@ -314,6 +332,7 @@ pub struct AppsState {
     pub results: Vec<PackageResult>,
     action_text: String,
     refresh_updates: bool,
+    icons: RefCell<IconCache>,
 }
 
 impl Default for AppsState {
@@ -336,6 +355,7 @@ impl Default for AppsState {
             results: Vec::new(),
             action_text: String::new(),
             refresh_updates: false,
+            icons: RefCell::new(IconCache::default()),
         }
     }
 }
@@ -370,6 +390,7 @@ impl App {
     }
 
     pub fn poll_apps(&mut self, ctx: &egui::Context) {
+        self.apps.icons.borrow_mut().poll(ctx);
         if let Some(r) = self.apps.load.poll() {
             match r {
                 Ok(out) => {
@@ -504,12 +525,16 @@ impl App {
         let ctx = ui.ctx().clone();
         let mut acts = Vec::new();
         self.render_apps(ui, &mut acts);
+        self.apps.icons.borrow_mut().start_pending(&ctx);
         for a in acts {
             match a {
                 PAct::Sort(s) => self.apps.sort = s,
                 PAct::Filter(f) => self.apps.filter = f,
                 PAct::View(v) => self.apps.view = v,
-                PAct::Reload => self.start_apps_load(&ctx),
+                PAct::Reload => {
+                    self.apps.icons.borrow_mut().refresh();
+                    self.start_apps_load(&ctx);
+                }
                 PAct::Settings => util::open_uri("ms-settings:appsfeatures"),
                 PAct::ToggleStore(id, on) => {
                     if on {
@@ -743,7 +768,7 @@ impl App {
                     if response.changed(){acts.push(PAct::ToggleStore(p.full_name.clone(),on));}
                     if let Some(reason)=reason{response.on_disabled_hover_text(reason);}
                 }else{ui.add_space(24.0);}
-                ui.label(widgets::icon(ic::APPS,18.0,ACCENT));
+                s.icons.borrow_mut().show(ui, &a.icon);
                 ui.with_layout(Layout::right_to_left(Align::Center),|ui|{
                     let reason=match &a.kind {AppKind::Store(p)=>p.protection_reason(),AppKind::Desktop if a.uninstall.is_empty()=>Some("No registered uninstaller. Use Windows installed apps.".into()),_=>None};
                     let response=ui.add_enabled(reason.is_none()&&!s.busy(),widgets::small(if reason.is_some(){"Protected"}else{"Uninstall"}));
@@ -858,6 +883,7 @@ impl App {
 #[cfg(test)]
 pub(crate) fn preview_fixture() -> AppsState {
     let mut s = AppsState::default();
+    s.icons = RefCell::new(IconCache::preview_fixture());
     s.loaded = true;
     s.list = vec![
         InstalledApp {
@@ -872,6 +898,7 @@ pub(crate) fn preview_fixture() -> AppsState {
             kind: AppKind::Desktop,
             running: Some(true),
             startup: Some(false),
+            icon: IconSource::Generic,
         },
         InstalledApp {
             name: "Mozilla Firefox".into(),
@@ -885,6 +912,7 @@ pub(crate) fn preview_fixture() -> AppsState {
             kind: AppKind::Desktop,
             running: Some(false),
             startup: Some(false),
+            icon: IconSource::Generic,
         },
     ];
     for p in [
@@ -929,6 +957,7 @@ pub(crate) fn preview_fixture() -> AppsState {
             uninstall: String::new(),
             scope: "Your account",
             location: p.location.clone(),
+            icon: IconSource::Generic,
             kind: AppKind::Store(p),
             running: None,
             startup: None,

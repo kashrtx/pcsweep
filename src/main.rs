@@ -4,6 +4,7 @@
 mod ads;
 mod analyzer;
 mod app;
+mod app_icons;
 mod app_packages;
 mod apps;
 mod background;
@@ -16,8 +17,10 @@ mod journal;
 mod network;
 mod platform;
 mod power;
+mod preferences;
 mod privacy;
 mod processes;
+mod scan_cache;
 mod security;
 mod speed;
 mod startup;
@@ -26,8 +29,10 @@ mod system;
 mod task;
 mod theme;
 mod tools;
+mod tray;
 #[cfg(test)]
 mod ui_preview;
+mod update_control;
 mod updates;
 mod util;
 mod widgets;
@@ -51,7 +56,7 @@ fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("PCSweep")
-            .with_inner_size([1320.0, 860.0])
+            .with_inner_size(app::saved_window_size())
             .with_min_inner_size([900.0, 520.0])
             .with_clamp_size_to_monitor_size(true)
             .with_icon(app_icon()),
