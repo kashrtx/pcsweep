@@ -418,8 +418,17 @@ pub enum BackgroundAction {
     },
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum BackgroundView {
+    #[default]
+    Processes,
+    Tasks,
+    Browsers,
+}
+
 #[derive(Default)]
 pub struct BackgroundState {
+    view: BackgroundView,
     load: Task<Result<(Inventory, HashMap<String, UndoRecord>, Vec<String>), String>>,
     change: Task<Result<String, String>>,
     tasks: Vec<ScheduledTask>,
@@ -433,6 +442,15 @@ pub struct BackgroundState {
     skipped: usize,
 }
 impl BackgroundState {
+    pub(crate) fn showing_processes(&self) -> bool {
+        self.view == BackgroundView::Processes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn show_task_preview(&mut self) {
+        self.view = BackgroundView::Tasks;
+    }
+
     pub fn busy(&self) -> bool {
         self.change.running()
     }
@@ -531,14 +549,44 @@ impl App {
 
     pub fn page_background(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
-        if !self.background.loaded
+        widgets::page_header(
+            ui,
+            "Background activity",
+            "See what is running now and review what starts later.",
+        );
+        ui.horizontal_wrapped(|ui| {
+            for (view, label) in [
+                (BackgroundView::Processes, "Running processes"),
+                (BackgroundView::Tasks, "Scheduled tasks"),
+                (BackgroundView::Browsers, "Browsers"),
+            ] {
+                if ui
+                    .add(widgets::chip(label, self.background.view == view))
+                    .clicked()
+                {
+                    self.background.view = view;
+                }
+            }
+        });
+        ui.add_space(8.0);
+        if self.background.showing_processes() {
+            self.background_processes(ui);
+            return;
+        }
+        let scheduled = self.background.view == BackgroundView::Tasks;
+        if scheduled
+            && !self.background.loaded
             && self.background.error.is_none()
             && !self.background.load.running()
         {
             self.refresh_background(&ctx);
         }
         let mut actions = Vec::new();
-        self.render_background(ui, &mut actions);
+        if scheduled {
+            self.render_tasks(ui, &mut actions);
+        } else {
+            Self::render_browsers(ui, &mut actions);
+        }
         for action in actions {
             match action {
                 UiAction::Refresh => self.refresh_background(&ctx),
@@ -586,8 +634,7 @@ impl App {
         }
     }
 
-    fn render_background(&mut self, ui: &mut Ui, actions: &mut Vec<UiAction>) {
-        widgets::page_header(ui, "Background activity", "Review scheduled work and browser settings. Change only tasks whose purpose you understand.");
+    fn render_browsers(ui: &mut Ui, actions: &mut Vec<UiAction>) {
         widgets::card(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(widgets::strong("Browser background activity", 16.0));
@@ -612,7 +659,9 @@ impl App {
                 }
             });
         });
-        ui.add_space(6.0);
+    }
+
+    fn render_tasks(&mut self, ui: &mut Ui, actions: &mut Vec<UiAction>) {
         let busy = self.background.busy() || self.background.load.running();
         ui.horizontal_wrapped(|ui| {
             if ui

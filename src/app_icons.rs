@@ -30,6 +30,7 @@ const BATCH_SIZE: usize = 8;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum IconSource {
+    Executable(PathBuf),
     Desktop {
         display: String,
         executable: String,
@@ -538,6 +539,7 @@ fn location_executable(location: &str) -> Option<PathBuf> {
 fn load_icon(source: &IconSource) -> Option<Pixels> {
     match source {
         IconSource::Generic => generic_icon(),
+        IconSource::Executable(path) => extract_reference(path, 0),
         IconSource::Desktop {
             display,
             executable,
@@ -603,6 +605,9 @@ impl IconCache {
         self.queued.push_back(source.clone());
     }
     pub fn show(&mut self, ui: &mut Ui, source: &IconSource) {
+        self.show_sized(ui, source, 28.0);
+    }
+    pub fn show_sized(&mut self, ui: &mut Ui, source: &IconSource, points: f32) {
         #[cfg(test)]
         if self.inert && !self.entries.contains_key(&IconSource::Generic) {
             let mut image = egui::ColorImage::new([16, 16], egui::Color32::TRANSPARENT);
@@ -642,7 +647,7 @@ impl IconCache {
                     .get(&IconSource::Generic)
                     .and_then(|v| v.texture.clone())
             });
-        let size = egui::vec2(28.0, 28.0);
+        let size = egui::Vec2::splat(points);
         if let Some(texture) = texture {
             ui.add(egui::Image::new(&texture).fit_to_exact_size(size));
         } else {
@@ -652,7 +657,7 @@ impl IconCache {
                 |ui| {
                     ui.label(widgets::icon(
                         widgets::ic::APPS,
-                        22.0,
+                        points * 0.75,
                         crate::theme::TEXT_DIM,
                     ));
                 },

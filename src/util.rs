@@ -766,6 +766,13 @@ fn system_file(name: &str) -> Result<PathBuf, String> {
     Ok(crate::platform::system_directory()?.join(name))
 }
 
+pub fn open_system_tool(program: &str) -> Result<(), String> {
+    Command::new(system_file(program)?)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Could not open this Windows tool: {e}"))
+}
+
 pub fn open_system_document(program: &str, document: &str) -> Result<(), String> {
     Command::new(system_file(program)?)
         .arg(system_file(document)?)

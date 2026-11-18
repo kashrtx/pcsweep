@@ -1,253 +1,406 @@
-use crate::app::{Action, App, Modal, Page, ToastKind};
-use crate::system::{self, MemoryPressure, PowerPolicy, ProcGroup};
+use crate::app::{Action, App, Modal, ToastKind};
+use crate::app_icons::{IconCache, IconSource};
+use crate::running::{self, Access, Identity, Process, Row, RowId, Snapshot, Window};
+use crate::system::{self, MemoryPressure, PowerPolicy};
 use crate::task::Task;
 use crate::theme::*;
 use crate::util::{self, fmt_bytes, fmt_num};
 use crate::widgets::{self, ic};
-use eframe::egui::{self, Align, Layout, RichText, ScrollArea, Ui};
+use eframe::egui::{self, Align, Label, Layout, RichText, ScrollArea, Ui};
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+const CACHE_HINT: &str = "Windows reuses eligible standby cache as apps need RAM.";
+
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
-enum MemSort {
+enum Sort {
     #[default]
-    Resident,
+    Ram,
+    Cpu,
     Private,
     Growth,
-    Cpu,
+    Name,
+    Pid,
 }
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum MemoryKind {
+impl Sort {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ram => "RAM",
+            Self::Cpu => "CPU",
+            Self::Private => "Private commit",
+            Self::Growth => "Growth",
+            Self::Name => "Name",
+            Self::Pid => "PID",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum Scope {
+    #[default]
+    All,
+    Windows,
+    Background,
+    Pid,
+}
+impl Scope {
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All apps",
+            Self::Windows => "Open windows",
+            Self::Background => "Background",
+            Self::Pid => "By PID",
+        }
+    }
+    fn individual(self) -> bool {
+        matches!(self, Self::Pid | Self::Background)
+    }
+    fn includes(self, row: &Row) -> bool {
+        match self {
+            Self::All | Self::Pid => true,
+            Self::Windows => row.window_count != 0,
+            Self::Background => row.window_count == 0,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ProcessView {
+    filter: String,
+    scope: Scope,
+    sort: Sort,
+    rows: Option<VisibleRows>,
+}
+
+struct VisibleRows {
+    sample: Option<Instant>,
+    scope: Scope,
+    sort: Sort,
+    filter: String,
+    indices: Vec<usize>,
+}
+
+impl ProcessView {
+    fn rows<'a>(&'a mut self, snapshot: &Snapshot, table: &[Row], scope: Scope) -> &'a [usize] {
+        if !self.rows.as_ref().is_some_and(|v| {
+            v.sample == snapshot.sampled_at
+                && v.scope == scope
+                && v.sort == self.sort
+                && v.filter == self.filter
+        }) {
+            let query = self.filter.trim().to_lowercase();
+            let pid_query = query.parse::<u32>().ok();
+            let mut indices: Vec<_> = table
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| scope.includes(row))
+                .filter(|(_, row)| {
+                    if let Some(pid) = pid_query {
+                        row.members
+                            .iter()
+                            .any(|&i| snapshot.processes[i].identity.pid == pid)
+                    } else {
+                        query.is_empty() || row.search.contains(&query)
+                    }
+                })
+                .map(|(i, _)| i)
+                .collect();
+            let pid = |row: &Row| snapshot.processes[row.members[0]].identity.pid;
+            // The worker already orders both tables by resident memory.
+            if self.sort != Sort::Ram {
+                indices.sort_by(|&a, &b| {
+                    let a = &table[a];
+                    let b = &table[b];
+                    let order = match self.sort {
+                        Sort::Ram => std::cmp::Ordering::Equal,
+                        Sort::Cpu => (b.cpu_known > 0)
+                            .cmp(&(a.cpu_known > 0))
+                            .then_with(|| b.cpu.total_cmp(&a.cpu)),
+                        Sort::Private => b.private.cmp(&a.private),
+                        Sort::Growth => b.growth.cmp(&a.growth),
+                        Sort::Name => a
+                            .name
+                            .to_ascii_lowercase()
+                            .cmp(&b.name.to_ascii_lowercase()),
+                        Sort::Pid => pid(a).cmp(&pid(b)),
+                    };
+                    order.then_with(|| a.id.cmp(&b.id))
+                });
+            }
+            self.rows = Some(VisibleRows {
+                sample: snapshot.sampled_at,
+                scope,
+                sort: self.sort,
+                filter: self.filter.clone(),
+                indices,
+            });
+        }
+        &self
+            .rows
+            .as_ref()
+            .expect("visible rows were prepared")
+            .indices
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Operation {
     Close,
-    Trim,
+    End,
     Efficiency,
     RestoreEfficiency,
+    Trim,
 }
-#[derive(Clone)]
-struct MemoryTarget {
-    pid: u32,
-    start: u64,
-    restore: Option<PowerPolicy>,
-    app: String,
+impl Operation {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Close => "Close normally",
+            Self::End => "End task",
+            Self::Efficiency => "Efficiency mode",
+            Self::RestoreEfficiency => "Restore efficiency settings",
+            Self::Trim => "Trim resident RAM",
+        }
+    }
+    fn closes(self) -> bool {
+        matches!(self, Self::Close | Self::End)
+    }
 }
-/// A confirmed process snapshot; PID reuse cannot redirect it to a new app.
+
+struct Target {
+    id: Identity,
+    name: String,
+    windows: Vec<Window>,
+    original: Option<PowerPolicy>,
+}
+
 pub struct MemoryAction {
-    kind: MemoryKind,
-    targets: Vec<MemoryTarget>,
-    name: String,
+    operation: Operation,
+    targets: Vec<Target>,
 }
-pub struct MemoryReport {
-    kind: MemoryKind,
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    Changed,
+    Gone,
+    Waiting,
+    Failed,
+}
+
+struct ResultRow {
+    id: Identity,
     name: String,
-    attempted: usize,
-    changed: Vec<((u32, u64), Option<PowerPolicy>)>,
+    outcome: Outcome,
+    detail: String,
+}
+
+pub struct MemoryReport {
+    operation: Operation,
+    rows: Vec<ResultRow>,
     before: u64,
     after: u64,
-    failed: Vec<String>,
-    /// Close only: apps whose every reviewed process has actually exited.
-    closed_apps: Vec<String>,
-    /// Close only: apps that were asked to close but are still running.
-    open_apps: Vec<String>,
+    policies: Vec<(Identity, Option<PowerPolicy>)>,
 }
-#[derive(Default)]
+impl MemoryReport {
+    fn summary(&self) -> String {
+        let count = |state| self.rows.iter().filter(|row| row.outcome == state).count();
+        let mut parts = Vec::new();
+        let changed = count(Outcome::Changed);
+        if changed > 0 {
+            let result = match self.operation {
+                Operation::End | Operation::Close => "exited",
+                Operation::Efficiency => "set to efficiency mode",
+                Operation::RestoreEfficiency => "restored",
+                Operation::Trim => "trimmed",
+            };
+            parts.push(format!("{changed} {result}"));
+        }
+        for (outcome, label) in [
+            (Outcome::Gone, "already exited"),
+            (Outcome::Waiting, "still running"),
+            (Outcome::Failed, "could not change"),
+        ] {
+            let n = count(outcome);
+            if n > 0 {
+                parts.push(format!("{n} {label}"));
+            }
+        }
+        let mut summary = format!("{}: {}.", self.operation.label(), parts.join(", "));
+        if self.operation == Operation::Trim && changed > 0 {
+            let freed = self.before.saturating_sub(self.after);
+            summary.push_str(&format!(
+                " Resident RAM fell by {} at measurement.",
+                fmt_bytes(freed)
+            ));
+        }
+        summary
+    }
+}
+
 pub struct MemState {
-    pub filter: String,
-    sort: MemSort,
-    selected: Option<String>,
-    advanced: bool,
-    efficiency: HashMap<(u32, u64), PowerPolicy>,
+    view: ProcessView,
+    background_view: ProcessView,
+    selected: Option<RowId>,
+    inspect_open: bool,
+    efficiency: HashMap<Identity, PowerPolicy>,
     pressure_since: Option<(MemoryPressure, Instant)>,
-    last_identity_refresh: Option<Instant>,
+    last_sample: Option<Instant>,
     pub job: Task<MemoryReport>,
-    /// Lower-case names of app groups ticked for a bulk close.
-    checked: HashSet<String>,
+    checked: HashSet<Identity>,
     details: bool,
     stop_waiting: Arc<AtomicBool>,
-    /// True while a close request is waiting to see which apps exit.
-    closing: bool,
+    running: Option<Operation>,
+    report: Option<MemoryReport>,
+    results_open: bool,
+    icons: IconCache,
 }
+
+impl Default for MemState {
+    fn default() -> Self {
+        Self {
+            view: ProcessView::default(),
+            background_view: ProcessView {
+                scope: Scope::Background,
+                ..ProcessView::default()
+            },
+            selected: None,
+            inspect_open: false,
+            efficiency: HashMap::new(),
+            pressure_since: None,
+            last_sample: None,
+            job: Task::default(),
+            checked: HashSet::new(),
+            details: false,
+            stop_waiting: Arc::default(),
+            running: None,
+            report: None,
+            results_open: false,
+            icons: IconCache::default(),
+        }
+    }
+}
+
 impl MemState {
     pub fn busy(&self) -> bool {
         self.job.running()
     }
 }
+
 enum MAct {
-    Filter(String),
-    Sort(MemSort),
-    Select(String),
-    Advanced(bool),
-    Ask(MemoryKind, ProcGroup),
-    AskKill(ProcGroup),
-    Go(Page),
+    Inspect(RowId),
+    Ask(Operation, Selection),
+    Check(Vec<Identity>, bool),
+    Clear,
+    StopWaiting,
+    Refresh,
     PageFile,
     Details(bool),
-    Check(String, bool),
-    CheckMany(Vec<String>, bool),
-    ClearChecked,
-    AskCloseChecked,
-    StopWaiting,
+    Show(Identity, Window),
+    Location(PathBuf),
 }
 
-const CLOSE_NOTE: &str = "Apps can show a save prompt or refuse. Nothing is force-closed, and apps started after this review are not included.";
-const CACHE_HINT: &str = "Cache overlaps available memory, so don't add the two. Windows reuses standby cache when apps need RAM.";
-const PRIVATE_HINT: &str = "Private commit. Unavailable when Windows won't report it for this app, for example elevated apps while PCSweep isn't running as administrator.";
-const PROTECTED_HINT: &str = "Windows, security and PCSweep processes are protected.";
-
-/// Windows, security and PCSweep's own processes can't be selected for closing.
-fn eligible(group: &ProcGroup) -> bool {
-    !system::is_critical(&group.name) && !group.pids.contains(&std::process::id())
+enum Selection {
+    Checked,
+    Row(RowId),
+    Pid(Identity),
 }
 
-fn private_text(group: &ProcGroup) -> String {
-    if group.private_known == 0 {
-        "unavailable".into()
-    } else if group.private_known < group.count {
-        format!("~{}", fmt_bytes(group.private_bytes))
-    } else {
-        fmt_bytes(group.private_bytes)
-    }
-}
-
-fn plural(count: usize, one: &str, many: &str) -> String {
-    format!("{count} {}", if count == 1 { one } else { many })
-}
-
-fn list_names(names: &[String]) -> String {
-    match names.len() {
-        0..=3 => names.join(", "),
-        n => format!("{}, {} and {} more", names[0], names[1], n - 2),
-    }
-}
-
-struct AppClose {
-    name: String,
-    targets: Vec<MemoryTarget>,
-    requested: bool,
-    error: Option<String>,
-}
-
-/// Asks each reviewed app to close normally, then waits off the UI thread to see
-/// which ones really exited. A posted close request is not reported as success,
-/// nothing is force-terminated, and save prompts are left for the user.
-trait CloseBackend {
-    fn request(&mut self, target: &MemoryTarget) -> Result<usize, String>;
-    fn exited(&mut self, target: &MemoryTarget) -> bool;
-}
-struct WindowsClose;
-impl CloseBackend for WindowsClose {
-    fn request(&mut self, target: &MemoryTarget) -> Result<usize, String> {
-        system::request_app_close(target.pid, target.start)
-    }
-    fn exited(&mut self, target: &MemoryTarget) -> bool {
-        system::process_exited(target.pid, target.start)
-    }
-}
-fn close_apps(action: MemoryAction, stop: &AtomicBool) -> MemoryReport {
-    close_apps_with(action, stop, &mut WindowsClose, Duration::from_secs(15))
-}
-fn close_apps_with(
-    action: MemoryAction,
-    stop: &AtomicBool,
-    backend: &mut impl CloseBackend,
-    wait: Duration,
-) -> MemoryReport {
+fn run_operation(action: MemoryAction, stop: &AtomicBool) -> MemoryReport {
+    let operation = action.operation;
     let mut report = MemoryReport {
-        kind: action.kind,
-        name: action.name,
-        attempted: action.targets.len(),
-        changed: Vec::new(),
+        operation,
+        rows: Vec::with_capacity(action.targets.len()),
         before: 0,
         after: 0,
-        failed: Vec::new(),
-        closed_apps: Vec::new(),
-        open_apps: Vec::new(),
+        policies: Vec::new(),
     };
-    let mut apps: Vec<AppClose> = Vec::new();
+    let mut pending = Vec::new();
     for target in action.targets {
-        let result = if stop.load(Ordering::Relaxed) {
-            Err("Close request canceled before this process was asked to close.".into())
-        } else {
-            backend.request(&target)
+        let mut row = ResultRow {
+            id: target.id,
+            name: target.name,
+            outcome: Outcome::Changed,
+            detail: String::new(),
         };
-        let index = apps
-            .iter()
-            .position(|a| a.name == target.app)
-            .unwrap_or_else(|| {
-                apps.push(AppClose {
-                    name: target.app.clone(),
-                    targets: Vec::new(),
-                    requested: false,
-                    error: None,
-                });
-                apps.len() - 1
-            });
-        let app = &mut apps[index];
-        match result {
-            Ok(_) => app.requested = true,
-            Err(error) => {
-                if app.error.is_none() {
-                    app.error = Some(error);
+        if operation.closes() {
+            let request = if stop.load(Ordering::Relaxed) {
+                Err("Request stopped before this process was reached.".into())
+            } else if operation == Operation::Close {
+                running::request_close(target.id, &target.windows)
+            } else {
+                running::request_end(target.id)
+            };
+            match request {
+                Ok(Some(handle)) => {
+                    pending.push((report.rows.len(), handle));
+                    row.outcome = Outcome::Waiting;
+                    row.detail = if operation == Operation::Close {
+                        "Still running. Check the app for a save prompt or use End task.".into()
+                    } else {
+                        "Windows accepted the request and is still ending this process.".into()
+                    };
+                }
+                Ok(None) => {
+                    row.outcome = Outcome::Gone;
+                    row.detail = "This process had already exited.".into();
+                }
+                Err(error) => {
+                    row.outcome = Outcome::Failed;
+                    row.detail = error;
+                }
+            }
+        } else {
+            let result = match operation {
+                Operation::Efficiency => system::enable_app_efficiency(target.id).map(Some),
+                Operation::RestoreEfficiency => target
+                    .original
+                    .ok_or_else(|| "No efficiency settings were saved for this process.".to_owned())
+                    .and_then(|original| system::restore_app_efficiency(target.id, original))
+                    .map(|_| None),
+                Operation::Trim => system::trim_app_memory(target.id).map(|(before, after)| {
+                    report.before = report.before.saturating_add(before);
+                    report.after = report.after.saturating_add(after);
+                    None
+                }),
+                Operation::Close | Operation::End => unreachable!("handled above"),
+            };
+            match result {
+                Ok(policy) => report.policies.push((target.id, policy)),
+                Err(error) => {
+                    row.outcome = Outcome::Failed;
+                    row.detail = error;
                 }
             }
         }
-        app.targets.push(target);
+        report.rows.push(row);
     }
-    let deadline = Instant::now() + wait;
+
+    let wait = if operation == Operation::Close { 8 } else { 2 };
+    let deadline = Instant::now() + Duration::from_secs(wait);
     loop {
-        let waiting = apps
-            .iter()
-            .filter(|a| a.requested)
-            .flat_map(|a| a.targets.iter())
-            .any(|t| !backend.exited(t));
-        if !waiting || stop.load(Ordering::Relaxed) || Instant::now() >= deadline {
+        pending.retain(|(index, handle)| {
+            if handle.exited() {
+                let row = &mut report.rows[*index];
+                row.outcome = Outcome::Changed;
+                row.detail.clear();
+                false
+            } else {
+                true
+            }
+        });
+        if pending.is_empty() || stop.load(Ordering::Relaxed) || Instant::now() >= deadline {
             break;
         }
-        std::thread::sleep(Duration::from_millis(250));
-    }
-    for app in apps {
-        let exited = app.targets.iter().filter(|t| backend.exited(t)).count();
-        if exited == app.targets.len() {
-            let identities = app.targets.iter().map(|t| ((t.pid, t.start), None));
-            report.changed.extend(identities);
-            report.closed_apps.push(app.name);
-        } else if app.requested {
-            report.open_apps.push(app.name);
-        } else {
-            let reason = app.error.unwrap_or_else(|| "It did not respond.".into());
-            report.failed.push(format!("{}: {reason}", app.name));
-        }
+        std::thread::sleep(Duration::from_millis(100));
     }
     report
 }
 
-fn close_summary(report: &MemoryReport) -> String {
-    let mut parts = Vec::new();
-    if !report.closed_apps.is_empty() {
-        parts.push(format!("Closed {}.", list_names(&report.closed_apps)));
-    }
-    if !report.open_apps.is_empty() {
-        parts.push(format!(
-            "{} still open after the request, possibly showing a save prompt.",
-            list_names(&report.open_apps)
-        ));
-    }
-    if !report.failed.is_empty() {
-        parts.push(format!(
-            "{} could not be asked to close.",
-            plural(report.failed.len(), "app", "apps")
-        ));
-    }
-    if parts.is_empty() {
-        "No apps were changed.".into()
-    } else {
-        parts.join(" ")
-    }
-}
 fn growth_text(value: i64, observed: u64) -> String {
     if observed < 3 {
-        return "measuring".into();
+        return "—".into();
     }
     let prefix = if value > 0 {
         "+"
@@ -258,445 +411,513 @@ fn growth_text(value: i64, observed: u64) -> String {
     };
     format!("{prefix}{}", fmt_bytes(value.unsigned_abs()))
 }
+
+fn metric(known: usize, total: usize, value: String) -> String {
+    if known == 0 {
+        "—".into()
+    } else if known < total {
+        format!("~{value}")
+    } else {
+        value
+    }
+}
+
+fn members<'a>(
+    snapshot: &'a Snapshot,
+    row: &'a Row,
+) -> impl Iterator<Item = &'a Process> + Clone + 'a {
+    row.members.iter().map(|&i| &snapshot.processes[i])
+}
+
+fn find_row<'a>(snapshot: &'a Snapshot, id: &RowId) -> Option<&'a Row> {
+    match id {
+        RowId::Process(_) => snapshot.individuals.iter().find(|row| row.id == *id),
+        RowId::Image(_, _) => snapshot.groups.iter().find(|row| row.id == *id),
+    }
+}
+
 impl App {
     pub fn execute_memory(&mut self, action: MemoryAction, ctx: &egui::Context) {
         if self.mem.busy() {
-            self.toast(ToastKind::Info, "Another app operation is still running.");
             return;
         }
         let stop = Arc::new(AtomicBool::new(false));
         self.mem.stop_waiting = stop.clone();
-        self.mem.closing = action.kind == MemoryKind::Close;
+        self.mem.running = Some(action.operation);
         self.mem.job = Task::spawn(ctx, move || {
-            if action.kind == MemoryKind::Close {
-                return close_apps(action, &stop);
-            }
-            let mut report = MemoryReport {
-                kind: action.kind,
-                name: action.name,
-                attempted: action.targets.len(),
-                changed: Vec::new(),
-                before: 0,
-                after: 0,
-                failed: Vec::new(),
-                closed_apps: Vec::new(),
-                open_apps: Vec::new(),
-            };
-            for target in action.targets {
-                let result = match action.kind {
-                    MemoryKind::Close => {
-                        system::request_app_close(target.pid, target.start).map(|_| None)
-                    }
-                    MemoryKind::Trim => {
-                        system::trim_app_memory(target.pid, target.start).map(|(before, after)| {
-                            report.before = report.before.saturating_add(before);
-                            report.after = report.after.saturating_add(after);
-                            None
-                        })
-                    }
-                    MemoryKind::Efficiency => {
-                        system::enable_app_efficiency(target.pid, target.start).map(Some)
-                    }
-                    MemoryKind::RestoreEfficiency => target
-                        .restore
-                        .ok_or_else(|| "No saved efficiency policy for this process.".to_string())
-                        .and_then(|policy| {
-                            system::restore_app_efficiency(target.pid, target.start, policy)
-                        })
-                        .map(|_| None),
-                };
-                match result {
-                    Ok(original) => report.changed.push(((target.pid, target.start), original)),
-                    Err(error) => report.failed.push(format!("PID {}: {error}", target.pid)),
-                }
+            let report = run_operation(action, &stop);
+            util::log(&report.summary());
+            for row in report.rows.iter().filter(|r| !r.detail.is_empty()).take(20) {
+                util::log(format!(
+                    "  {} (PID {}): {}",
+                    row.name, row.id.pid, row.detail
+                ));
             }
             report
         });
     }
-    pub fn poll_memory(&mut self) {
+
+    pub fn poll_memory(&mut self, ctx: &egui::Context) {
+        self.mem.icons.poll(ctx);
         let pressure = system::memory_pressure(
             self.sys.mem_total,
             self.sys.mem_avail,
             self.sys.commit_total,
             self.sys.commit_limit,
         );
-        if self
-            .mem
-            .pressure_since
-            .as_ref()
-            .map(|(previous, _)| *previous)
-            != Some(pressure)
-        {
+        if self.mem.pressure_since.as_ref().map(|(value, _)| *value) != Some(pressure) {
             self.mem.pressure_since = Some((pressure, Instant::now()));
         }
-        if self
-            .mem
-            .last_identity_refresh
-            .is_none_or(|last| last.elapsed().as_secs() >= 3)
-        {
-            let live: std::collections::HashSet<_> = self
-                .sys
-                .procs
-                .iter()
-                .map(|p| (p.pid, p.start_time))
-                .collect();
-            self.mem
-                .efficiency
-                .retain(|identity, _| live.contains(identity));
-            if !self.mem.checked.is_empty() && !self.sys.procs.is_empty() {
-                let names: HashSet<String> = self
-                    .sys
-                    .procs
-                    .iter()
-                    .map(|p| p.name.to_lowercase())
-                    .collect();
-                self.mem.checked.retain(|name| names.contains(name));
+        let snapshot = &self.sys.processes;
+        if self.mem.last_sample != snapshot.sampled_at {
+            self.mem.last_sample = snapshot.sampled_at;
+            if !self.mem.checked.is_empty() || !self.mem.efficiency.is_empty() {
+                let live: HashSet<_> = snapshot.processes.iter().map(|p| p.identity).collect();
+                self.mem.checked.retain(|id| live.contains(id));
+                self.mem.efficiency.retain(|id, _| live.contains(id));
             }
-            self.mem.last_identity_refresh = Some(Instant::now());
         }
         let Some(result) = self.mem.job.poll() else {
             return;
         };
-        self.mem.closing = false;
+        self.mem.running = None;
         match result {
-            Err(error) => self.toast(ToastKind::Error, format!("App operation failed: {error}")),
+            Err(error) => self.toast(ToastKind::Error, error),
             Ok(report) => {
-                let done = report.changed.len();
-                for (identity, original) in &report.changed {
-                    if let Some(original) = original {
-                        self.mem.efficiency.entry(*identity).or_insert(*original);
-                    } else if report.kind == MemoryKind::RestoreEfficiency {
-                        self.mem.efficiency.remove(identity);
+                for &(id, policy) in &report.policies {
+                    if let Some(original) = policy {
+                        self.mem.efficiency.entry(id).or_insert(original);
+                    } else if report.operation == Operation::RestoreEfficiency {
+                        self.mem.efficiency.remove(&id);
                     }
                 }
-                let message = match report.kind {
-                    MemoryKind::Close => close_summary(&report),
-                    MemoryKind::Trim => format!("Trimmed {done} of {} processes: resident memory fell by {} at measurement. It can grow back immediately.", report.attempted, fmt_bytes(report.before.saturating_sub(report.after))),
-                    MemoryKind::Efficiency => format!("Efficiency mode enabled for {done} of {} processes for {}. Undo is available here while PCSweep stays open.", report.attempted, report.name),
-                    MemoryKind::RestoreEfficiency => format!("Restored the previous efficiency policy for {done} of {} processes for {}.", report.attempted, report.name),
-                };
-                util::log(&message);
-                for error in report.failed.iter().take(20) {
-                    util::log(format!("  {error}"));
-                }
-                let kind = if !report.open_apps.is_empty() {
-                    ToastKind::Info
-                } else if done == 0 {
-                    ToastKind::Error
-                } else if report.failed.is_empty() {
-                    ToastKind::Success
-                } else {
-                    ToastKind::Info
-                };
-                self.toast(kind, message);
-                if done == 0 && report.open_apps.is_empty() {
-                    if let Some(reason) = report.failed.first() {
-                        self.toast(ToastKind::Error, reason.clone());
+                if report.operation.closes() {
+                    for row in &report.rows {
+                        if matches!(row.outcome, Outcome::Changed | Outcome::Gone) {
+                            self.mem.checked.remove(&row.id);
+                        }
                     }
                 }
+                let complete = report
+                    .rows
+                    .iter()
+                    .all(|row| matches!(row.outcome, Outcome::Changed | Outcome::Gone));
+                self.toast(
+                    if complete {
+                        ToastKind::Success
+                    } else {
+                        ToastKind::Info
+                    },
+                    report.summary(),
+                );
+                self.mem.report = Some(report);
+                self.mem.results_open = !complete;
                 self.sys.refresh_processes_soon();
             }
         }
     }
-    fn memory_targets(&self, group: &ProcGroup, kind: MemoryKind) -> Vec<MemoryTarget> {
-        self.sys
-            .procs
+
+    fn review_processes(&mut self, operation: Operation, selection: Selection) {
+        let snapshot = &self.sys.processes;
+        let (name, candidates): (String, Vec<&Process>) = match selection {
+            Selection::Checked => (
+                "selected processes".into(),
+                snapshot
+                    .processes
+                    .iter()
+                    .filter(|process| self.mem.checked.contains(&process.identity))
+                    .collect(),
+            ),
+            Selection::Row(id) => {
+                let Some(row) = find_row(snapshot, &id) else {
+                    return;
+                };
+                (row.name.clone(), members(snapshot, row).collect())
+            }
+            Selection::Pid(id) => {
+                let Some(process) = snapshot.processes.iter().find(|p| p.identity == id) else {
+                    return;
+                };
+                (process.name.clone(), vec![process])
+            }
+        };
+        let mut affected: Vec<_> = candidates
             .iter()
-            .filter(|p| group.pids.contains(&p.pid))
-            .filter_map(|p| {
-                let restore = self.mem.efficiency.get(&(p.pid, p.start_time)).copied();
-                if kind == MemoryKind::RestoreEfficiency && restore.is_none() {
-                    return None;
-                }
-                Some(MemoryTarget {
-                    pid: p.pid,
-                    start: p.start_time,
-                    restore,
-                    app: group.name.clone(),
-                })
+            .copied()
+            .filter(|p| {
+                p.access == Access::Available
+                    && (operation != Operation::Close || !p.windows.is_empty())
+                    && (operation != Operation::RestoreEfficiency
+                        || self.mem.efficiency.contains_key(&p.identity))
             })
-            .collect()
+            .collect();
+        if affected.is_empty() {
+            self.toast(
+                ToastKind::Info,
+                "No selected processes can perform this action. Open process details to see why.",
+            );
+            return;
+        }
+        affected.sort_unstable_by_key(|p| (&p.name, p.identity));
+        let windows_component = affected.iter().any(|p| p.windows_component);
+        let count = affected.len();
+        let excluded = candidates.len() - count;
+        let mut details: Vec<_> = affected
+            .iter()
+            .map(|p| {
+                format!(
+                    "{} • PID {}{}",
+                    p.name,
+                    p.identity.pid,
+                    p.image
+                        .as_ref()
+                        .map(|path| format!("\n{}", path.display()))
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        if excluded > 0 {
+            details.push(format!(
+                "{excluded} selected processes are ineligible for this action."
+            ));
+        }
+        let (title, body, confirm, note) = match operation {
+            Operation::Close => (
+                format!("Close {name} normally?"),
+                format!("Ask {count} window-owning processes to close. Apps can show a save prompt."),
+                "Ask to close",
+                Some("Use End task if a background process stays running or an app stops responding."),
+            ),
+            Operation::End => (
+                format!("End {name}?"),
+                format!("End the {count} listed processes now. Unsaved work can be lost."),
+                "End task",
+                windows_component.then_some("This selection includes a Windows component. Related apps, the desktop, or a service may be interrupted. Windows can restart some processes automatically."),
+            ),
+            Operation::Efficiency => (
+                format!("Use efficiency mode for {name}?"),
+                "Apply Windows’ power-efficient CPU policy to the listed processes.".into(),
+                "Enable efficiency",
+                Some("Apps can run more slowly. The previous settings are available to restore while PCSweep stays open."),
+            ),
+            Operation::RestoreEfficiency => (
+                format!("Restore efficiency settings for {name}?"),
+                "Restore the execution-speed policy saved for the listed processes.".into(),
+                "Restore settings",
+                None,
+            ),
+            Operation::Trim => (
+                format!("Trim resident RAM for {name}?"),
+                "Ask Windows to reclaim eligible pages from the listed processes’ working sets.".into(),
+                "Trim RAM",
+                Some("Pages can reload as soon as apps need them. This can cause stutter and leaves private commit unchanged."),
+            ),
+        };
+        let targets = affected
+            .into_iter()
+            .map(|process| Target {
+                id: process.identity,
+                name: process.name.clone(),
+                windows: if operation == Operation::Close {
+                    process.windows.clone()
+                } else {
+                    Vec::new()
+                },
+                original: self.mem.efficiency.get(&process.identity).copied(),
+            })
+            .collect();
+        self.modal = Some(Modal {
+            title,
+            body,
+            details,
+            note: note.map(str::to_owned),
+            confirm: confirm.into(),
+            danger: operation == Operation::End,
+            action: Action::Memory(MemoryAction { operation, targets }),
+        });
     }
+
     pub fn page_memory(&mut self, ui: &mut Ui) {
         let mut acts = Vec::new();
-        self.render_memory(ui, &mut acts);
-        for act in acts {
-            match act {
-                MAct::Details(value) => self.mem.details = value,
-                MAct::Check(name, on) => {
-                    if on {
-                        self.mem.checked.insert(name);
-                    } else {
-                        self.mem.checked.remove(&name);
-                    }
-                }
-                MAct::CheckMany(names, on) => {
-                    for name in names {
-                        if on {
-                            self.mem.checked.insert(name);
-                        } else {
-                            self.mem.checked.remove(&name);
-                        }
-                    }
-                }
-                MAct::ClearChecked => self.mem.checked.clear(),
-                MAct::StopWaiting => self.mem.stop_waiting.store(true, Ordering::Relaxed),
-                MAct::AskCloseChecked => {
-                    let groups: Vec<ProcGroup> = self
-                        .sys
-                        .groups()
-                        .into_iter()
-                        .filter(|g| self.mem.checked.contains(&g.name.to_lowercase()))
-                        .filter(eligible)
-                        .collect();
-                    if groups.is_empty() {
-                        self.toast(
-                            ToastKind::Info,
-                            "None of the selected apps are running now.",
-                        );
-                        continue;
-                    }
-                    let mut targets = Vec::new();
-                    let mut details = Vec::new();
-                    let mut ram = 0;
-                    for group in &groups {
-                        let group_targets = self.memory_targets(group, MemoryKind::Close);
-                        details.push(format!(
-                            "{}: {}, {} RAM now",
-                            group.name,
-                            plural(group_targets.len(), "process", "processes"),
-                            fmt_bytes(group.mem)
-                        ));
-                        ram += group.mem;
-                        targets.extend(group_targets);
-                    }
-                    self.modal = Some(Modal {
-                        title: format!("Close {} normally?", plural(groups.len(), "app", "apps")),
-                        body: format!(
-                            "Windows will ask each app's windows to close, then PCSweep checks which ones really exited. Together they use {} of RAM right now; how much memory is freed depends on what Windows does next.",
-                            fmt_bytes(ram)
-                        ),
-                        details,
-                        note: Some(CLOSE_NOTE.into()),
-                        confirm: "Ask apps to close".into(),
-                        danger: false,
-                        action: Action::Memory(MemoryAction {
-                            kind: MemoryKind::Close,
-                            targets,
-                            name: plural(groups.len(), "app", "apps"),
-                        }),
-                    });
-                }
-                MAct::Filter(value) => self.mem.filter = value,
-                MAct::Sort(value) => self.mem.sort = value,
-                MAct::Select(name) => {
-                    self.mem.selected = if self.mem.selected.as_ref() == Some(&name) {
-                        None
-                    } else {
-                        Some(name)
-                    };
-                }
-                MAct::Advanced(value) => self.mem.advanced = value,
-                MAct::Go(page) => self.page = page,
-                MAct::PageFile => {
-                    let executable = util::env("SystemRoot")
-                        .unwrap_or_else(|| r"C:\Windows".into())
-                        .join(r"System32\SystemPropertiesPerformance.exe");
-                    if let Err(error) = std::process::Command::new(executable).spawn() {
-                        self.toast(
-                            ToastKind::Error,
-                            format!("Could not open virtual memory settings: {error}"),
-                        );
-                    }
-                }
-                MAct::AskKill(group) => {
-                    let pids = self
-                        .memory_targets(&group, MemoryKind::Close)
-                        .into_iter()
-                        .map(|p| (p.pid, p.start))
-                        .collect::<Vec<_>>();
-                    self.modal = Some(Modal {
-                        title: format!("Force end {}?", group.name),
-                        body: format!("{} processes using {} will be terminated immediately. Unsaved work can be lost. Try Close app first.", pids.len(), fmt_bytes(group.mem)),
-                        details: Vec::new(), note: Some("Processes that exited, changed identity, or belong to Windows are skipped.".into()),
-                        confirm: "Force end".into(), danger: true,
-                        action: Action::Kill { pids, name: group.name },
-                    });
-                }
-                MAct::Ask(kind, group) => {
-                    let targets = self.memory_targets(&group, kind);
-                    let (title, body, note, confirm) = match kind {
-                        MemoryKind::Close => (format!("Close {} normally?", group.name),
-                            "Windows will ask the app's windows to close. The app can show a save prompt or refuse; background services may have no windows to close.",
-                            "Review any save prompts in the app. This does not force termination.", "Ask app to close"),
-                        MemoryKind::Trim => (format!("Trim resident RAM for {}?", group.name),
-                            "Windows will move eligible pages out of this app's working set. This can lower its resident RAM temporarily, and the next access may need to reload pages.",
-                            "This does not fix leaks or reduce committed memory. It can cause stutter or disk activity. There is no automatic or scheduled trimming.", "Trim selected app"),
-                        MemoryKind::Efficiency => (format!("Use efficiency mode for {}?", group.name),
-                            "Use Windows' power-efficient execution policy for these background processes. This may reduce CPU interference, heat and battery use, and may slow the selected app.",
-                            "Avoid games, calls and time-sensitive work. Applies to current processes only. Restore their previous policy here while PCSweep remains open.", "Enable efficiency"),
-                        MemoryKind::RestoreEfficiency => (format!("Undo efficiency mode for {}?", group.name),
-                            "Restore the execution-speed policy these processes had before PCSweep enabled efficiency mode.",
-                            "Only the same process lifetimes are changed. Restarted apps already use their own default policy.", "Restore previous policy"),
-                    };
-                    self.modal = Some(Modal {
-                        title,
-                        body: body.into(),
-                        details: vec![format!("{} current process(es)", targets.len())],
-                        note: Some(note.into()),
-                        confirm: confirm.into(),
-                        danger: false,
-                        action: Action::Memory(MemoryAction {
-                            kind,
-                            targets,
-                            name: group.name,
-                        }),
-                    });
-                }
-            }
-        }
-    }
-    fn render_memory(&self, ui: &mut Ui, acts: &mut Vec<MAct>) {
-        let s = &self.sys;
-        let pressure =
-            system::memory_pressure(s.mem_total, s.mem_avail, s.commit_total, s.commit_limit);
+        widgets::page_header(
+            ui,
+            "Memory and running apps",
+            "See what is using RAM and manage running apps.",
+        );
+        let pressure = system::memory_pressure(
+            self.sys.mem_total,
+            self.sys.mem_avail,
+            self.sys.commit_total,
+            self.sys.commit_limit,
+        );
         let color = match pressure {
             MemoryPressure::Normal => GOOD,
             MemoryPressure::Elevated => WARN,
             MemoryPressure::Critical => BAD,
         };
-        widgets::page_header(ui, "Memory and running apps", "See actual memory pressure, find growing apps, and keep background work under control.");
-        self.render_memory_summary(ui, color, acts);
-        if let Some(warning) = &s.process_warning {
-            ui.colored_label(WARN, warning);
-        }
+        self.render_memory_summary(ui, color, &mut acts);
         if pressure != MemoryPressure::Normal {
-            ui.add_space(4.0);
-            widgets::banner(
-                ui,
-                color,
-                if pressure == MemoryPressure::Normal {
-                    ic::CHECK
-                } else {
-                    ic::WARN
-                },
-                |ui| {
-                    let seconds = self
-                        .mem
-                        .pressure_since
-                        .as_ref()
-                        .map_or(0, |(_, t)| t.elapsed().as_secs());
-                    let message = match pressure {
-                    MemoryPressure::Normal => "Memory has room to work. Cached RAM is useful and can be reused automatically.".to_string(),
-                    MemoryPressure::Elevated => "Memory is getting tight. Close an app you are not using, and check its startup settings if it keeps returning.".to_string(),
-                    MemoryPressure::Critical if seconds >= 10 => "Memory pressure has stayed high. Save your work and close a heavy app. Near the commit limit, apps can fail to allocate memory.".to_string(),
-                    MemoryPressure::Critical => "Memory is very tight right now. Watch for sustained pressure rather than clearing cache on a timer.".to_string(),
-                };
-                    ui.vertical(|ui| {
-                        ui.label(message);
-                        ui.horizontal_wrapped(|ui| {
-                            if ui.add(widgets::small("Manage startup apps")).clicked() {
-                                acts.push(MAct::Go(Page::Startup));
-                            }
-                            ui.label(widgets::faint(
-                                "Private commit is different from resident RAM and page-file usage.",
-                            ));
-                        });
-                    });
-                },
-            );
+            let sustained = self
+                .mem
+                .pressure_since
+                .is_some_and(|(_, at)| at.elapsed() >= Duration::from_secs(10));
+            let message = match (pressure, sustained) {
+                (MemoryPressure::Critical, true) => {
+                    "Memory pressure has stayed high. Save your work and close a heavy app."
+                }
+                (MemoryPressure::Critical, false) => "Memory is very tight right now.",
+                _ => "Memory is getting tight. Close an app you are no longer using.",
+            };
+            ui.colored_label(color, message);
         }
-        ui.add_space(6.0);
-        let mut groups = s.groups();
-        match self.mem.sort {
-            MemSort::Resident => {}
-            MemSort::Private => groups.sort_by_key(|g| std::cmp::Reverse(g.private_bytes)),
-            MemSort::Growth => groups.sort_by_key(|g| std::cmp::Reverse(g.growth)),
-            MemSort::Cpu => groups.sort_by(|a, b| b.cpu.total_cmp(&a.cpu)),
+        ui.add_space(8.0);
+        self.render_process_table(ui, false, &mut acts);
+        self.process_windows(ui.ctx(), &mut acts);
+        self.apply_process_actions(ui.ctx(), acts);
+    }
+
+    pub fn background_processes(&mut self, ui: &mut Ui) {
+        let mut acts = Vec::new();
+        self.render_process_table(ui, true, &mut acts);
+        self.process_windows(ui.ctx(), &mut acts);
+        self.apply_process_actions(ui.ctx(), acts);
+    }
+
+    fn apply_process_actions(&mut self, ctx: &egui::Context, actions: Vec<MAct>) {
+        for act in actions {
+            match act {
+                MAct::Inspect(id) => {
+                    self.mem.selected = Some(id);
+                    self.mem.inspect_open = true;
+                }
+                MAct::Ask(operation, selection) => self.review_processes(operation, selection),
+                MAct::Check(ids, on) => {
+                    if on {
+                        self.mem.checked.extend(ids);
+                    } else {
+                        self.mem.checked.retain(|id| !ids.contains(id));
+                    }
+                }
+                MAct::Clear => self.mem.checked.clear(),
+                MAct::StopWaiting => self.mem.stop_waiting.store(true, Ordering::Relaxed),
+                MAct::Refresh => self.sys.refresh_processes_soon(),
+                MAct::Details(value) => self.mem.details = value,
+                MAct::Show(id, window) => {
+                    if let Err(error) = running::show_window(id, &window) {
+                        self.toast(ToastKind::Info, error);
+                    }
+                }
+                MAct::Location(path) => util::show_in_explorer(&path),
+                MAct::PageFile => {
+                    if let Err(error) = util::open_system_tool("SystemPropertiesPerformance.exe") {
+                        self.toast(ToastKind::Error, error);
+                    }
+                }
+            }
         }
-        if let Some(selected) = self
-            .mem
-            .selected
-            .as_ref()
-            .and_then(|name| groups.iter().find(|g| g.name.eq_ignore_ascii_case(name)))
-        {
-            self.render_selected_memory(ui, selected, acts);
-            ui.add_space(6.0);
-        }
+        self.mem.icons.start_pending(ctx);
+    }
+
+    fn render_process_table(&mut self, ui: &mut Ui, background: bool, acts: &mut Vec<MAct>) {
+        let available = !self.mutations_running();
+        let snapshot = &self.sys.processes;
+        let view = if background {
+            &mut self.mem.background_view
+        } else {
+            &mut self.mem.view
+        };
+        let busy = self.mem.running;
         ui.horizontal_wrapped(|ui| {
-            ui.label(widgets::dim("Sort"));
-            for (sort, label) in [
-                (MemSort::Resident, "RAM"),
-                (MemSort::Private, "Private commit"),
-                (MemSort::Growth, "Growth"),
-                (MemSort::Cpu, "CPU"),
-            ] {
+            for scope in [Scope::All, Scope::Windows, Scope::Background, Scope::Pid] {
                 if ui
-                    .add(widgets::chip(label, self.mem.sort == sort))
+                    .add(widgets::chip(scope.label(), view.scope == scope))
                     .clicked()
                 {
-                    acts.push(MAct::Sort(sort));
+                    view.scope = scope;
                 }
             }
-            let mut filter = self.mem.filter.clone();
-            if widgets::search_box(ui, &mut filter, "Search apps", 180.0).changed() {
-                acts.push(MAct::Filter(filter));
+            if ui
+                .add(widgets::small(widgets::icon_text(
+                    ic::REFRESH,
+                    "Refresh",
+                    13.0,
+                    TEXT,
+                )))
+                .clicked()
+            {
+                acts.push(MAct::Refresh);
             }
         });
-        let filter = self.mem.filter.trim().to_lowercase();
-        let shown: Vec<&ProcGroup> = groups
-            .iter()
-            .filter(|g| filter.is_empty() || g.name.to_lowercase().contains(&filter))
-            .collect();
-        self.render_selection_bar(ui, &groups, &shown, acts);
-        ui.label(widgets::faint(format!(
-            "{} app groups, {} processes. Refreshed every 3 seconds; growth is observed for up to 10 minutes. Tick apps to close several at once, or click a name for more actions.",
-            shown.len(),
-            fmt_num(s.procs.len() as u64)
-        )));
-        if shown.is_empty() {
-            ui.label(widgets::dim(
-                "No apps match. Try part of an executable name.",
-            ));
-            return;
+        ui.horizontal_wrapped(|ui| {
+            widgets::search_box(
+                ui,
+                &mut view.filter,
+                "Search name, PID, path or window",
+                247.0,
+            );
+            egui::ComboBox::from_id_salt("process_sort")
+                .selected_text(format!("Sort by {}", view.sort.label()))
+                .show_ui(ui, |ui| {
+                    for sort in [
+                        Sort::Ram,
+                        Sort::Cpu,
+                        Sort::Private,
+                        Sort::Growth,
+                        Sort::Name,
+                        Sort::Pid,
+                    ] {
+                        ui.selectable_value(&mut view.sort, sort, sort.label());
+                    }
+                });
+        });
+        // Entering an exact PID should expose that process alone. Ending a
+        // matching row can never include siblings with the same executable.
+        let scope = if view.filter.trim().parse::<u32>().is_ok() {
+            Scope::Pid
+        } else {
+            view.scope
+        };
+        let table = if scope.individual() {
+            &snapshot.individuals
+        } else {
+            &snapshot.groups
+        };
+        let indices = view.rows(snapshot, table, scope);
+        let checked = &self.mem.checked;
+        let shown_count = indices.len();
+        if let Some(error) = &self.sys.process_warning {
+            ui.add(Label::new(RichText::new(error).color(WARN)).wrap());
         }
-        let selectable: Vec<String> = shown
-            .iter()
-            .filter(|g| eligible(g))
-            .map(|g| g.name.to_lowercase())
-            .collect();
-        ui.horizontal(|ui| {
-            let all =
-                !selectable.is_empty() && selectable.iter().all(|n| self.mem.checked.contains(n));
-            let mut value = all;
-            let header = ui
-                .add_enabled(!selectable.is_empty(), egui::Checkbox::new(&mut value, ""))
-                .on_hover_text("Select every app shown that can be closed");
-            if header.changed() {
-                acts.push(MAct::CheckMany(selectable.clone(), value));
-            }
-            ui.label(widgets::faint("App"));
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                for (width, label) in [
-                    (68.0, "CPU"),
-                    (90.0, "RAM"),
-                    (96.0, "Private"),
-                    (98.0, "Growth"),
-                ] {
-                    widgets::cell(ui, width, true, widgets::faint(label));
+        if let Some(at) = snapshot.sampled_at {
+            let age = at.elapsed().as_secs();
+            let view_name = if scope.individual() {
+                "processes"
+            } else {
+                "app groups"
+            };
+            ui.label(widgets::faint(format!(
+                "{} {view_name} shown · {} processes total · {} groups with open windows{}",
+                fmt_num(shown_count as u64),
+                fmt_num(snapshot.processes.len() as u64),
+                snapshot.foreground,
+                if age > 8 {
+                    format!(" · updated {age}s ago")
+                } else {
+                    String::new()
+                },
+            )));
+        } else {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(widgets::dim("Reading running processes…"));
+            });
+        }
+
+        let selected = selection_summary(snapshot, table, indices, checked, scope);
+        selection_bar(ui, &selected, busy, available, acts);
+        if let Some(report) = &self.mem.report {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(widgets::dim(report.summary()));
+                if ui.add(widgets::small("Process results")).clicked() {
+                    self.mem.results_open = true;
                 }
             });
+        }
+        if indices.is_empty() {
+            if snapshot.sampled_at.is_some() {
+                widgets::tight_card(ui, |ui| {
+                    ui.label(widgets::dim("No processes match this view."));
+                    if ui.add(widgets::small("Show all apps")).clicked() {
+                        view.scope = Scope::All;
+                        view.filter.clear();
+                    }
+                });
+            }
+            return;
+        }
+
+        let columns = TableColumns::new(ui.available_width());
+        widgets::row(ui, 24.0, |ui| {
+            ui.add_space(55.0);
+            ui.label(widgets::faint(if scope.individual() {
+                "Process / PID"
+            } else {
+                "App or process group"
+            }));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.add_space(columns.action);
+                columns.header(ui);
+            });
         });
+        let icons = &mut self.mem.icons;
         ScrollArea::vertical()
-            .id_salt("procs_scroll")
+            .id_salt(("live_process_rows", scope.label()))
             .auto_shrink([false, false])
-            .show_rows(ui, 42.0, shown.len(), |ui, range| {
-                for group in &shown[range] {
-                    self.render_memory_row(ui, group, acts);
+            .show_rows(ui, 42.0, indices.len(), |ui, range| {
+                for &index in &indices[range] {
+                    let row = &table[index];
+                    ui.push_id(&row.id, |ui| {
+                        process_row(
+                            ui, snapshot, row, columns, scope, available, checked, icons, acts,
+                        );
+                    });
                 }
             });
     }
 
+    fn process_windows(&mut self, ctx: &egui::Context, acts: &mut Vec<MAct>) {
+        if self.modal.is_some() {
+            return;
+        }
+        let available = !self.mutations_running();
+        if self.mem.inspect_open {
+            let snapshot = &self.sys.processes;
+            let row = self
+                .mem
+                .selected
+                .as_ref()
+                .and_then(|id| find_row(snapshot, id));
+            let mut open = self.mem.inspect_open;
+            egui::Window::new("Process details")
+                .id(egui::Id::new("process_inspector"))
+                .open(&mut open)
+                .default_width(660.0)
+                .min_width(300.0)
+                .vscroll(true)
+                .collapsible(false)
+                .show(ctx, |ui| {
+                    let Some(row) = row else {
+                        ui.label(widgets::dim(
+                            "This process has exited. Choose another row for details.",
+                        ));
+                        return;
+                    };
+                    process_inspector(ui, snapshot, row, &mut self.mem, available, acts);
+                });
+            self.mem.inspect_open = open;
+        }
+        if self.mem.results_open {
+            let Some(report) = &self.mem.report else {
+                return;
+            };
+            egui::Window::new("Process results")
+                .open(&mut self.mem.results_open)
+                .default_width(560.0)
+                .vscroll(true)
+                .collapsible(false)
+                .show(ctx, |ui| {
+                    ui.add(Label::new(widgets::strong(report.summary(), 16.0)).wrap());
+                    for row in report.rows.iter().filter(|r| !r.detail.is_empty()) {
+                        ui.separator();
+                        ui.label(widgets::strong(
+                            format!("{} · PID {}", row.name, row.id.pid),
+                            14.0,
+                        ));
+                        ui.add(Label::new(widgets::dim(&row.detail)).wrap());
+                    }
+                });
+        }
+    }
     fn render_memory_summary(&self, ui: &mut Ui, color: egui::Color32, acts: &mut Vec<MAct>) {
         let s = &self.sys;
         widgets::card(ui, |ui| {
@@ -828,394 +1049,496 @@ impl App {
             }
         });
     }
+}
 
-    fn render_selection_bar(
-        &self,
-        ui: &mut Ui,
-        groups: &[ProcGroup],
-        shown: &[&ProcGroup],
-        acts: &mut Vec<MAct>,
-    ) {
-        let busy = self.mem.busy() && self.mem.closing;
-        let checked: Vec<&ProcGroup> = groups
-            .iter()
-            .filter(|g| self.mem.checked.contains(&g.name.to_lowercase()))
-            .collect();
-        if checked.is_empty() && !busy {
-            return;
-        }
-        let processes: usize = checked.iter().map(|g| g.count).sum();
-        let ram: u64 = checked.iter().map(|g| g.mem).sum();
-        let hidden = checked
-            .iter()
-            .filter(|g| !shown.iter().any(|v| v.name == g.name))
-            .count();
-        widgets::tight_frame().show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            ui.horizontal(|ui| {
-                if busy {
-                    ui.spinner();
-                    ui.label(widgets::dim("Waiting to see which apps close…"));
-                } else {
-                    ui.label(widgets::strong(
-                        format!("{} selected", plural(checked.len(), "app", "apps")),
-                        14.5,
-                    ));
-                    ui.label(widgets::dim(format!(
-                        "{}, using {} RAM right now",
-                        plural(processes, "process", "processes"),
-                        fmt_bytes(ram)
-                    )));
-                    if hidden > 0 {
-                        ui.label(widgets::faint(format!("{hidden} hidden by the search")));
-                    }
-                }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if busy {
-                        if ui.add(widgets::small("Stop waiting")).clicked() {
-                            acts.push(MAct::StopWaiting);
-                        }
-                    } else {
-                        let close = widgets::primary("Close selected…");
-                        if ui.add_enabled(!self.mem.busy(), close).clicked() {
-                            acts.push(MAct::AskCloseChecked);
-                        }
-                        if ui.add(widgets::small("Clear")).clicked() {
-                            acts.push(MAct::ClearChecked);
-                        }
-                    }
-                });
-            });
-        });
-        ui.add_space(4.0);
+struct SelectionSummary {
+    groups: usize,
+    processes: usize,
+    hidden: usize,
+    can_close: bool,
+    selected_ram: u64,
+    by_pid: bool,
+}
+fn selection_summary(
+    snapshot: &Snapshot,
+    table: &[Row],
+    indices: &[usize],
+    checked: &HashSet<Identity>,
+    scope: Scope,
+) -> SelectionSummary {
+    let mut summary = SelectionSummary {
+        groups: 0,
+        processes: 0,
+        hidden: 0,
+        can_close: false,
+        selected_ram: 0,
+        by_pid: scope.individual(),
+    };
+    if checked.is_empty() {
+        return summary;
     }
+    summary.groups = snapshot
+        .groups
+        .iter()
+        .filter(|row| members(snapshot, row).any(|p| checked.contains(&p.identity)))
+        .count();
+    let visible = indices
+        .iter()
+        .flat_map(|&index| members(snapshot, &table[index]))
+        .filter(|p| checked.contains(&p.identity))
+        .count();
+    for p in snapshot
+        .processes
+        .iter()
+        .filter(|p| p.access == Access::Available && checked.contains(&p.identity))
+    {
+        summary.processes += 1;
+        summary.can_close |= !p.windows.is_empty();
+        summary.selected_ram = summary.selected_ram.saturating_add(p.memory.unwrap_or(0));
+    }
+    summary.hidden = summary.processes.saturating_sub(visible);
+    summary
+}
 
-    fn render_memory_row(&self, ui: &mut Ui, group: &ProcGroup, acts: &mut Vec<MAct>) {
-        let key = group.name.to_lowercase();
-        widgets::row(ui, 42.0, |ui| {
-            let can_close = eligible(group);
-            let mut checked = self.mem.checked.contains(&key);
-            let response = ui.add_enabled(can_close, egui::Checkbox::new(&mut checked, ""));
-            if !can_close {
-                response.on_disabled_hover_text(PROTECTED_HINT);
-            } else if response.changed() {
-                acts.push(MAct::Check(key.clone(), checked));
+fn selection_bar(
+    ui: &mut Ui,
+    summary: &SelectionSummary,
+    busy: Option<Operation>,
+    available: bool,
+    acts: &mut Vec<MAct>,
+) {
+    if summary.processes == 0 && busy.is_none() {
+        return;
+    }
+    widgets::tight_card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            if let Some(operation) = busy {
+                ui.spinner();
+                ui.label(widgets::dim(format!("{} in progress…", operation.label())));
+                if operation.closes() && ui.add(widgets::small("Stop waiting")).clicked() {
+                    acts.push(MAct::StopWaiting);
+                }
+                return;
             }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                widgets::cell(ui, 68.0, true, widgets::faint(format!("{:.1}%", group.cpu)));
-                widgets::cell(ui, 90.0, true, widgets::strong(fmt_bytes(group.mem), 14.0));
-                widgets::cell(ui, 96.0, true, widgets::dim(private_text(group)))
-                    .on_hover_text(PRIVATE_HINT);
-                let growth = if group.private_known == 0 {
-                    RichText::new("unavailable").color(TEXT_FAINT)
-                } else {
-                    let color = if group.growth > 128 * 1024 * 1024 {
-                        WARN
-                    } else {
-                        TEXT_DIM
-                    };
-                    let partial = if group.private_known < group.count {
-                        "~"
-                    } else {
-                        ""
-                    };
-                    let text = growth_text(group.growth, group.observed_secs);
-                    RichText::new(format!("{partial}{text}")).color(color)
-                };
-                let hint = format!(
-                    "Change in private committed memory over {} seconds observed. Growth alone does not prove a leak.",
-                    group.observed_secs
-                );
-                widgets::cell(ui, 98.0, true, growth).on_hover_text(hint);
-                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                    let selected = self
-                        .mem
-                        .selected
-                        .as_ref()
-                        .is_some_and(|name| name.eq_ignore_ascii_case(&group.name));
-                    let label = if group.count > 1 {
-                        format!("{} ({})", group.name, group.count)
-                    } else {
-                        group.name.clone()
-                    };
-                    let button = egui::Button::new(RichText::new(label).color(TEXT))
-                        .selected(selected)
-                        .frame(false)
-                        .truncate();
-                    if ui.add(button).on_hover_text(&group.name).clicked() {
-                        acts.push(MAct::Select(group.name.clone()));
-                    }
-                });
-            });
-        });
-    }
-
-    fn render_selected_memory(&self, ui: &mut Ui, group: &ProcGroup, acts: &mut Vec<MAct>) {
-        let protected =
-            system::is_critical(&group.name) || group.pids.contains(&std::process::id());
-        let enabled = !protected && !self.mem.busy();
-        let has_undo = self.sys.procs.iter().any(|p| {
-            group.pids.contains(&p.pid) && self.mem.efficiency.contains_key(&(p.pid, p.start_time))
-        });
-        let expanded = ui.available_height() > 560.0;
-        egui::CollapsingHeader::new(format!("App actions · {}",group.name))
-            .id_salt(("selected_app_controls",group.name.to_lowercase()))
-            .default_open(expanded)
-            .show(ui, |ui| {
-        widgets::card(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                if ui.add(widgets::small("Hide app details")).clicked() { acts.push(MAct::Select(group.name.clone())); }
-                ui.label(widgets::icon(
-                    if protected { ic::LOCK } else { ic::APPS },
-                    18.0,
-                    ACCENT,
-                ));
-                ui.label(widgets::strong(&group.name, 17.0));
-                ui.label(widgets::dim(format!(
-                    "{} RAM · {} process(es)",
-                    fmt_bytes(group.mem),
-                    group.count
-                )));
-                if has_undo {
-                    widgets::badge(ui, "Efficiency set by PCSweep", GOOD);
-                }
-                if self.mem.busy() {
-                    ui.spinner();
-                }
-            });
-            ui.horizontal_wrapped(|ui| {
-                if ui
-                    .add_enabled(enabled, widgets::primary("Close app"))
-                    .clicked()
-                {
-                    acts.push(MAct::Ask(MemoryKind::Close, group.clone()));
-                }
-                if ui
-                    .add_enabled(
-                        enabled,
-                        widgets::ghost(if has_undo {
-                            "Undo efficiency"
-                        } else {
-                            "Efficiency mode"
-                        }),
-                    )
-                    .clicked()
-                {
-                    acts.push(MAct::Ask(
-                        if has_undo {
-                            MemoryKind::RestoreEfficiency
-                        } else {
-                            MemoryKind::Efficiency
-                        },
-                        group.clone(),
-                    ));
-                }
-                if ui
-                    .add_enabled(enabled, widgets::ghost("Force end…"))
-                    .clicked()
-                {
-                    acts.push(MAct::AskKill(group.clone()));
-                }
-                let mut advanced = self.mem.advanced;
-                if ui.checkbox(&mut advanced, "Advanced").changed() {
-                    acts.push(MAct::Advanced(advanced));
-                }
-            });
-            if protected {
-                ui.label(widgets::faint(
-                    "Windows, security and PCSweep processes are protected from these actions.",
-                ));
+            let (count, singular, plural) = if summary.by_pid {
+                (summary.processes, "process", "processes")
             } else {
-                ui.label(widgets::faint("Close requests preserve the app's chance to save. Efficiency affects CPU/power, not memory allocation."));
+                (summary.groups, "app", "apps")
+            };
+            ui.label(widgets::strong(
+                format!(
+                    "{count} {} selected",
+                    if count == 1 { singular } else { plural }
+                ),
+                14.5,
+            ))
+            .on_hover_text(format!(
+                "{} processes · {} resident RAM",
+                summary.processes,
+                fmt_bytes(summary.selected_ram)
+            ));
+            if summary.hidden > 0 {
+                ui.label(widgets::faint(format!(
+                    "{} outside this view",
+                    summary.hidden
+                )));
             }
-            if self.mem.advanced {
-                ui.separator();
-                ui.horizontal_wrapped(|ui| {
-                    if ui.add_enabled(enabled, widgets::small("Trim this app's resident RAM…")).clicked() { acts.push(MAct::Ask(MemoryKind::Trim, group.clone())); }
-                    ui.label(widgets::faint("Temporary only. Reloading pages can cause stutter; private commit is unchanged."));
-                });
+            if ui
+                .add_enabled(
+                    available && summary.can_close,
+                    widgets::small("Close selected…"),
+                )
+                .on_disabled_hover_text("Select a process with an open window to close normally.")
+                .clicked()
+            {
+                acts.push(MAct::Ask(Operation::Close, Selection::Checked));
+            }
+            if ui
+                .add_enabled(available, widgets::small("End selected…"))
+                .clicked()
+            {
+                acts.push(MAct::Ask(Operation::End, Selection::Checked));
+            }
+            if ui.add(widgets::small("Clear")).clicked() {
+                acts.push(MAct::Clear);
             }
         });
+    });
+}
+
+#[derive(Clone, Copy)]
+struct TableColumns {
+    action: f32,
+    wide: bool,
+}
+impl TableColumns {
+    fn new(width: f32) -> Self {
+        Self {
+            action: 100.0,
+            wide: width >= 690.0,
+        }
+    }
+    fn header(self, ui: &mut Ui) {
+        widgets::cell(ui, 57.0, true, widgets::faint("CPU"));
+        widgets::cell(ui, 83.0, true, widgets::faint("RAM"));
+        if self.wide {
+            widgets::cell(ui, 90.0, true, widgets::faint("Private"));
+            widgets::cell(ui, 88.0, true, widgets::faint("Growth"));
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_row(
+    ui: &mut Ui,
+    snapshot: &Snapshot,
+    row: &Row,
+    columns: TableColumns,
+    scope: Scope,
+    available: bool,
+    checked: &HashSet<Identity>,
+    icons: &mut IconCache,
+    acts: &mut Vec<MAct>,
+) {
+    let first = &snapshot.processes[row.members[0]];
+    let selectable = members(snapshot, row).filter(|p| p.access == Access::Available);
+    let count = selectable
+        .clone()
+        .filter(|p| checked.contains(&p.identity))
+        .count();
+    let restriction = first
+        .access
+        .restriction()
+        .unwrap_or("Windows did not verify a process in this row.");
+    widgets::row(ui, 42.0, |ui| {
+        let mut on = row.available > 0 && count == row.available;
+        let checkbox =
+            egui::Checkbox::without_text(&mut on).indeterminate(count > 0 && count < row.available);
+        let selection = ui
+            .add_enabled(row.available > 0, checkbox)
+            .on_hover_text("Select for a bulk action");
+        if row.available == 0 {
+            selection.on_disabled_hover_text(restriction);
+        } else if selection.changed() {
+            acts.push(MAct::Check(selectable.map(|p| p.identity).collect(), on));
+        }
+        let source = first
+            .image
+            .as_ref()
+            .map(|path| IconSource::Executable(path.clone()))
+            .unwrap_or(IconSource::Generic);
+        icons.show_sized(ui, &source, 22.0);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let end = ui.add_enabled(
+                available && row.available > 0,
+                widgets::small("End task…").min_size(egui::vec2(columns.action - 8.0, 0.0)),
+            );
+            if row.available == 0 { end.on_disabled_hover_text(restriction); }
+            else if end.clicked() { acts.push(MAct::Ask(Operation::End, Selection::Row(row.id.clone()))); }
+            let total = row.members.len();
+            widgets::cell(ui, 57.0, true, widgets::faint(metric(row.cpu_known, total, format!("{:.1}%", row.cpu))));
+            widgets::cell(ui, 83.0, true, widgets::strong(metric(row.memory_known, total, fmt_bytes(row.memory)), 14.0));
+            if columns.wide {
+                widgets::cell(ui, 90.0, true, widgets::dim(metric(row.private_known, total, fmt_bytes(row.private))))
+                    .on_hover_text("Private commit is memory reserved by this process. ~ indicates a partial total.");
+                widgets::cell(ui, 88.0, true, RichText::new(growth_text(row.growth, row.observed_secs))
+                    .color(if row.growth > 0 { WARN } else { TEXT_DIM }))
+                    .on_hover_text("Change in private commit across the available samples, up to 10 minutes.");
+            }
+            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                let label = if scope.individual() { format!("{} · {}", row.name, first.identity.pid) } else { row.title() };
+                let button = ui.add(egui::Button::new(RichText::new(label).color(TEXT)).frame(false).truncate())
+                    .on_hover_text(format!(
+                        "{}\n{}",
+                        first.image.as_ref().map_or_else(|| first.name.clone(), |path| path.display().to_string()),
+                        if row.window_count > 0 { "Open process details and switch windows" } else { "Open process details" }
+                    ));
+                if button.clicked() { acts.push(MAct::Inspect(row.id.clone())); }
+                button.context_menu(|ui| {
+                    if ui.button("Process details").clicked() {
+                        acts.push(MAct::Inspect(row.id.clone()));
+                        ui.close_menu();
+                    }
+                    if ui.add_enabled(available && selectable_window(snapshot, row), egui::Button::new("Close normally…")).clicked() {
+                        acts.push(MAct::Ask(Operation::Close, Selection::Row(row.id.clone())));
+                        ui.close_menu();
+                    }
+                    if let Some(path) = &first.image {
+                        if ui.add_enabled(running::local_image_path(path), egui::Button::new("Open file location")).clicked() {
+                            acts.push(MAct::Location(path.clone()));
+                            ui.close_menu();
+                        }
+                        if ui.button("Copy executable path").clicked() {
+                            ui.ctx().copy_text(path.display().to_string());
+                            ui.close_menu();
+                        }
+                    }
+                });
+            });
+        });
+    });
+}
+
+fn selectable_window(snapshot: &Snapshot, row: &Row) -> bool {
+    members(snapshot, row).any(|p| p.access == Access::Available && !p.windows.is_empty())
+}
+
+fn process_inspector(
+    ui: &mut Ui,
+    snapshot: &Snapshot,
+    row: &Row,
+    mem: &mut MemState,
+    available: bool,
+    acts: &mut Vec<MAct>,
+) {
+    let first = &snapshot.processes[row.members[0]];
+    ui.horizontal_wrapped(|ui| {
+        let icon = first
+            .image
+            .as_ref()
+            .map(|p| IconSource::Executable(p.clone()))
+            .unwrap_or(IconSource::Generic);
+        mem.icons.show(ui, &icon);
+        ui.label(widgets::strong(row.title(), 20.0));
+        if first.windows_component {
+            ui.label(widgets::faint("Windows component"));
+        }
+    });
+    if let Some(path) = &first.image {
+        ui.add(Label::new(widgets::dim(path.display().to_string())).wrap());
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    running::local_image_path(path),
+                    widgets::small("Open file location"),
+                )
+                .clicked()
+            {
+                acts.push(MAct::Location(path.clone()));
+            }
+            if ui.add(widgets::small("Copy path")).clicked() {
+                ui.ctx().copy_text(path.display().to_string());
+            }
+        });
+    }
+    ui.horizontal_wrapped(|ui| {
+        let can_close = selectable_window(snapshot, row);
+        if ui
+            .add_enabled(available && can_close, widgets::small("Close normally…"))
+            .on_disabled_hover_text("A normal close needs an open window.")
+            .clicked()
+        {
+            acts.push(MAct::Ask(Operation::Close, Selection::Row(row.id.clone())));
+        }
+        if ui
+            .add_enabled(available && row.available > 0, widgets::small("End task…"))
+            .clicked()
+        {
+            acts.push(MAct::Ask(Operation::End, Selection::Row(row.id.clone())));
+        }
+        let undo = members(snapshot, row).any(|p| mem.efficiency.contains_key(&p.identity));
+        let mode = if undo {
+            Operation::RestoreEfficiency
+        } else {
+            Operation::Efficiency
+        };
+        if ui
+            .add_enabled(
+                available && row.available > 0,
+                widgets::small(if undo {
+                    "Undo efficiency…"
+                } else {
+                    "Efficiency mode…"
+                }),
+            )
+            .clicked()
+        {
+            acts.push(MAct::Ask(mode, Selection::Row(row.id.clone())));
+        }
+        if ui
+            .add_enabled(available && row.available > 0, widgets::small("Trim RAM…"))
+            .clicked()
+        {
+            acts.push(MAct::Ask(Operation::Trim, Selection::Row(row.id.clone())));
+        }
+    });
+    if row.available == 0 {
+        if let Some(reason) = first.access.restriction() {
+            ui.add(Label::new(widgets::dim(reason)).wrap());
+        }
+    } else if row.window_count == 0 {
+        ui.label(widgets::dim("This group has no open windows on this desktop. Use End task to stop a background process."));
+    }
+    ui.separator();
+    for process in members(snapshot, row) {
+        ui.push_id(process.identity, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(widgets::strong(
+                    format!("PID {}", process.identity.pid),
+                    14.0,
+                ));
+                if process.parent != 0 {
+                    ui.label(widgets::faint(format!("Parent {}", process.parent)));
+                }
+                if let Some(session) = process.session {
+                    ui.label(widgets::faint(format!("Session {session}")));
+                }
+                if let Some(bytes) = process.memory {
+                    ui.label(widgets::dim(format!("{} RAM", fmt_bytes(bytes))));
+                }
+                if let Some(bytes) = process.private {
+                    ui.label(widgets::faint(format!(
+                        "{} private commit",
+                        fmt_bytes(bytes)
+                    )));
+                }
+                if row.members.len() > 1
+                    && ui
+                        .add_enabled(
+                            available && process.access == Access::Available,
+                            widgets::small("End PID…"),
+                        )
+                        .clicked()
+                {
+                    acts.push(MAct::Ask(Operation::End, Selection::Pid(process.identity)));
+                }
+            });
+            if row.members.len() > 1 {
+                if let Some(reason) = process.access.restriction() {
+                    ui.add(Label::new(widgets::faint(reason)).wrap());
+                }
+            }
+            for window in &process.windows {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(process.identity.created != 0, widgets::small("Switch to"))
+                        .clicked()
+                    {
+                        acts.push(MAct::Show(process.identity, window.clone()));
+                    }
+                    ui.add(Label::new(widgets::dim(&window.title)).truncate())
+                        .on_hover_text(&window.title);
+                });
+            }
         });
     }
 }
+
 #[cfg(test)]
 pub(crate) fn preview_fixture() -> MemState {
-    let mut state = MemState {
-        selected: Some("chrome.exe".into()),
-        advanced: true,
+    MemState {
+        icons: IconCache::preview_fixture(),
         ..MemState::default()
-    };
-    state.checked.insert("chrome.exe".into());
-    state.efficiency.insert(
-        (7001, 10),
-        PowerPolicy {
-            control: 0,
-            state: 0,
-        },
-    );
-    state
+    }
 }
+
 #[cfg(test)]
 pub(crate) fn bulk_preview_fixture() -> MemState {
-    let mut state = MemState::default();
-    state.checked.insert("chrome.exe".into());
-    state.checked.insert("code.exe".into());
-    state
+    let mut mem = preview_fixture();
+    mem.checked.extend([7001, 7002, 7003].map(|pid| Identity {
+        pid,
+        created: u64::from(pid) + 1,
+    }));
+    mem
+}
+
+#[cfg(test)]
+pub(crate) fn memory_preview_fixture() -> MemState {
+    let mut mem = preview_fixture();
+    mem.checked.insert(Identity {
+        pid: 7001,
+        created: 7002,
+    });
+    mem
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    struct FakeClose {
-        calls: Vec<(u32, u64)>,
-        exits: HashSet<(u32, u64)>,
-        denied: HashSet<u32>,
-    }
-    impl CloseBackend for FakeClose {
-        fn request(&mut self, target: &MemoryTarget) -> Result<usize, String> {
-            self.calls.push((target.pid, target.start));
-            if self.denied.contains(&target.pid) {
-                Err("Identity changed or protected".into())
-            } else {
-                Ok(1)
-            }
-        }
-        fn exited(&mut self, target: &MemoryTarget) -> bool {
-            self.exits.contains(&(target.pid, target.start))
-        }
-    }
-    fn close_action() -> MemoryAction {
-        MemoryAction {
-            kind: MemoryKind::Close,
-            name: "3 apps".into(),
-            targets: (1..=3)
-                .map(|pid| MemoryTarget {
-                    pid,
-                    start: 10,
-                    restore: None,
-                    app: format!("app{pid}.exe"),
-                })
-                .collect(),
-        }
-    }
     #[test]
-    fn bulk_close_uses_reviewed_identities_and_reports_verified_results() {
-        let mut backend = FakeClose {
-            calls: vec![],
-            exits: [(1, 10)].into(),
-            denied: [3].into(),
+    fn confirmed_group_action_keeps_exact_reviewed_pids_and_allows_explorer() {
+        let mut app = App::test_fixture();
+        let snapshot = &app.sys.processes;
+        let explorer = snapshot
+            .groups
+            .iter()
+            .find(|row| row.name == "explorer.exe")
+            .unwrap();
+        let explorer_id = snapshot.processes[explorer.members[0]].identity;
+        app.review_processes(Operation::End, Selection::Row(explorer.id.clone()));
+        let modal = app.modal.take().unwrap();
+        assert!(modal.note.unwrap().contains("Windows component"));
+        let Action::Memory(action) = modal.action else {
+            panic!("expected a process action")
         };
-        let report = close_apps_with(
-            close_action(),
-            &AtomicBool::new(false),
-            &mut backend,
-            Duration::ZERO,
-        );
-        assert_eq!(backend.calls, vec![(1, 10), (2, 10), (3, 10)]);
-        assert_eq!(report.closed_apps, vec!["app1.exe"]);
-        assert_eq!(report.open_apps, vec!["app2.exe"]);
-        assert_eq!(report.failed.len(), 1);
-        assert_eq!(report.changed.len(), 1);
-        assert!(report.failed[0].contains("Identity changed"));
+        assert_eq!(action.targets.len(), 1);
+        assert_eq!(action.targets[0].id, explorer_id);
     }
+
     #[test]
-    fn canceled_bulk_close_never_sends_remaining_requests() {
-        let mut backend = FakeClose {
-            calls: vec![],
-            exits: HashSet::new(),
-            denied: HashSet::new(),
+    fn pid_search_targets_only_that_instance_and_background_includes_helpers() {
+        let snapshot = running::preview_fixture(1024 * 1024);
+        let mut view = ProcessView {
+            scope: Scope::Background,
+            ..ProcessView::default()
         };
-        let report = close_apps_with(
-            close_action(),
-            &AtomicBool::new(true),
-            &mut backend,
-            Duration::ZERO,
-        );
-        assert!(backend.calls.is_empty());
-        assert!(report.closed_apps.is_empty());
-        assert_eq!(report.failed.len(), 3);
-    }
-
-    fn closing_report(closed: &[&str], open: &[&str], failed: &[&str]) -> MemoryReport {
-        MemoryReport {
-            kind: MemoryKind::Close,
-            name: "apps".into(),
-            attempted: closed.len() + open.len() + failed.len(),
-            changed: Vec::new(),
-            before: 0,
-            after: 0,
-            failed: failed.iter().map(|s| s.to_string()).collect(),
-            closed_apps: closed.iter().map(|s| s.to_string()).collect(),
-            open_apps: open.iter().map(|s| s.to_string()).collect(),
-        }
+        let indices = view.rows(&snapshot, &snapshot.individuals, Scope::Background);
+        assert!(indices.iter().any(|&i| snapshot.individuals[i].id
+            == RowId::Process(Identity {
+                pid: 7002,
+                created: 7003
+            })));
+        assert!(!indices
+            .iter()
+            .any(|&i| snapshot.individuals[i].window_count > 0));
+        view.filter = "7002".into();
+        let indices = view.rows(&snapshot, &snapshot.individuals, Scope::Pid);
+        assert_eq!(indices.len(), 1);
+        let row = &snapshot.individuals[indices[0]];
+        assert_eq!(row.members.len(), 1);
+        assert_eq!(snapshot.processes[row.members[0]].identity.pid, 7002);
     }
 
     #[test]
-    fn close_summary_reports_only_verified_exits_as_closed() {
-        let text = close_summary(&closing_report(
-            &["a.exe"],
-            &["b.exe"],
-            &["c.exe: no windows"],
-        ));
-        assert!(text.contains("Closed a.exe."));
-        assert!(text.contains("b.exe still open"));
-        assert!(text.contains("1 app could not be asked to close."));
-        let none = close_summary(&closing_report(&[], &[], &[]));
-        assert_eq!(none, "No apps were changed.");
-    }
-
-    #[test]
-    fn long_name_lists_stay_readable() {
-        let names: Vec<String> = (1..=5).map(|i| format!("app{i}.exe")).collect();
-        assert_eq!(list_names(&names[..2]), "app1.exe, app2.exe");
-        assert_eq!(list_names(&names), "app1.exe, app2.exe and 3 more");
-    }
-
-    #[test]
-    fn unreadable_private_memory_is_shown_as_unavailable_not_zero() {
-        let mut group = ProcGroup {
-            name: "elevated.exe".into(),
-            count: 2,
-            mem: 1024,
-            cpu: 0.0,
-            private_bytes: 0,
-            private_known: 0,
-            growth: 0,
-            observed_secs: 0,
-            pids: vec![10, 11],
+    fn close_review_only_includes_processes_that_can_receive_window_messages() {
+        let mut app = App::test_fixture();
+        app.mem
+            .checked
+            .extend([7001, 7002, 7011].map(|pid| Identity {
+                pid,
+                created: u64::from(pid) + 1,
+            }));
+        app.review_processes(Operation::Close, Selection::Checked);
+        let modal = app.modal.take().unwrap();
+        let Action::Memory(action) = modal.action else {
+            panic!("expected a process action")
         };
-        assert_eq!(private_text(&group), "unavailable");
-        group.private_known = 1;
-        group.private_bytes = 2048;
-        assert_eq!(private_text(&group), "~2.00 KB");
+        assert_eq!(action.targets.len(), 1);
+        assert_eq!(action.targets[0].id.pid, 7001);
+        app.review_processes(Operation::End, Selection::Checked);
+        let Action::Memory(action) = app.modal.take().unwrap().action else {
+            panic!("expected a process action")
+        };
+        assert_eq!(action.targets.len(), 3);
     }
 
     #[test]
-    fn protected_and_own_processes_cannot_be_selected() {
-        let mut group = ProcGroup {
-            name: "explorer.exe".into(),
-            count: 1,
-            mem: 1,
-            cpu: 0.0,
-            private_bytes: 0,
-            private_known: 0,
-            growth: 0,
-            observed_secs: 0,
-            pids: vec![42],
+    fn stopping_a_batch_keeps_reviewed_processes_untouched() {
+        let action = MemoryAction {
+            operation: Operation::End,
+            targets: vec![Target {
+                id: Identity {
+                    pid: 1234,
+                    created: 99,
+                },
+                name: "Test".into(),
+                windows: Vec::new(),
+                original: None,
+            }],
         };
-        assert!(!eligible(&group));
-        group.name = "notepad.exe".into();
-        assert!(eligible(&group));
-        group.pids.push(std::process::id());
-        assert!(!eligible(&group));
-    }
-    #[test]
-    fn memory_growth_preserves_sign_and_waits_for_observation() {
-        assert_eq!(growth_text(4, 0), "measuring");
-        assert_eq!(growth_text(1024, 4), "+1.00 KB");
-        assert_eq!(growth_text(-1024, 4), "−1.00 KB");
-        assert_eq!(growth_text(0, 4), "0 B");
+        let report = run_operation(action, &AtomicBool::new(true));
+        assert!(report.rows[0].outcome == Outcome::Failed);
+        assert!(report.rows[0].detail.contains("stopped"));
     }
 }

@@ -129,10 +129,6 @@ pub enum Action {
         items: Vec<(PathBuf, u64)>,
         origin: Origin,
     },
-    Kill {
-        pids: Vec<(u32, u64)>,
-        name: String,
-    },
     RunTool(usize),
     Uninstall(crate::apps::InstalledApp),
     RemoveLeftovers(crate::leftovers::Target, Vec<crate::leftovers::Candidate>),
@@ -454,26 +450,6 @@ impl App {
                 self.analyzer.recycle = Task::spawn(ctx, move || util::recycle_checked(items));
             }
             Action::Recycle { items, origin } => self.start_recycle(items, origin, ctx),
-            Action::Kill { pids, name } => {
-                let n = self.sys.kill(&pids);
-                util::log(format!("Ended {name} ({n} process(es))"));
-                if n == pids.len() && n > 0 {
-                    self.toast(ToastKind::Success, format!("Ended {name}"));
-                } else if n > 0 {
-                    self.toast(
-                        ToastKind::Info,
-                        format!(
-                        "Ended {n} of {} processes for {name}. Some exited or could not be ended.",
-                        pids.len()
-                    ),
-                    );
-                } else {
-                    self.toast(
-                        ToastKind::Error,
-                        format!("{name} could not be ended. It may need administrator rights."),
-                    );
-                }
-            }
             Action::RunTool(i) => self.start_tool(i, ctx),
             Action::Uninstall(app) => self.launch_uninstall(&app, ctx),
             Action::RemoveLeftovers(target, items) => {
@@ -513,7 +489,7 @@ impl App {
         self.poll_apps(ctx);
         self.poll_leftovers(ctx);
         self.poll_tools();
-        self.poll_memory();
+        self.poll_memory(ctx);
         self.poll_privacy(ctx);
         self.poll_preferences(ctx);
         self.poll_security(ctx);
@@ -873,7 +849,7 @@ impl App {
             startup: Default::default(),
             apps: crate::apps::preview_fixture(),
             tools: Default::default(),
-            mem: crate::processes::preview_fixture(),
+            mem: crate::processes::memory_preview_fixture(),
             privacy: crate::privacy::preview_fixture(),
             preferences: crate::preferences::preview_fixture(),
             security: crate::security::preview_fixture(),
@@ -1152,7 +1128,8 @@ impl eframe::App for App {
         if ctx.style().visuals.panel_fill != theme::BG {
             theme::apply(ctx);
         }
-        let want_procs = matches!(self.page, Page::Dashboard | Page::Memory);
+        let want_procs = matches!(self.page, Page::Dashboard | Page::Memory)
+            || (self.page == Page::Background && self.background.showing_processes());
         self.sys.tick(want_procs);
         self.poll(ctx);
 

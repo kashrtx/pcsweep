@@ -369,6 +369,13 @@ fn render_page(page: Page, size: [u32; 2], path: &Path, pending_dns: bool) {
     let mut app = App::test_fixture();
     app.page = page;
     populate_page_fixture(&mut app, page);
+    if page == Page::Background
+        && path
+            .file_stem()
+            .is_some_and(|s| s.to_string_lossy().starts_with("scheduled-tasks"))
+    {
+        app.background.show_task_preview();
+    }
     if pending_dns {
         app.ads = crate::ads::trial_preview_fixture();
     }
@@ -522,6 +529,12 @@ fn all_management_pages_render_at_minimum_and_default_window_sizes() {
             render_page(page, size, &path, false);
         }
     }
+    render_page(
+        Page::Background,
+        [1040, 680],
+        &directory.join("scheduled-tasks-1040x680.png"),
+        false,
+    );
     for size in [[1040, 680], [1320, 860]] {
         let path = directory.join(format!("dns-trial-{}x{}.png", size[0], size[1]));
         render_page(Page::Ads, size, &path, true);

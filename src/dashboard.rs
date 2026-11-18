@@ -349,14 +349,14 @@ impl App {
                                 self.sys.cpu
                             )));
                         });
-                        let groups = self.sys.groups();
-                        let max = groups.first().map(|g| g.mem).unwrap_or(1).max(1) as f32;
+                        let groups = &self.sys.processes.groups;
+                        let max = groups.first().map(|g| g.memory).unwrap_or(1).max(1) as f32;
                         for g in groups.iter().take(4) {
                             ui.horizontal(|ui| {
                                 widgets::cell(ui, 190.0, false, RichText::new(&g.name).color(TEXT_DIM));
                                 let bw = (ui.available_width() - 90.0).max(20.0);
-                                widgets::bar(ui, g.mem as f32 / max, ACCENT_STRONG, egui::vec2(bw, 6.0));
-                                widgets::cell(ui, 80.0, true, widgets::faint(fmt_bytes(g.mem)));
+                                widgets::bar(ui, g.memory as f32 / max, ACCENT_STRONG, egui::vec2(bw, 6.0));
+                                widgets::cell(ui, 80.0, true, widgets::faint(fmt_bytes(g.memory)));
                             });
                         }
                     });

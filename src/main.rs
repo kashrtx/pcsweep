@@ -23,6 +23,7 @@ mod power;
 mod preferences;
 mod privacy;
 mod processes;
+mod running;
 mod scan_cache;
 mod security;
 mod speed;
