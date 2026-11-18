@@ -1731,7 +1731,7 @@ fn home_service_choice_and_restore_are_direct_and_managed_controls_stay_disabled
     }
 }
 
-fn analyzer_selection_fixture(app: &mut App) {
+fn analyzer_selection_fixture(app: &mut App, root: &Path) {
     use crate::analyzer::{Node, NodeKind, ScanResult};
     let mb = 1024 * 1024;
     let children = vec![
@@ -1779,7 +1779,7 @@ fn analyzer_selection_fixture(app: &mut App) {
     app.page = Page::Analyzer;
     app.analyzer.result = Some(
         ScanResult {
-            root_path: r"C:\Users\Preview\Videos".into(),
+            root_path: root.to_path_buf(),
             root: Node {
                 name: "Videos".into(),
                 size: 37 * mb,
@@ -1807,7 +1807,12 @@ fn analyzer_filter_sort_and_multi_selection_review_only_shown_eligible_files() {
     theme::setup_fonts(&ctx);
     theme::apply(&ctx);
     let mut app = App::test_fixture();
-    analyzer_selection_fixture(&mut app);
+    let dir =
+        std::env::temp_dir().join(format!("pcsweep-analyzer-review-ui-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("alpha.tmp"), b"review alpha").unwrap();
+    std::fs::write(dir.join("zebra.tmp"), b"review zebra").unwrap();
+    analyzer_selection_fixture(&mut app, &dir);
     let mut painter = CpuPainter::default();
     let mut output = None;
     for _ in 0..7 {
@@ -1872,15 +1877,22 @@ fn analyzer_filter_sort_and_multi_selection_review_only_shown_eligible_files() {
     let recycle = text_rect(&output, "Move selected to Recycle Bin…");
     let output = shipment_frame(&ctx, &mut app, size, click_at(recycle.center()));
     upload_preview_textures(&mut painter, &output);
+    assert!(app.analyzer.selection_check.running());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.analyzer.selection_check.running() {
+        app.poll_analyzer();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "file review must finish"
+        );
+        std::thread::yield_now();
+    }
     let modal = app
         .modal
         .as_ref()
         .expect("multi-selection opens a reviewed Recycle Bin action");
     match &modal.action {
-        Action::Recycle {
-            items,
-            origin: crate::app::Origin::Analyzer,
-        } => assert_eq!(items.len(), 2),
+        Action::RecycleChecked(items) => assert_eq!(items.len(), 2),
         _ => panic!("expected analyzer recycling review"),
     }
     assert!(
@@ -1937,6 +1949,7 @@ fn analyzer_filter_sort_and_multi_selection_review_only_shown_eligible_files() {
         !app.analyzer.scan.running(),
         "reading and filtering saved data cannot start a rescan"
     );
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -2098,6 +2111,9 @@ fn enlarged_bold_interface_keeps_all_pages_reachable() {
                     !visible_texts(&scrolled, "chrome.exe (2)").is_empty(),
                     "enlarged memory lists must remain reachable by scrolling"
                 );
+                let end = text_rect(&scrolled, "End task…");
+                let chrome = text_rect(&scrolled, "chrome.exe (2)");
+                assert!(end.left() > chrome.right());
                 save_shipment_preview(
                     &ctx,
                     &painter,
@@ -2150,5 +2166,55 @@ fn uninstaller_confidence_review_is_visible_and_starts_unselected() {
         &output,
         [1040, 680],
         "uninstaller-leftovers-review.png",
+    );
+}
+
+#[test]
+fn background_process_end_task_reviews_the_exact_pid_at_compact_size() {
+    let size = [900, 520];
+    let ctx = egui::Context::default();
+    theme::setup_fonts(&ctx);
+    theme::apply(&ctx);
+    let mut app = App::test_fixture();
+    app.page = Page::Background;
+    app.mem = crate::processes::preview_fixture();
+    let mut painter = CpuPainter::default();
+    let mut output = None;
+    for _ in 0..8 {
+        let frame = shipment_frame(&ctx, &mut app, size, Vec::new());
+        upload_preview_textures(&mut painter, &frame);
+        output = Some(frame);
+    }
+    let output = output.unwrap();
+    text_rect(&output, "Running processes");
+    let name = text_rect(&output, "sync-agent.exe · 7011");
+    let end = visible_texts(&output, "End task…")
+        .into_iter()
+        .find(|button| (button.center().y - name.center().y).abs() < 4.0)
+        .expect("background process must have a visible End task");
+    let _ = shipment_frame(&ctx, &mut app, size, click_at(end.center()));
+    let modal = app.modal.as_ref().expect("End task must open a review");
+    assert_eq!(modal.title, "End sync-agent.exe?");
+    assert_eq!(modal.details.len(), 1);
+    assert!(modal.details[0].contains("PID 7011"));
+    assert!(
+        !app.mutations_running(),
+        "opening the review must not end a process"
+    );
+    let mut review = None;
+    for _ in 0..6 {
+        let frame = shipment_frame(&ctx, &mut app, size, Vec::new());
+        upload_preview_textures(&mut painter, &frame);
+        review = Some(frame);
+    }
+    let review = review.unwrap();
+    text_rect(&review, "End task");
+    text_rect(&review, "Cancel");
+    save_shipment_preview(
+        &ctx,
+        &painter,
+        &review,
+        size,
+        "background-end-task-review.png",
     );
 }

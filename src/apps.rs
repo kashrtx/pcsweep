@@ -11,6 +11,7 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::os::windows::process::CommandExt;
 use std::process::Command;
+use std::time::Instant;
 use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
 use winreg::RegKey;
 
@@ -335,36 +336,12 @@ pub(crate) fn inventory() -> AppInventory {
         }
         Err(error) => Some(error),
     };
-    // Executable-path matching gives useful context without claiming that a
-    // display-name guess proves which app owns a process or startup entry.
-    let mut system = sysinfo::System::new();
-    system.refresh_processes();
-    let processes: Vec<String> = system
-        .processes()
-        .values()
-        .filter_map(|p| p.exe())
-        .map(util::norm)
-        .collect();
-    let startup: Vec<String> = crate::startup::list()
-        .into_iter()
-        .filter(|s| s.enabled)
-        .filter_map(|s| crate::startup::exe_from_command(&s.command))
-        .map(|p| util::norm(&p))
-        .collect();
-    for app in &mut list {
-        if !app.location.trim().is_empty() {
-            let root = util::norm(std::path::Path::new(&app.location));
-            if root.len() > 3 {
-                app.running = Some(processes.iter().any(|p| util::is_within(p, &root)));
-                app.startup = Some(startup.iter().any(|p| util::is_within(p, &root)));
-            }
-        }
-    }
     AppInventory { list, store_error }
 }
 
 pub struct AppsState {
     pub list: Vec<InstalledApp>,
+    usage_updated: Option<(Option<Instant>, Option<Instant>)>,
     pub loaded: bool,
     pub load: Task<AppInventory>,
     pub sort: AppSort,
@@ -389,6 +366,7 @@ impl Default for AppsState {
     fn default() -> Self {
         Self {
             list: Vec::new(),
+            usage_updated: None,
             loaded: false,
             load: Task::default(),
             sort: AppSort::Size,
@@ -446,6 +424,7 @@ impl App {
             match r {
                 Ok(out) => {
                     self.apps.list = out.list;
+                    self.apps.usage_updated = None;
                     self.apps.loaded = true;
                     self.apps.store_error = out.store_error;
                     let available: HashSet<String> = self
@@ -466,6 +445,9 @@ impl App {
                     format!("Couldn't read installed apps: {e}"),
                 ),
             }
+        }
+        if self.page == crate::app::Page::Apps {
+            self.refresh_app_usage();
         }
         if let Some(r) = self.apps.update_scan.poll() {
             self.apps.updates_checked = true;
@@ -500,6 +482,46 @@ impl App {
             if self.apps.refresh_updates {
                 self.start_app_updates(ctx);
             }
+        }
+    }
+
+    fn refresh_app_usage(&mut self) {
+        let sample = (self.sys.processes.sampled_at, self.startup.sampled_at);
+        if self.apps.usage_updated == Some(sample) {
+            return;
+        }
+        self.apps.usage_updated = Some(sample);
+        // Keep badges synchronized with the same inventories shown on the
+        // process and startup pages. Only a known executable path is evidence.
+        let running: Vec<_> = self
+            .sys
+            .processes
+            .groups
+            .iter()
+            .filter_map(|row| match &row.id {
+                crate::running::RowId::Image(path, _) => Some(path.as_str()),
+                crate::running::RowId::Process(_) => None,
+            })
+            .collect();
+        let startup: Vec<_> = self
+            .startup
+            .items
+            .iter()
+            .filter(|item| item.enabled)
+            .filter_map(|item| item.file.as_deref())
+            .map(util::norm)
+            .collect();
+        for app in &mut self.apps.list {
+            let root = util::norm(std::path::Path::new(&app.location));
+            if root.len() <= 3 {
+                continue;
+            }
+            app.running = sample
+                .0
+                .map(|_| running.iter().any(|path| util::is_within(path, &root)));
+            app.startup = sample
+                .1
+                .map(|_| startup.iter().any(|path| util::is_within(path, &root)));
         }
     }
 

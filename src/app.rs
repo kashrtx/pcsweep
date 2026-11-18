@@ -17,7 +17,7 @@ use eframe::egui::{
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Page {
     Dashboard,
     Cleaner,
@@ -115,20 +115,11 @@ pub struct Toast {
     pub born: Instant,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Origin {
-    Analyzer,
-    Duplicates,
-}
-
 /// Everything that changes the system goes through a confirmation dialog first.
 pub enum Action {
     QuitApp,
     CleanJunk,
-    Recycle {
-        items: Vec<(PathBuf, u64)>,
-        origin: Origin,
-    },
+    RecycleDuplicates(Vec<(PathBuf, u64)>),
     RunTool(usize),
     Uninstall(crate::apps::InstalledApp),
     RemoveLeftovers(crate::leftovers::Target, Vec<crate::leftovers::Candidate>),
@@ -197,6 +188,7 @@ pub struct App {
     keep_background: bool,
     background_hidden: bool,
     app_options_open: bool,
+    start_elevated: bool,
     tray_error: Option<String>,
     pub(crate) force_exit: bool,
     pub(crate) appearance: crate::appearance::Appearance,
@@ -233,20 +225,26 @@ impl App {
                     self.page = Page::Updates;
                     self.begin_update_check(ctx);
                 }
-                crate::tray::TrayEvent::Quit => {
-                    if self.mutations_running() {
-                        self.show_from_background(ctx);
-                        self.modal = Some(Modal {
-                            title: "Quit while an operation is running?".into(),
-                            body: "An active cleanup, download or Windows change may be interrupted. Completed changes remain applied; unfinished history may be uncertain. You can keep PCSweep running in the background until it finishes.".into(),
-                            details: Vec::new(), note: None, confirm: "Quit anyway".into(), danger: true, action: Action::QuitApp,
-                        });
-                    } else {
-                        self.force_exit = true;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                }
+                crate::tray::TrayEvent::Quit => self.request_quit(ctx),
             }
+        }
+    }
+
+    fn request_quit(&mut self, ctx: &egui::Context) {
+        if self.mutations_running() {
+            self.show_from_background(ctx);
+            self.modal = Some(Modal {
+                title: "Quit while an operation is running?".into(),
+                body: "Quitting can interrupt the current operation. Any changes already applied will stay in place.".into(),
+                details: Vec::new(),
+                note: None,
+                confirm: "Quit anyway".into(),
+                danger: true,
+                action: Action::QuitApp,
+            });
+        } else {
+            self.force_exit = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 
@@ -258,7 +256,7 @@ impl App {
         let mut keep = self.keep_background;
         let mut automatic = self.updates.automatic_checks();
         let previous_appearance = self.appearance.clone();
-        let mut elevated = crate::appearance::start_elevated();
+        let mut elevated = self.start_elevated;
         egui::Window::new("PCSweep options").open(&mut open).collapsible(false).resizable(false).default_width(480.0).vscroll(true).show(ctx, |ui| {
             ui.add(egui::Label::new("Choose how PCSweep stays available. No background cleanup, speed tests or Windows changes run automatically.").wrap());
             ui.add_space(8.0);
@@ -293,8 +291,9 @@ impl App {
             theme::setup_fonts(ctx);
             theme::fit_to_viewport(ctx);
         }
-        if elevated != crate::appearance::start_elevated() {
+        if elevated != self.start_elevated {
             crate::appearance::set_start_elevated(elevated);
+            self.start_elevated = elevated;
         }
         if keep != self.keep_background {
             self.keep_background = keep;
@@ -357,6 +356,7 @@ impl App {
             keep_background,
             background_hidden: false,
             app_options_open: false,
+            start_elevated: crate::appearance::start_elevated(),
             tray_error: None,
             force_exit: false,
             appearance: Default::default(),
@@ -374,7 +374,7 @@ impl App {
             env!("CARGO_PKG_VERSION"),
             if is_admin { " as administrator" } else { "" }
         ));
-        app.startup.reload();
+        app.startup.reload(&cc.egui_ctx);
         app.restore_scan_caches(&cc.egui_ctx);
         app.start_apps_load(&cc.egui_ctx);
         app.apps.leftovers.restore = Task::spawn(&cc.egui_ctx, || {
@@ -409,31 +409,6 @@ impl App {
         }
     }
 
-    fn start_recycle(&mut self, items: Vec<(PathBuf, u64)>, origin: Origin, ctx: &egui::Context) {
-        if self.cleaner.clean.running()
-            || self.analyzer.recycle.running()
-            || self.dups.recycle.running()
-        {
-            self.toast(
-                ToastKind::Info,
-                "A cleanup is already running. Wait for it to finish before moving more files.",
-            );
-            return;
-        }
-        match origin {
-            Origin::Analyzer => {
-                self.analyzer.recycle =
-                    Task::spawn(ctx, move || util::recycle(items, "Space analyzer"));
-            }
-            Origin::Duplicates => {
-                let groups = self.dups.groups.clone().unwrap_or_default();
-                self.dups.recycle = Task::spawn(ctx, move || {
-                    crate::duplicates::recycle_verified(items, groups)
-                });
-            }
-        }
-    }
-
     fn execute(&mut self, action: Action, ctx: &egui::Context) {
         let resolving_dns = matches!(&action, Action::Ads(action) if action.is_resolution());
         if self.mutations_running() && !resolving_dns && !matches!(action, Action::QuitApp) {
@@ -449,7 +424,12 @@ impl App {
             Action::RecycleChecked(items) => {
                 self.analyzer.recycle = Task::spawn(ctx, move || util::recycle_checked(items));
             }
-            Action::Recycle { items, origin } => self.start_recycle(items, origin, ctx),
+            Action::RecycleDuplicates(items) => {
+                let groups = self.dups.groups.clone().unwrap_or_default();
+                self.dups.recycle = Task::spawn(ctx, move || {
+                    crate::duplicates::recycle_verified(items, groups)
+                });
+            }
             Action::RunTool(i) => self.start_tool(i, ctx),
             Action::Uninstall(app) => self.launch_uninstall(&app, ctx),
             Action::RemoveLeftovers(target, items) => {
@@ -486,6 +466,7 @@ impl App {
         self.poll_cleaner(ctx);
         self.poll_analyzer();
         self.poll_duplicates();
+        self.poll_startup(ctx);
         self.poll_apps(ctx);
         self.poll_leftovers(ctx);
         self.poll_tools();
@@ -519,6 +500,7 @@ impl App {
             || self.analyzer.recycle.running()
             || self.dups.recycle.running()
             || self.apps.busy()
+            || self.startup.busy()
             || self.mem.job.running()
             || self.privacy.busy()
             || self.preferences.busy()
@@ -551,6 +533,7 @@ impl App {
             || self.dups.scan.running()
             || self.dups.recycle.running()
             || self.apps.load.running()
+            || self.startup.working()
             || self.relaunch.running()
             || self.tools.run.as_ref().map_or(false, |r| !r.is_done())
             || !self.toasts.is_empty()
@@ -737,9 +720,6 @@ impl App {
                     let response =
                         widgets::nav_item(ui, icon_char, label, self.page == page, badge);
                     if response.clicked() {
-                        if page == Page::Startup {
-                            self.startup.reload();
-                        }
                         self.page = page;
                     }
                     ui.add_space(1.0);
@@ -821,9 +801,19 @@ impl App {
         if self.appearance.scale > 100 {
             // Keep full controls reachable at enlarged text sizes instead
             // of shrinking the user's chosen text back down to fit.
-            let area = ui.available_size().max(vec2(640.0, 680.0));
+            let available = ui.available_size();
+            let gutter = ui.spacing().scroll.allocated_width();
+            let min_width = if matches!(self.page, Page::Memory | Page::Background) {
+                606.0
+            } else {
+                640.0
+            };
+            let area = vec2(
+                (available.x - gutter).max(min_width),
+                available.y.max(680.0),
+            );
             egui::ScrollArea::both()
-                .id_salt("readable_page")
+                .id_salt(("readable_page", self.page))
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     // A bounded page canvas keeps virtualized inner lists
@@ -875,6 +865,7 @@ impl App {
             keep_background: false,
             background_hidden: false,
             app_options_open: false,
+            start_elevated: false,
             tray_error: None,
             force_exit: false,
             appearance: Default::default(),
@@ -1100,12 +1091,15 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_tray(ctx);
-        if ctx.input(|i| i.viewport().close_requested())
-            && hide_on_close(self.force_exit, self.keep_background, self.tray.available())
-        {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            self.background_hidden = true;
+        if !self.force_exit && ctx.input(|i| i.viewport().close_requested()) {
+            if hide_on_close(self.force_exit, self.keep_background, self.tray.available()) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                self.background_hidden = true;
+            } else if self.mutations_running() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.request_quit(ctx);
+            }
         }
         let needs_native_tick =
             self.background_hidden || ctx.input(|i| i.viewport().minimized == Some(true));
@@ -1128,7 +1122,7 @@ impl eframe::App for App {
         if ctx.style().visuals.panel_fill != theme::BG {
             theme::apply(ctx);
         }
-        let want_procs = matches!(self.page, Page::Dashboard | Page::Memory)
+        let want_procs = matches!(self.page, Page::Dashboard | Page::Memory | Page::Apps)
             || (self.page == Page::Background && self.background.showing_processes());
         self.sys.tick(want_procs);
         self.poll(ctx);

@@ -735,6 +735,15 @@ impl IconCache {
 mod tests {
     use super::*;
     #[test]
+    fn running_executable_icon_loads_the_native_explorer_resource() {
+        let system = crate::platform::system_directory().unwrap();
+        let path = system.parent().unwrap().join("explorer.exe");
+        let icon = load_icon(&IconSource::Executable(path)).expect("Explorer has a native icon");
+        assert_eq!(icon.size, [ICON_SIZE, ICON_SIZE]);
+        assert!(icon.rgba.chunks_exact(4).any(|pixel| pixel[3] > 0));
+    }
+
+    #[test]
     fn display_icon_parses_quotes_commas_environment_and_signed_resource_ids() {
         assert_eq!(
             parse_display_icon(r#""C:\Apps\A,B\app.exe",-123"#),

@@ -1,4 +1,4 @@
-use crate::app::{Action, App, Modal, Origin, Page, ToastKind};
+use crate::app::{Action, App, Modal, Page, ToastKind};
 use crate::task::Task;
 use crate::theme::*;
 use crate::util::{self, fmt_age, fmt_bytes, fmt_num};
@@ -1019,7 +1019,7 @@ pub struct AnalyzerState {
     pub old_min: u64,
     pub recycle: Task<util::RecycleReport>,
     pub journal_error: Option<String>,
-    pub selection_check: Task<Result<Vec<util::CheckedPath>, String>>,
+    pub selection_check: Task<Result<util::SelectionReview, String>>,
 }
 
 impl Default for AnalyzerState {
@@ -1339,11 +1339,7 @@ impl App {
         if self.modal.is_none() && !self.mutations_running() {
             if let Some(result) = self.analyzer.selection_check.poll() {
                 match result.and_then(|r| r) {
-                    Ok(items) if !items.is_empty() => {
-                        let total = items.iter().map(|p| p.size).sum();
-                        self.modal=Some(Modal{title:format!("Move {} to the Recycle Bin?",fmt_bytes(total)),body:format!("{} selected items were checked on disk now. They will be checked again before moving. You can restore them from the Recycle Bin.",items.len()),details:items.iter().map(|p|format!("{} ({})",p.path.display(),fmt_bytes(p.size))).collect(),note:Some("This review uses current files, so you do not need to remap the drive. Whole folders include all their contents.".into()),confirm:"Move to Recycle Bin".into(),danger:true,action:Action::RecycleChecked(items)});
-                    }
-                    Ok(_) => self.toast(ToastKind::Info, "No eligible files were selected."),
+                    Ok(review) => self.finish_analyzer_review(review),
                     Err(e) => self.toast(ToastKind::Error, e),
                 }
             }
@@ -1469,16 +1465,7 @@ impl App {
                 }
                 AAct::SelectMany(v) => self.analyzer.selected.extend(v),
                 AAct::ClearSel => self.analyzer.selected.clear(),
-                AAct::AskRecycle(items) => {
-                    if self.analyzer.cache.read_only {
-                        if !self.analyzer.selection_check.running() {
-                            self.analyzer.selection_check =
-                                Task::spawn(&ctx, move || util::check_selected(items));
-                        }
-                    } else {
-                        self.ask_recycle(items, Origin::Analyzer);
-                    }
-                }
+                AAct::AskRecycle(items) => self.review_analyzer_selection(items, &ctx),
                 AAct::OldMonths(m) => self.analyzer.old_months = m,
                 AAct::OldMin(b) => self.analyzer.old_min = b,
                 AAct::Filter(s) => self.analyzer.filter = s,
@@ -1487,74 +1474,64 @@ impl App {
         self.remember_analyzer();
     }
 
-    /// Shared confirmation for moving user files to the Recycle Bin.
-    pub fn ask_recycle(&mut self, items: Vec<(PathBuf, u64)>, origin: Origin) {
-        if origin == Origin::Analyzer && self.analyzer.cache.read_only {
-            self.toast(
-                ToastKind::Info,
-                "Refresh this saved map before moving files, then review the current results.",
+    fn review_analyzer_selection(&mut self, items: Vec<(PathBuf, u64)>, ctx: &egui::Context) {
+        if !self.analyzer.selection_check.running()
+            && !self.analyzer.recycle.running()
+            && !items.is_empty()
+        {
+            self.analyzer.selection_check = Task::spawn(ctx, move || util::check_selected(items));
+        }
+    }
+
+    fn finish_analyzer_review(&mut self, review: util::SelectionReview) {
+        if review.items.is_empty() {
+            let message = review.skipped.first().map_or_else(
+                || "No eligible files were selected.".into(),
+                |(path, reason)| format!("{} could not be moved. {reason}", path.display()),
             );
+            self.toast(ToastKind::Info, message);
             return;
         }
-        if origin == Origin::Duplicates && self.dups.saved_requires_refresh() {
-            self.toast(ToastKind::Info, "Refresh the saved duplicate scan before moving files, then review the current results.");
-            return;
-        }
-        let items: Vec<(PathBuf, u64)> = items
-            .into_iter()
-            .filter(|(p, _)| util::block_reason_fast(p).is_none())
-            .collect();
-        if items.is_empty() {
-            self.toast(
-                ToastKind::Info,
-                "Nothing to move. Protected items can't be selected.",
-            );
-            return;
-        }
-        let total: u64 = items.iter().map(|i| i.1).sum();
-        let mut details: Vec<String> = items
+        let total = review
+            .items
             .iter()
-            .take(12)
-            .map(|(p, s)| format!("{}  ({})", p.display(), fmt_bytes(*s)))
-            .collect();
-        if items.len() > 12 {
-            details.push(format!("…and {} more", items.len() - 12));
-        }
-        let appdata = items.iter().any(|(p, _)| util::in_appdata(p));
-        let any_dir = items.iter().any(|(p, _)| p.is_dir());
-        // USB drives and network shares have no Recycle Bin: Windows deletes permanently there.
-        let removable: Vec<String> = self
-            .sys
-            .drives
+            .fold(0u64, |size, item| size.saturating_add(item.size));
+        let mut details: Vec<_> = review
+            .items
             .iter()
-            .filter(|d| d.removable)
-            .map(|d| util::norm(Path::new(&d.mount)))
+            .map(|p| format!("{} ({})", p.path.display(), fmt_bytes(p.size)))
             .collect();
-        let permanent = items.iter().any(|(p, _)| {
-            let n = util::norm(p);
-            n.starts_with(r"\\") || removable.iter().any(|r| util::is_within(&n, r))
-        });
-        let mut notes = Vec::new();
-        if permanent {
-            notes.push("Some items are on a USB or network drive, which has no Recycle Bin, so they will be deleted permanently.");
+        details.extend(
+            review
+                .skipped
+                .iter()
+                .map(|(p, reason)| format!("Kept {}. {reason}", p.display())),
+        );
+        let mut body = format!("Move {} checked items to the Recycle Bin. The listed items will be checked again before they are moved.", review.items.len());
+        if !review.skipped.is_empty() {
+            body.push_str(&format!(
+                " {} other items will be kept.",
+                review.skipped.len()
+            ));
         }
-        if appdata {
-            notes.push("Some items are inside AppData and may belong to an installed app.");
-        }
-        if any_dir {
-            notes.push("Whole folders are included.");
-        }
+        let note = if review.items.iter().any(|p| p.folder) {
+            Some(
+                "Whole folders include their contents. You can restore them from the Recycle Bin."
+                    .into(),
+            )
+        } else if review.items.iter().any(|p| util::in_appdata(&p.path)) {
+            Some("AppData can hold settings and saves. You can restore moved files from the Recycle Bin.".into())
+        } else {
+            None
+        };
         self.modal = Some(Modal {
             title: format!("Move {} to the Recycle Bin?", fmt_bytes(total)),
-            body: format!(
-                "{} item(s) will be moved to the Recycle Bin. You can restore them from there. Space is freed once you empty the Recycle Bin.",
-                items.len()
-            ),
+            body,
             details,
-            note: if notes.is_empty() { None } else { Some(notes.join(" ")) },
+            note,
             confirm: "Move to Recycle Bin".into(),
             danger: true,
-            action: Action::Recycle { items, origin },
+            action: Action::RecycleChecked(review.items),
         });
     }
 
@@ -2471,20 +2448,6 @@ mod tests {
             assert!(app.analyzer.cache.recent.len() <= RECENT_MAPS);
         }
     }
-    #[test]
-    fn cached_map_recycle_requires_a_fresh_scan() {
-        let mut app = App::test_fixture();
-        mark_preview_saved(&mut app.analyzer);
-        app.ask_recycle(
-            vec![(PathBuf::from(r"C:\data\old.bin"), 20)],
-            Origin::Analyzer,
-        );
-        assert!(
-            app.modal.is_none(),
-            "a saved map must not authorize file mutations"
-        );
-    }
-
     #[test]
     fn removed_folder_hides_descendants_but_not_neighbors() {
         let removed = HashSet::from([PathBuf::from(r"C:\data\photos")]);

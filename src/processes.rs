@@ -907,13 +907,18 @@ impl App {
                 .collapsible(false)
                 .show(ctx, |ui| {
                     ui.add(Label::new(widgets::strong(report.summary(), 16.0)).wrap());
-                    for row in report.rows.iter().filter(|r| !r.detail.is_empty()) {
+                    for row in &report.rows {
                         ui.separator();
                         ui.label(widgets::strong(
                             format!("{} · PID {}", row.name, row.id.pid),
                             14.0,
                         ));
-                        ui.add(Label::new(widgets::dim(&row.detail)).wrap());
+                        let detail = match row.outcome {
+                            Outcome::Changed if report.operation.closes() => "Exit confirmed",
+                            Outcome::Changed => "Completed",
+                            _ => &row.detail,
+                        };
+                        ui.add(Label::new(widgets::dim(detail)).wrap());
                     }
                 });
         }
@@ -1377,6 +1382,9 @@ fn process_inspector(
                     format!("PID {}", process.identity.pid),
                     14.0,
                 ));
+                if ui.add(widgets::small("Copy PID")).clicked() {
+                    ui.ctx().copy_text(process.identity.pid.to_string());
+                }
                 if process.parent != 0 {
                     ui.label(widgets::faint(format!("Parent {}", process.parent)));
                 }

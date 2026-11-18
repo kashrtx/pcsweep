@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
-use std::os::windows::fs::MetadataExt;
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -475,52 +475,129 @@ pub(crate) fn fixed_local(path: &Path) -> bool {
         unsafe { windows_sys::Win32::Storage::FileSystem::GetDriveTypeW(root.as_ptr()) == 3 }
     })
 }
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CheckedPath {
     pub path: PathBuf,
     pub size: u64,
+    pub folder: bool,
+    file_id: (u32, u64),
     modified: Option<SystemTime>,
     created: Option<SystemTime>,
     tree: Option<u64>,
 }
-pub fn check_selected(items: Vec<(PathBuf, u64)>) -> Result<Vec<CheckedPath>, String> {
+
+pub struct SelectionReview {
+    pub items: Vec<CheckedPath>,
+    pub skipped: Vec<(PathBuf, String)>,
+}
+
+fn check_path(path: &Path) -> Result<CheckedPath, String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
+    };
+    if !fixed_local(path) {
+        return Err("This drive does not provide a fixed local Recycle Bin.".into());
+    }
+    if let Some(reason) = block_reason(path) {
+        return Err(reason.into());
+    }
+    let file = fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    let md = file.metadata().map_err(|e| e.to_string())?;
+    if is_reparse(&md) || md.file_attributes() & CLOUD_MASK != 0 {
+        return Err("Links and cloud placeholders are kept.".into());
+    }
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) } == 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let file_id = (
+        info.dwVolumeSerialNumber,
+        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    );
+    let (tree, size) = if md.is_dir() {
+        let (signature, bytes, _) = crate::leftovers::snapshot_folder(path)?;
+        (Some(signature), bytes)
+    } else if md.is_file() {
+        (None, md.len())
+    } else {
+        return Err("Only ordinary files and folders can be moved.".into());
+    };
+    Ok(CheckedPath {
+        path: path.to_path_buf(),
+        size,
+        folder: md.is_dir(),
+        file_id,
+        modified: md.modified().ok(),
+        created: md.created().ok(),
+        tree,
+    })
+}
+
+pub fn check_selected(mut items: Vec<(PathBuf, u64)>) -> Result<SelectionReview, String> {
     if items.len() > 10_000 {
         return Err("Select fewer than 10,000 items per review.".into());
     }
-    items.into_iter().map(|(path,_)| {
-        if !fixed_local(&path) {
-            return Err("This drive does not provide a fixed local Recycle Bin. Use Explorer to choose how to remove these files.".into());
+    // A folder and one of its descendants can both be selected from file views.
+    // Count the child once and retain it if its parent cannot be moved.
+    items.sort_unstable_by(|a, b| {
+        a.0.components()
+            .count()
+            .cmp(&b.0.components().count())
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    let mut seen = std::collections::HashSet::new();
+    let mut directories = std::collections::HashSet::new();
+    let mut review = SelectionReview {
+        items: Vec::new(),
+        skipped: Vec::new(),
+    };
+    for (path, _) in items {
+        if !seen.insert(norm(&path))
+            || path
+                .ancestors()
+                .skip(1)
+                .any(|p| directories.contains(&norm(p)))
+        {
+            continue;
         }
-        if let Some(reason)=block_reason(&path){return Err(format!("{}: {reason}",path.display()));}
-        let md=fs::symlink_metadata(&path).map_err(|e|format!("{}: {e}",path.display()))?;
-        let (tree,size)=if md.is_dir(){let(sig,bytes,_)=crate::leftovers::snapshot_folder(&path)?;(Some(sig),bytes)}else if md.is_file(){(None,md.len())}else{return Err("Only ordinary files and folders can be selected".into());};
-        Ok(CheckedPath{path,size,modified:md.modified().ok(),created:md.created().ok(),tree})
-    }).collect()
-}
-pub fn recycle_checked(items: Vec<CheckedPath>) -> RecycleReport {
-    let mut good = Vec::new();
-    let mut failed = Vec::new();
-    for item in items {
-        let current = check_selected(vec![(item.path.clone(), item.size)]);
-        match current {
-            Ok(now)
-                if now[0].size == item.size
-                    && now[0].modified == item.modified
-                    && now[0].created == item.created
-                    && now[0].tree == item.tree =>
-            {
-                good.push((item.path, item.size))
+        match check_path(&path) {
+            Ok(item) => {
+                if item.folder {
+                    directories.insert(norm(&path));
+                }
+                review.items.push(item);
             }
-            _ => failed.push((
-                item.path,
-                "Changed since review or no longer eligible; preserved. Check the selection again."
-                    .into(),
-            )),
+            Err(error) => review.skipped.push((path, error)),
         }
     }
-    let mut report = recycle(good, "Space analyzer — verified selection");
-    report.failed.extend(failed);
-    report
+    Ok(review)
+}
+
+pub fn recycle_checked(items: Vec<CheckedPath>) -> RecycleReport {
+    let paths = items
+        .iter()
+        .map(|item| (item.path.clone(), item.size))
+        .collect();
+    let checks: HashMap<_, _> = items
+        .iter()
+        .map(|item| (item.path.as_path(), item))
+        .collect();
+    recycle_with(paths, "Space analyzer", |path| {
+        let expected = checks.get(path).ok_or("This item was not reviewed.")?;
+        let current = check_path(path)?;
+        if &current != *expected {
+            return Err("Changed since review. Check the current file before moving it.".into());
+        }
+        Ok(())
+    })
 }
 
 pub struct RecycleReport {
@@ -533,6 +610,22 @@ pub struct RecycleReport {
 /// Moves user-chosen items to the Recycle Bin (restorable). Protected paths are refused.
 /// Each item is recorded in the cleanup journal first; if it can't be, nothing moves.
 pub fn recycle(items: Vec<(PathBuf, u64)>, source: &str) -> RecycleReport {
+    recycle_with(items, source, |path| {
+        if !fixed_local(path) {
+            return Err("This drive does not provide a fixed local Recycle Bin.".into());
+        }
+        if let Some(reason) = block_reason(path) {
+            return Err(reason.into());
+        }
+        Ok(())
+    })
+}
+
+fn recycle_with(
+    items: Vec<(PathBuf, u64)>,
+    source: &str,
+    verify: impl Fn(&Path) -> Result<(), String>,
+) -> RecycleReport {
     use crate::journal::{Act, Outcome, Session};
     let mut rep = RecycleReport {
         done: Vec::new(),
@@ -574,9 +667,9 @@ pub fn recycle(items: Vec<(PathBuf, u64)>, source: &str) -> RecycleReport {
         };
         let mut outcomes = Vec::with_capacity(batch.len());
         for ((path, size), id) in batch.iter().zip(ids) {
-            if let Some(reason) = block_reason(path) {
-                outcomes.push((id, Outcome::Skipped, Some(reason.into())));
-                rep.failed.push((path.clone(), reason.into()));
+            if let Err(reason) = verify(path) {
+                outcomes.push((id, Outcome::Skipped, Some(reason.clone())));
+                rep.failed.push((path.clone(), reason));
                 continue;
             }
             match trash::delete(path) {
@@ -702,35 +795,93 @@ pub fn settings_path() -> PathBuf {
     log_path().with_file_name("settings.txt")
 }
 
+fn parse_settings(text: &str) -> HashMap<String, String> {
+    text.lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            Some((key.trim().to_owned(), value.trim().to_owned()))
+        })
+        .collect()
+}
+
 /// Simple key=value settings stored next to the activity log.
 pub fn load_settings() -> HashMap<String, String> {
-    let mut m = HashMap::new();
-    if let Ok(text) = fs::read_to_string(settings_path()) {
-        for line in text.lines() {
-            if let Some((k, v)) = line.split_once('=') {
-                m.insert(k.trim().to_string(), v.trim().to_string());
-            }
-        }
-    }
-    m
+    fs::read_to_string(settings_path())
+        .map(|text| parse_settings(&text))
+        .unwrap_or_default()
 }
 
 pub fn save_settings(pairs: &[(String, String)]) {
-    let mut m = load_settings();
-    for (k, v) in pairs {
-        m.insert(k.clone(), v.clone());
+    if let Err(error) = save_settings_at(&settings_path(), pairs) {
+        log(format!("Could not save app settings. {error}"));
     }
-    let mut keys: Vec<&String> = m.keys().collect();
-    keys.sort();
-    let text: String = keys
-        .into_iter()
-        .map(|k| format!("{}={}\n", k, m[k]))
-        .collect();
-    let p = settings_path();
-    if let Some(d) = p.parent() {
-        let _ = fs::create_dir_all(d);
+}
+
+fn save_settings_at(path: &Path, pairs: &[(String, String)]) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    static WRITER: Mutex<()> = Mutex::new(());
+    static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
+    let _guard = WRITER
+        .lock()
+        .map_err(|_| std::io::Error::other("Settings writer unavailable"))?;
+    let mut settings = match fs::read_to_string(path) {
+        Ok(text) => parse_settings(&text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+        Err(error) => return Err(error),
+    };
+    settings.extend(pairs.iter().cloned());
+    let mut entries: Vec<_> = settings.into_iter().collect();
+    entries.sort_unstable();
+    let folder = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("Missing settings folder"))?;
+    fs::create_dir_all(folder)?;
+
+    let new_path = folder.join(format!(
+        "settings-{}-{}.tmp",
+        std::process::id(),
+        NEXT_FILE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&new_path)?;
+    let result = (|| {
+        let text: String = entries
+            .iter()
+            .map(|(key, value)| format!("{key}={value}\n"))
+            .collect();
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        let wide = |path: &Path| {
+            path.as_os_str()
+                .encode_wide()
+                .chain(Some(0))
+                .collect::<Vec<_>>()
+        };
+        let from = wide(&new_path);
+        let to = wide(path);
+        if unsafe {
+            MoveFileExW(
+                from.as_ptr(),
+                to.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(new_path);
     }
-    let _ = fs::write(p, text);
+    result
 }
 
 // ---------------------------------------------------------------- shell
@@ -923,12 +1074,53 @@ mod selected_review_tests {
         let path = dir.join("keep.tmp");
         fs::write(&path, b"before").unwrap();
         let reviewed = check_selected(vec![(path.clone(), 1)]).unwrap();
-        assert_eq!(reviewed[0].size, 6);
+        assert_eq!(reviewed.items[0].size, 6);
         fs::write(&path, b"changed since confirmation").unwrap();
-        let report = recycle_checked(reviewed);
+        let report = recycle_checked(reviewed.items);
         assert!(report.done.is_empty());
         assert_eq!(report.failed.len(), 1);
         assert!(path.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn missing_selection_members_do_not_block_the_rest_of_the_review() {
+        let dir =
+            std::env::temp_dir().join(format!("pcsweep-review-remaining-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let current = dir.join("current.tmp");
+        let missing = dir.join("already-removed.tmp");
+        fs::write(&current, b"present").unwrap();
+        let review = check_selected(vec![(missing.clone(), 20), (current.clone(), 1)]).unwrap();
+        assert_eq!(review.items.len(), 1);
+        assert_eq!(review.items[0].path, current);
+        assert_eq!(review.items[0].size, 7);
+        assert_eq!(review.skipped.len(), 1);
+        assert_eq!(review.skipped[0].0, missing);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn settings_update_preserves_existing_values_and_a_failed_replace() {
+        let dir = std::env::temp_dir().join(format!(
+            "pcsweep-settings-safe-write-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.txt");
+        fs::write(&path, "updates.automatic=1\nclean.Temp=0\n").unwrap();
+        save_settings_at(&path, &[("clean.Temp".into(), "1".into())]).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(parse_settings(&text)["updates.automatic"], "1");
+        assert_eq!(parse_settings(&text)["clean.Temp"], "1");
+
+        let locked = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&path)
+            .unwrap();
+        assert!(save_settings_at(&path, &[("clean.Temp".into(), "0".into())]).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+        drop(locked);
         fs::remove_dir_all(dir).unwrap();
     }
 }

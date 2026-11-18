@@ -1,4 +1,4 @@
-use crate::app::{App, Origin, ToastKind};
+use crate::app::{Action, App, Modal, ToastKind};
 use crate::task::Task;
 use crate::theme::*;
 use crate::util::{self, fmt_bytes, fmt_date, fmt_num};
@@ -694,6 +694,47 @@ impl App {
             .count()
     }
 
+    fn review_duplicates(&mut self, items: Vec<(PathBuf, u64)>) {
+        if self.dups.saved_requires_refresh() {
+            self.toast(
+                ToastKind::Info,
+                "Refresh the saved duplicate scan before moving files.",
+            );
+            return;
+        }
+        let items: Vec<_> = items
+            .into_iter()
+            .filter(|(path, _)| util::block_reason_fast(path).is_none())
+            .collect();
+        if items.is_empty() {
+            self.toast(
+                ToastKind::Info,
+                "Select files you want to move to the Recycle Bin.",
+            );
+            return;
+        }
+        let total = items
+            .iter()
+            .fold(0u64, |size, (_, bytes)| size.saturating_add(*bytes));
+        let mut details: Vec<_> = items
+            .iter()
+            .take(12)
+            .map(|(path, bytes)| format!("{} ({})", path.display(), fmt_bytes(*bytes)))
+            .collect();
+        if items.len() > 12 {
+            details.push(format!("…and {} more", items.len() - 12));
+        }
+        self.modal = Some(Modal {
+            title: format!("Move {} to the Recycle Bin?", fmt_bytes(total)),
+            body: format!("Move {} selected copies. PCSweep verifies that an identical copy remains and that the drive supports the Recycle Bin.", items.len()),
+            details,
+            note: Some("You can restore moved files from the Recycle Bin. Empty the bin to recover the space.".into()),
+            confirm: "Move to Recycle Bin".into(),
+            danger: true,
+            action: Action::RecycleDuplicates(items),
+        });
+    }
+
     pub fn page_duplicates(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
         let mut acts = Vec::new();
@@ -839,7 +880,7 @@ impl App {
                             }
                         }
                     }
-                    self.ask_recycle(items, Origin::Duplicates);
+                    self.review_duplicates(items);
                 }
             }
         }

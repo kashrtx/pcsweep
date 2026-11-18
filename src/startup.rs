@@ -1,4 +1,5 @@
 use crate::app::{App, ToastKind};
+use crate::task::Task;
 use crate::theme::*;
 use crate::util;
 use crate::widgets::{self, ic};
@@ -161,8 +162,35 @@ fn filetime_now() -> u64 {
 }
 
 /// Enables or disables an item exactly like Task Manager does. Nothing is deleted.
-pub fn set_enabled(item: &StartupItem, enabled: bool) -> Result<(), String> {
-    let (key, _) = root(item.loc.machine())
+fn set_enabled(item: &StartupItem, enabled: bool) -> Result<(), String> {
+    let hive = root(item.loc.machine());
+    let unchanged = match item.loc {
+        Loc::UserRun | Loc::MachineRun | Loc::MachineRun32 => {
+            let path = if item.loc == Loc::MachineRun32 {
+                RUN32
+            } else {
+                RUN
+            };
+            hive.open_subkey(path)
+                .and_then(|key| key.get_value::<String, _>(&item.key))
+                .is_ok_and(|command| command == item.command)
+        }
+        Loc::UserFolder | Loc::CommonFolder => {
+            item.file.as_ref().is_some_and(|file| file.is_file())
+        }
+    };
+    if !unchanged {
+        return Err(
+            "The startup entry changed since it was listed. Check the refreshed list.".into(),
+        );
+    }
+    if approved(item.loc.machine(), item.loc.approved_key(), &item.key) != item.enabled {
+        return Err(
+            "Windows changed this startup state. Check the refreshed list before trying again."
+                .into(),
+        );
+    }
+    let (key, _) = hive
         .create_subkey(item.loc.approved_key())
         .map_err(|e| e.to_string())?;
     let mut bytes = vec![0u8; 12];
@@ -205,12 +233,24 @@ pub fn exe_from_command(cmd: &str) -> Option<PathBuf> {
 #[derive(Default)]
 pub struct StartupState {
     pub items: Vec<StartupItem>,
+    pub sampled_at: Option<std::time::Instant>,
     pub filter: String,
+    load: Task<Vec<StartupItem>>,
+    change: Task<Result<(String, bool), String>>,
+    error: Option<String>,
 }
 
 impl StartupState {
-    pub fn reload(&mut self) {
-        self.items = list();
+    pub fn reload(&mut self, ctx: &egui::Context) {
+        if !self.load.running() && !self.change.running() {
+            self.load = Task::spawn(ctx, list);
+        }
+    }
+    pub fn busy(&self) -> bool {
+        self.change.running()
+    }
+    pub fn working(&self) -> bool {
+        self.load.running() || self.busy()
     }
     pub fn enabled_count(&self) -> usize {
         self.items.iter().filter(|i| i.enabled).count()
@@ -241,34 +281,49 @@ impl App {
                     let Some(item) = self.startup.items.get(i).cloned() else {
                         continue;
                     };
-                    match set_enabled(&item, on) {
-                        Ok(()) => {
-                            self.startup.items[i].enabled = on;
+                    if !self.startup.working() {
+                        self.startup.change = Task::spawn(&ctx, move || {
+                            set_enabled(&item, on)?;
                             util::log(format!(
                                 "{} startup item: {}",
                                 if on { "Enabled" } else { "Disabled" },
                                 item.display
                             ));
-                            self.toast(
-                                ToastKind::Success,
-                                format!(
-                                    "{} will {}start with Windows",
-                                    item.display,
-                                    if on { "" } else { "no longer " }
-                                ),
-                            );
-                        }
-                        Err(e) => self.toast(
-                            ToastKind::Error,
-                            format!("Couldn't change {}: {e}", item.display),
-                        ),
+                            Ok((item.display, on))
+                        });
                     }
                 }
                 SAct::Show(p) => util::show_in_explorer(&p),
-                SAct::Reload => self.startup.reload(),
+                SAct::Reload => self.startup.reload(&ctx),
                 SAct::Relaunch => self.relaunch_admin(&ctx),
                 SAct::Settings => util::open_uri("ms-settings:startupapps"),
                 SAct::Filter(f) => self.startup.filter = f,
+            }
+        }
+    }
+
+    pub fn poll_startup(&mut self, ctx: &egui::Context) {
+        if let Some(result) = self.startup.change.poll() {
+            match result.and_then(|r| r) {
+                Ok((name, true)) => {
+                    self.toast(ToastKind::Success, format!("{name} will start at sign-in."))
+                }
+                Ok((name, false)) => self.toast(
+                    ToastKind::Success,
+                    format!("{name} is disabled at sign-in."),
+                ),
+                Err(error) => self.toast(ToastKind::Error, error),
+            }
+            self.startup.reload(ctx);
+        }
+        if let Some(result) = self.startup.load.poll() {
+            match result {
+                Ok(items) => {
+                    self.startup.items = items;
+                    self.startup.sampled_at = Some(std::time::Instant::now());
+                    self.startup.error = None;
+                }
+                Err(error) => self.startup.error = Some(error),
             }
         }
     }
@@ -303,12 +358,10 @@ impl App {
                 acts.push(SAct::Settings);
             }
             if ui
-                .add(widgets::small(widgets::icon_text(
-                    ic::REFRESH,
-                    "Refresh",
-                    13.0,
-                    TEXT,
-                )))
+                .add_enabled(
+                    !s.working(),
+                    widgets::small(widgets::icon_text(ic::REFRESH, "Refresh", 13.0, TEXT)),
+                )
                 .clicked()
             {
                 acts.push(SAct::Reload);
@@ -327,13 +380,22 @@ impl App {
                 }
             }
         });
+        if s.working() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(widgets::dim("Updating startup apps…"));
+            });
+        }
+        if let Some(error) = &s.error {
+            ui.add(Label::new(RichText::new(error).color(WARN)).wrap());
+        }
         ui.add_space(4.0);
         let filter = s.filter.to_lowercase();
         ScrollArea::vertical()
             .id_salt("startup_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                if s.items.is_empty() {
+                if s.items.is_empty() && !s.working() && s.error.is_none() {
                     ui.label(widgets::dim("No startup apps found."));
                 }
                 for (i, item) in s.items.iter().enumerate() {
@@ -343,12 +405,13 @@ impl App {
                     {
                         continue;
                     }
-                    let can_change = !item.loc.machine() || self.is_admin;
+                    let allowed = !item.loc.machine() || self.is_admin;
+                    let can_change = allowed && !s.working();
                     widgets::row(ui, 52.0, |ui| {
                         ui.add_space(4.0);
                         let resp = widgets::toggle(ui, item.enabled, can_change);
-                        if !can_change {
-                            resp.on_hover_text("Restart PCSweep as administrator to change apps that start for all users.");
+                        if !allowed {
+                            resp.on_disabled_hover_text("Restart PCSweep as administrator to change apps that start for all users.");
                         } else if resp.clicked() {
                             acts.push(SAct::Set(i, !item.enabled));
                         }
@@ -379,8 +442,8 @@ impl App {
                             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                                 ui.vertical(|ui| {
                                     ui.spacing_mut().item_spacing.y = 1.0;
-                                    ui.add(Label::new(widgets::strong(&item.display, 14.5)).truncate());
-                                    ui.add(Label::new(widgets::faint(&item.command)).truncate());
+                                    ui.add(Label::new(widgets::strong(&item.display, 14.5)).truncate()).on_hover_text(&item.display);
+                                    ui.add(Label::new(widgets::faint(&item.command)).truncate()).on_hover_text(&item.command);
                                 });
                             });
                         });
