@@ -2192,7 +2192,8 @@ fn background_process_end_task_reviews_the_exact_pid_at_compact_size() {
         .into_iter()
         .find(|button| (button.center().y - name.center().y).abs() < 4.0)
         .expect("background process must have a visible End task");
-    let _ = shipment_frame(&ctx, &mut app, size, click_at(end.center()));
+    let clicked = shipment_frame(&ctx, &mut app, size, click_at(end.center()));
+    upload_preview_textures(&mut painter, &clicked);
     let modal = app.modal.as_ref().expect("End task must open a review");
     assert_eq!(modal.title, "End sync-agent.exe?");
     assert_eq!(modal.details.len(), 1);

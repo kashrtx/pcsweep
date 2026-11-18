@@ -1496,18 +1496,34 @@ impl App {
             .items
             .iter()
             .fold(0u64, |size, item| size.saturating_add(item.size));
+        const SHOWN_ITEMS: usize = 64;
+        const SHOWN_SKIPPED: usize = 16;
         let mut details: Vec<_> = review
             .items
             .iter()
+            .take(SHOWN_ITEMS)
             .map(|p| format!("{} ({})", p.path.display(), fmt_bytes(p.size)))
             .collect();
+        if review.items.len() > SHOWN_ITEMS {
+            details.push(format!(
+                "…and {} more checked items",
+                review.items.len() - SHOWN_ITEMS
+            ));
+        }
         details.extend(
             review
                 .skipped
                 .iter()
+                .take(SHOWN_SKIPPED)
                 .map(|(p, reason)| format!("Kept {}. {reason}", p.display())),
         );
-        let mut body = format!("Move {} checked items to the Recycle Bin. The listed items will be checked again before they are moved.", review.items.len());
+        if review.skipped.len() > SHOWN_SKIPPED {
+            details.push(format!(
+                "…and {} more items to keep",
+                review.skipped.len() - SHOWN_SKIPPED
+            ));
+        }
+        let mut body = format!("Move {} checked items to the Recycle Bin. PCSweep will verify each item again before moving it.", review.items.len());
         if !review.skipped.is_empty() {
             body.push_str(&format!(
                 " {} other items will be kept.",

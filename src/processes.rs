@@ -584,13 +584,21 @@ impl App {
         let (title, body, confirm, note) = match operation {
             Operation::Close => (
                 format!("Close {name} normally?"),
-                format!("Ask {count} window-owning processes to close. Apps can show a save prompt."),
+                if count == 1 {
+                    "Ask this app to close its windows. It can show a save prompt.".into()
+                } else {
+                    format!("Ask {count} processes to close their windows. Apps can show a save prompt.")
+                },
                 "Ask to close",
                 Some("Use End task if a background process stays running or an app stops responding."),
             ),
             Operation::End => (
                 format!("End {name}?"),
-                format!("End the {count} listed processes now. Unsaved work can be lost."),
+                if count == 1 {
+                    "End this process now. Unsaved work can be lost.".into()
+                } else {
+                    format!("End the {count} listed processes now. Unsaved work can be lost.")
+                },
                 "End task",
                 windows_component.then_some("This selection includes a Windows component. Related apps, the desktop, or a service may be interrupted. Windows can restart some processes automatically."),
             ),
