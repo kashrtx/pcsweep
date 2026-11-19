@@ -392,7 +392,8 @@ fn apply_dacl(file: &File, mut descriptor: Vec<usize>) -> io::Result<()> {
 
 fn verified_original(request: &Request, rights: u32) -> io::Result<File> {
     let mut original = winfile::read_locked(&request.target, rights)?;
-    if winfile::stamp(&original)? != request.original || sha256(&mut original)? != request.old_hash
+    if !winfile::stamp(&original)?.same_file(request.original)
+        || sha256(&mut original)? != request.old_hash
     {
         return Err(io::Error::other(
             "The installed executable changed. It will not be restarted or replaced.",
@@ -413,12 +414,13 @@ fn restore(
 ) -> io::Result<()> {
     // Move only the verified replacement aside. Preserve the backup if an
     // unrelated file now occupies the destination.
-    let installed = winfile::read_locked(&request.target, DELETE)?;
-    if winfile::stamp(&installed)? != new_file {
+    let mut installed = winfile::read_locked(&request.target, DELETE)?;
+    if !winfile::stamp(&installed)?.same_file(new_file) {
         return Err(io::Error::other(
             "A different executable occupies the app path.",
         ));
     }
+    verify_stage(&mut installed, request)?;
     winfile::rename_locked(&installed, &job.join("failed.exe"))?;
     winfile::rename_locked(original, &request.target)
 }
@@ -430,7 +432,7 @@ fn start_updated(
     permissions: Vec<usize>,
 ) -> io::Result<()> {
     let mut updated = winfile::read_locked(&request.target, WRITE_DAC)?;
-    if winfile::stamp(&updated)? != stamp {
+    if !winfile::stamp(&updated)?.same_file(stamp) {
         return Err(io::Error::other(
             "The replacement executable changed before launch.",
         ));
@@ -654,7 +656,7 @@ mod tests {
             &failed.job,
             |request, folder, stamp, dacl| {
                 let mut new = winfile::read_locked(&request.target, WRITE_DAC)?;
-                assert_eq!(winfile::stamp(&new)?, stamp);
+                assert!(winfile::stamp(&new)?.same_file(stamp));
                 verify_stage(&mut new, request)?;
                 apply_dacl(&new, dacl)?;
                 assert!(folder.join(BACKUP).exists());

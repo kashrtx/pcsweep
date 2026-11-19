@@ -107,6 +107,14 @@ pub struct Stamp {
     len: u64,
 }
 
+impl Stamp {
+    /// Windows can reuse the creation time of a replaced name during a rename.
+    /// Use this with a content digest when following our own executable move.
+    pub fn same_file(self, other: Self) -> bool {
+        self.volume == other.volume && self.id == other.id
+    }
+}
+
 pub fn stamp(file: &File) -> io::Result<Stamp> {
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { zeroed() };
     if unsafe { GetFileInformationByHandle(handle(file), &mut info) } == 0 {
