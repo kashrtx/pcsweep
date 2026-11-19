@@ -401,7 +401,7 @@ fn explorer(restart: bool) -> io::Result<String> {
             while !process.exited() {
                 if Instant::now() >= deadline {
                     return Err(io::Error::other(
-                        "Windows Explorer is still closing. Try Open Explorer in a moment.",
+                        "Windows Explorer is still closing. Try Restore taskbar in a moment.",
                     ));
                 }
                 std::thread::sleep(Duration::from_millis(50));

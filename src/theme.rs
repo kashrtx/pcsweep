@@ -527,6 +527,7 @@ pub fn apply(ctx: &egui::Context) {
     style.spacing.scroll = egui::style::ScrollStyle {
         bar_width: 10.0,
         handle_min_length: 24.0,
+        foreground_color: true,
         ..egui::style::ScrollStyle::solid()
     };
 

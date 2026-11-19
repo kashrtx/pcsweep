@@ -2386,7 +2386,7 @@ fn every_theme_supports_compact_bold_layouts_and_dialogs() {
             upload_preview_textures(&mut painter, &frame);
         }
         text_rect(&frame, "Memory and running apps");
-        let open = text_rect(&frame, "Open Explorer");
+        let open = text_rect(&frame, "Restore taskbar");
         let restart = text_rect(&frame, "Restart Explorer…");
         assert!(!open.intersects(restart), "{skin:?}");
         save_shipment_preview(

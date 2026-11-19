@@ -73,8 +73,8 @@ fn items<'a>(snapshot: &'a Snapshot, query: &str) -> Vec<ResultItem<'a>> {
             Destination::Updates,
         ),
         (
-            "Open Explorer",
-            "explorer.exe taskbar shell file desktop recover",
+            "Restore taskbar",
+            "open explorer.exe taskbar shell file desktop recover",
             ic::APPS,
             Destination::OpenExplorer,
         ),

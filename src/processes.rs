@@ -618,7 +618,7 @@ impl App {
         let enabled = !self.mutations_running();
         ui.horizontal_wrapped(|ui| {
             if ui
-                .add_enabled(enabled, widgets::small("Open Explorer"))
+                .add_enabled(enabled, widgets::small("Restore taskbar"))
                 .clicked()
             {
                 self.execute_recovery(RecoveryAction::Explorer { restart: false }, ui.ctx());
@@ -635,7 +635,7 @@ impl App {
             } else {
                 format!("Recently closed ({recent})")
             };
-            if ui.add(widgets::ghost(label)).clicked() {
+            if ui.add(widgets::small(label)).clicked() {
                 self.show_recent_apps();
             }
             if self.mem.recovering.running() {
