@@ -688,7 +688,7 @@ impl App {
             }
         });
         if let Some(error) = &self.network.error {
-            ui.colored_label(WARN, error);
+            ui.colored_label(color_warning(), error);
         }
         ScrollArea::vertical().id_salt("network_health").auto_shrink([false, false]).show(ui, |ui| {
             let visible: Vec<_> = self.network.adapters.iter().filter(|a| self.network.show_virtual || a.is_physical()).collect();
@@ -697,7 +697,7 @@ impl App {
                 widgets::tight_frame().show(ui, |ui| {
                     ui.horizontal(|ui| {
                         if ui.selectable_label(self.network.selected.as_ref() == Some(&adapter.guid), &adapter.name).clicked() { self.network.selected = Some(adapter.guid.clone()); }
-                        ui.label(RichText::new(&adapter.status).color(if adapter.connected() { GOOD } else { TEXT_FAINT }));
+                        ui.label(RichText::new(&adapter.status).color(if adapter.connected() { color_success() } else { color_secondary() }));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| { ui.label(widgets::strong(rate(adapter.link_bps), 14.0)); });
                     });
                     ui.add(Label::new(widgets::faint(&adapter.description)).truncate()).on_hover_text(&adapter.description);
@@ -708,14 +708,14 @@ impl App {
             widgets::section(ui, &format!("{} · adapter details", adapter.name));
             widgets::card(ui, |ui| {
                 ui.label(widgets::strong(&adapter.description, 16.0));
-                ui.horizontal_wrapped(|ui| { widgets::badge(ui, &format!("Local receive: {}", rate(adapter.receive_link_bps)), ACCENT); widgets::badge(ui, &format!("Local transmit: {}", rate(adapter.transmit_link_bps)), ACCENT); });
+                ui.horizontal_wrapped(|ui| { widgets::badge(ui, &format!("Local receive: {}", rate(adapter.receive_link_bps)), color_accent()); widgets::badge(ui, &format!("Local transmit: {}", rate(adapter.transmit_link_bps)), color_accent()); });
                 ui.label(widgets::faint("These are negotiated rates between this adapter and its local network. They do not measure your internet connection or guarantee application throughput."));
-                if let Some(signal) = adapter.wifi_signal { ui.horizontal(|ui| { ui.label(widgets::dim(format!("Wi-Fi signal quality: {signal}%"))); widgets::bar(ui, signal as f32 / 100.0, if signal < 40 { WARN } else { GOOD }, egui::vec2(160.0, 7.0)); }); }
+                if let Some(signal) = adapter.wifi_signal { ui.horizontal(|ui| { ui.label(widgets::dim(format!("Wi-Fi signal quality: {signal}%"))); widgets::bar(ui, signal as f32 / 100.0, if signal < 40 { color_warning() } else { color_success() }, egui::vec2(160.0, 7.0)); }); }
                 if let Some(error) = &adapter.wifi_error { ui.label(widgets::faint(error)); }
                 ui.label(widgets::dim(format!("Driver: {} · {}", if adapter.driver_provider.is_empty() { "Provider not reported" } else { &adapter.driver_provider }, if adapter.driver_version.is_empty() { "Version not reported" } else { &adapter.driver_version })));
                 ui.label(widgets::faint(format!("Driver date: {}. A date alone does not establish whether a newer driver is needed.", if adapter.driver_date.is_empty() { "Not reported" } else { &adapter.driver_date })));
                 ui.add(Label::new(widgets::faint(format!("Interface {} · {}", adapter.index, adapter.guid))).truncate()).on_hover_text(&adapter.guid);
-                if adapter.remote_session { ui.colored_label(WARN, "Remote session detected. Connection health does not change adapter settings."); }
+                if adapter.remote_session { ui.colored_label(color_warning(), "Remote session detected. Connection health does not change adapter settings."); }
                 if adapter.domain_authenticated || adapter.domain_member == Some(true) { ui.label(widgets::faint("Domain-managed connection: follow your administrator's network guidance.")); }
                 if let Some(error) = &adapter.statistics_error { ui.label(widgets::faint(format!("Packet counters unavailable: {error}"))); }
                 else { ui.label(widgets::dim(format!("Since driver counters started: {} received / {} sent · {} errors · {} discards", util::fmt_bytes(adapter.received_bytes), util::fmt_bytes(adapter.sent_bytes), adapter.received_errors.saturating_add(adapter.sent_errors), adapter.received_discards.saturating_add(adapter.sent_discards))));
@@ -723,7 +723,7 @@ impl App {
                 }
             });
             for finding in findings(adapter, delta) {
-                widgets::banner(ui, if finding.warning { WARN } else { ACCENT }, ic::INFO, |ui| {
+                widgets::banner(ui, if finding.warning { color_warning() } else { color_accent() }, ic::INFO, |ui| {
                     ui.vertical(|ui| {
                         ui.add(Label::new(widgets::strong(finding.title, 14.0)).wrap());
                         ui.add(Label::new(widgets::dim(finding.detail)).wrap());
@@ -738,7 +738,7 @@ impl App {
             });
             ui.label(widgets::faint("Driver options vary by hardware and workload. Review the vendor's documentation before changing them in Windows. There is no universal 'maximum speed' setting; PCSweep keeps IPv6, offloads and adapter settings unchanged."));
             if self.network.options_load.running() { ui.spinner(); }
-            if let Some(error) = &self.network.options_error { ui.colored_label(WARN, error); }
+            if let Some(error) = &self.network.options_error { ui.colored_label(color_warning(), error); }
             if let Some((id, options)) = self.network.options.as_ref().filter(|(id,_)| id == &adapter.guid) {
                 ui.label(widgets::strong(format!("{} driver-reported options", options.len()), 14.0));
                 ScrollArea::vertical().id_salt(("network_options", id)).max_height(220.0).show_rows(ui, 46.0, options.len(), |ui, range| {
@@ -746,7 +746,7 @@ impl App {
                 });
             }
             if self.network.probes.running() { ui.horizontal(|ui| { ui.spinner(); ui.label(widgets::dim("Running the small checks you approved…")); }); }
-            if let Some(error) = &self.network.probe_error { ui.colored_label(WARN, error); }
+            if let Some(error) = &self.network.probe_error { ui.colored_label(color_warning(), error); }
             if !self.network.probe_rows.is_empty() {
                 widgets::section(ui, &format!("Reachability checks · {}", self.network.probe_for.as_deref().unwrap_or("current route")));
                 ui.label(widgets::faint("DNS and HTTPS follow Windows' current route, which may use a different adapter or VPN. Timings can vary; no bandwidth estimate is inferred."));

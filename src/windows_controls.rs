@@ -1202,11 +1202,11 @@ fn render_update_controls(
             17.0,
         ));
         if snapshot.environment.pending_restart {
-            ui.colored_label(WARN, "Windows reports an update or servicing restart pending. A new pause does not undo work already installing.");
+            ui.colored_label(color_warning(), "Windows reports an update or servicing restart pending. A new pause does not undo work already installing.");
         }
         if let Some((token, heading, age)) = snapshot.reminder_context() {
             if !reminder_hidden(&snapshot.reminders, &token, chrono::Utc::now().timestamp()) {
-                ui.colored_label(WARN, heading);
+                ui.colored_label(color_warning(), heading);
                 ui.label(widgets::dim(age));
                 ui.label(widgets::faint("Installation age is not a check for newly available updates. You choose when to resume; PCSweep does not turn updates back on for you."));
                 ui.horizontal_wrapped(|ui| {
@@ -1342,11 +1342,11 @@ fn render_update_controls(
         .default_open(snapshot.policy_guard.is_err())
         .show(ui, |ui| {
             ui.label(widgets::dim("A stronger direct control for Home and Pro. Disabling this service can prevent Windows Update checks and other updates that depend on it. Windows may repair or re-enable it later; this is not a permanent enforcement service."));
-            if let Err(reason) = &snapshot.service_guard { ui.colored_label(WARN, reason); }
+            if let Err(reason) = &snapshot.service_guard { ui.colored_label(color_warning(), reason); }
             match &snapshot.service {
                 Ok(service) => {
                     ui.label(widgets::strong(format!("Windows Update service: {} · {}{}", service.start_mode, service.state, if service.delayed_auto { " · delayed auto-start flag" } else { "" }), 14.0));
-                    if let Some(reason) = &service.warning { ui.colored_label(WARN, reason); }
+                    if let Some(reason) = &service.warning { ui.colored_label(color_warning(), reason); }
                     if let Ok(expected) = service.fingerprint() {
                         let enabled = !busy && admin && snapshot.service_guard.is_ok();
                         ui.horizontal_wrapped(|ui| {
@@ -1357,7 +1357,7 @@ fn render_update_controls(
                         });
                     }
                 }
-                Err(reason) => { ui.colored_label(WARN, reason); }
+                Err(reason) => { ui.colored_label(color_warning(), reason); }
             }
         });
     egui::CollapsingHeader::new("Update reminder preferences").show(ui, |ui| {
@@ -1459,7 +1459,7 @@ impl App {
                     if !self.is_admin && ui.add_enabled(!busy, widgets::small("Restart as administrator to change updates")).clicked() { elevate = true; }
                 });
                 if let Some(e) = &self.windows_controls.error {
-                    ui.colored_label(WARN, e);
+                    ui.colored_label(color_warning(), e);
                 }
                 if let Some(m) = &self.windows_controls.message {
                     ui.label(widgets::dim(m));
@@ -1561,7 +1561,7 @@ impl App {
                 });
                 if let Some(history) = &self.windows_controls.timeline {
                     for warning in &history.warnings {
-                        ui.colored_label(WARN, warning);
+                        ui.colored_label(color_warning(), warning);
                     }
                     let query = self.windows_controls.history_filter.to_lowercase();
                     let rows: Vec<_> = history
@@ -1678,7 +1678,7 @@ fn undo_controls(
             }
         }
         Err(e) => {
-            ui.colored_label(WARN, e);
+            ui.colored_label(color_warning(), e);
         }
         _ => {}
     }

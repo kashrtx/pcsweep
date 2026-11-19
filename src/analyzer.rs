@@ -535,7 +535,7 @@ fn treemap(ui: &mut Ui, node: &Node, height: f32) -> Option<usize> {
     let width = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, Rounding::same(12.0), CARD);
+    painter.rect_filled(rect, Rounding::same(12.0), color_surface());
     let mut items: Vec<(usize, f64)> = node
         .children
         .iter()
@@ -563,7 +563,7 @@ fn treemap(ui: &mut Ui, node: &Node, height: f32) -> Option<usize> {
             Align2::CENTER_CENTER,
             "This folder is empty",
             FontId::proportional(14.0),
-            TEXT_DIM,
+            color_muted(),
         );
         return None;
     }
@@ -1565,7 +1565,7 @@ impl App {
             acts.push(AAct::Go(Page::Storage));
         }
         if let Some(error) = &a.journal_error {
-            ui.colored_label(WARN, format!("Cleanup history needs review: {error}. Cleanup stopped; check uncertain outcomes in Cleanup history."));
+            ui.colored_label(color_warning(), format!("Cleanup history needs review: {error}. Cleanup stopped; check uncertain outcomes in Cleanup history."));
             ui.horizontal_wrapped(|ui| {
                 if ui.add(widgets::small("Activity log")).clicked() {
                     acts.push(AAct::Go(Page::Activity));
@@ -1594,7 +1594,10 @@ impl App {
                 if ui
                     .add_enabled(
                         !scanning,
-                        widgets::chip(widgets::icon_text(ic::DRIVE, &label, 14.0, TEXT), selected),
+                        widgets::chip(
+                            widgets::icon_text(ic::DRIVE, &label, 14.0, color_ink()),
+                            selected,
+                        ),
                     )
                     .clicked()
                 {
@@ -1605,7 +1608,7 @@ impl App {
                 .add_enabled(
                     !scanning,
                     widgets::chip(
-                        widgets::icon_text(ic::FOLDER, "Your user folder", 14.0, TEXT),
+                        widgets::icon_text(ic::FOLDER, "Your user folder", 14.0, color_ink()),
                         false,
                     ),
                 )
@@ -1617,7 +1620,7 @@ impl App {
                 .add_enabled(
                     !scanning,
                     widgets::chip(
-                        widgets::icon_text(ic::SEARCH, "Choose a folder", 14.0, TEXT),
+                        widgets::icon_text(ic::SEARCH, "Choose a folder", 14.0, color_ink()),
                         false,
                     ),
                 )
@@ -1661,7 +1664,7 @@ impl App {
                     ui.label(
                         RichText::new(fmt_bytes(p.bytes.load(Ordering::Relaxed)))
                             .font(widgets::light(40.0))
-                            .color(TEXT),
+                            .color(color_ink()),
                     );
                     ui.label(widgets::dim(format!(
                         "{} files in {} folders so far, {}s",
@@ -1687,7 +1690,7 @@ impl App {
             widgets::card(ui, |ui| {
                 ui.add_space(20.0);
                 ui.vertical_centered(|ui| {
-                    ui.label(widgets::icon(ic::PIE, 40.0, ACCENT));
+                    ui.label(widgets::icon(ic::PIE, 40.0, color_accent()));
                     ui.add_space(6.0);
                     ui.label(widgets::strong("Pick a drive or folder to map", 18.0));
                     ui.label(widgets::dim(
@@ -1718,7 +1721,7 @@ impl App {
             if ui.add_enabled(!a.recycle.running(), widgets::small("Rescan")).on_hover_text("Refresh this map after files have changed").clicked() {
                 acts.push(AAct::Rescan(res.root_path.clone()));
             }
-            ui.label(RichText::new(fmt_bytes(res.root.size)).font(widgets::light(30.0)).color(TEXT));
+            ui.label(RichText::new(fmt_bytes(res.root.size)).font(widgets::light(30.0)).color(color_ink()));
             ui.label(widgets::dim(format!(
                 "in {} files and {} folders, mapped in {:.1}s.",
                 fmt_num(res.root.files),
@@ -1726,17 +1729,17 @@ impl App {
                 res.elapsed.as_secs_f32()
             )));
             if res.cancelled {
-                widgets::badge(ui, "Stopped early, partial results", WARN);
+                widgets::badge(ui, "Stopped early, partial results", color_warning());
             }
             if res.denied > 0 {
-                widgets::badge(ui, &format!("{} folders not readable", fmt_num(res.denied)), TEXT_FAINT).on_hover_text(
+                widgets::badge(ui, &format!("{} folders not readable", fmt_num(res.denied)), color_secondary()).on_hover_text(
                     "Windows blocks some system folders. Restarting as administrator lets PCSweep read more of them.",
                 );
             }
             if let Some(d) = self.sys.drives.iter().find(|d| util::norm(Path::new(&d.mount)) == util::norm(&res.root_path)) {
                 let hidden = d.used().saturating_sub(res.root.size);
                 if hidden > 1024 * 1024 * 1024 {
-                    widgets::badge(ui, &format!("{} used by Windows and hidden data", fmt_bytes(hidden)), TEXT_FAINT).on_hover_text(
+                    widgets::badge(ui, &format!("{} used by Windows and hidden data", fmt_bytes(hidden)), color_secondary()).on_hover_text(
                         "Space the scan can't see: restore points, the system reserve and protected folders. Tools can trim some of it.",
                     );
                 }
@@ -1860,7 +1863,7 @@ impl App {
             if ui
                 .add_enabled(
                     !a.nav.is_empty(),
-                    widgets::small(widgets::icon_text(ic::BACK, "Up", 13.0, TEXT)),
+                    widgets::small(widgets::icon_text(ic::BACK, "Up", 13.0, color_ink())),
                 )
                 .clicked()
             {
@@ -1870,9 +1873,9 @@ impl App {
             if ui
                 .add(
                     Label::new(RichText::new(root_label).color(if a.nav.is_empty() {
-                        TEXT
+                        color_ink()
                     } else {
-                        ACCENT
+                        color_accent()
                     }))
                     .sense(Sense::click()),
                 )
@@ -1885,11 +1888,11 @@ impl App {
             for (depth, &i) in a.nav.iter().enumerate() {
                 let Some(c) = n.children.get(i) else { break };
                 n = c;
-                ui.label(widgets::icon(ic::CHEVRON, 10.0, TEXT_FAINT));
+                ui.label(widgets::icon(ic::CHEVRON, 10.0, color_secondary()));
                 let last = depth + 1 == a.nav.len();
                 if ui
                     .add(
-                        Label::new(RichText::new(&c.name).color(if last { TEXT } else { ACCENT }))
+                        Label::new(RichText::new(&c.name).color(if last { color_ink() } else { color_accent() }))
                             .sense(Sense::click()),
                     )
                     .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -1905,7 +1908,7 @@ impl App {
                         ic::OPEN,
                         "Open in Explorer",
                         13.0,
-                        TEXT,
+                        color_ink(),
                     )))
                     .clicked()
                 {
@@ -2025,8 +2028,8 @@ impl App {
                         let (icon_c, col) = match child.kind {
                             NodeKind::Dir => (ic::FOLDER, PALETTE[idx % PALETTE.len()]),
                             NodeKind::File => (ic::FILE, classify(&ext_of(&child.name)).color()),
-                            NodeKind::SmallFiles => (ic::FILE, TEXT_FAINT),
-                            NodeKind::Denied => (ic::LOCK, TEXT_FAINT),
+                            NodeKind::SmallFiles => (ic::FILE, color_secondary()),
+                            NodeKind::Denied => (ic::LOCK, color_secondary()),
                         };
                         ui.label(widgets::icon(if block.is_some() { ic::LOCK } else { icon_c }, 16.0, col));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -2036,7 +2039,7 @@ impl App {
                             if actionable {
                                 let btn = ui.add_enabled(
                                     block.is_none() && !a.selection_check.running(),
-                                    widgets::small(widgets::icon(ic::CLEAN, 13.0, TEXT_DIM)),
+                                    widgets::small(widgets::icon(ic::CLEAN, 13.0, color_muted())),
                                 );
                                 let btn = match block {
                                     Some(why) => btn.on_disabled_hover_text(why),
@@ -2049,7 +2052,7 @@ impl App {
                                     )]));
                                 }
                                 if ui
-                                    .add(widgets::small(widgets::icon(ic::OPEN, 13.0, TEXT_DIM)))
+                                    .add(widgets::small(widgets::icon(ic::OPEN, 13.0, color_muted())))
                                     .on_hover_text("Show in Explorer")
                                     .clicked()
                                 {
@@ -2083,9 +2086,9 @@ impl App {
                                 let enterable =
                                     child.kind == NodeKind::Dir && !child.children.is_empty();
                                 let mut text = RichText::new(&child.name).color(if removed {
-                                    TEXT_FAINT
+                                    color_secondary()
                                 } else {
-                                    TEXT
+                                    color_ink()
                                 });
                                 if removed {
                                     text = text.strikethrough();
@@ -2209,7 +2212,7 @@ impl App {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             ui.add_space(6.0);
                             if ui
-                                .add(widgets::small(widgets::icon(ic::OPEN, 13.0, TEXT_DIM)))
+                                .add(widgets::small(widgets::icon(ic::OPEN, 13.0, color_muted())))
                                 .on_hover_text("Show in Explorer")
                                 .clicked()
                             {
@@ -2226,7 +2229,10 @@ impl App {
                             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                                 ui.vertical(|ui| {
                                     ui.spacing_mut().item_spacing.y = 1.0;
-                                    ui.add(Label::new(RichText::new(&name).color(TEXT)).truncate());
+                                    ui.add(
+                                        Label::new(RichText::new(&name).color(color_ink()))
+                                            .truncate(),
+                                    );
                                     let folder = f
                                         .path
                                         .parent()
@@ -2291,7 +2297,9 @@ impl App {
                             ui.horizontal(|ui| {
                                 ui.add_sized(
                                     [70.0, 20.0],
-                                    Label::new(RichText::new(format!(".{}", e.ext)).color(TEXT)),
+                                    Label::new(
+                                        RichText::new(format!(".{}", e.ext)).color(color_ink()),
+                                    ),
                                 );
                                 let bw = (ui.available_width() - 190.0).max(20.0);
                                 widgets::bar(

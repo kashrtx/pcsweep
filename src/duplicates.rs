@@ -924,13 +924,17 @@ impl App {
                 for (i, r) in d.roots.iter().enumerate() {
                     widgets::tight_frame().show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.label(widgets::icon(ic::FOLDER, 14.0, ACCENT));
+                            ui.label(widgets::icon(ic::FOLDER, 14.0, color_accent()));
                             ui.label(r.display().to_string());
                             if !scanning
                                 && ui
                                     .add(
-                                        egui::Button::new(widgets::icon(ic::CLOSE, 10.0, TEXT_DIM))
-                                            .frame(false),
+                                        egui::Button::new(widgets::icon(
+                                            ic::CLOSE,
+                                            10.0,
+                                            color_muted(),
+                                        ))
+                                        .frame(false),
                                     )
                                     .clicked()
                             {
@@ -942,7 +946,12 @@ impl App {
                 if ui
                     .add_enabled(
                         !scanning,
-                        widgets::ghost(widgets::icon_text(ic::FOLDER, "Add folder", 14.0, TEXT)),
+                        widgets::ghost(widgets::icon_text(
+                            ic::FOLDER,
+                            "Add folder",
+                            14.0,
+                            color_ink(),
+                        )),
                     )
                     .clicked()
                 {
@@ -1001,7 +1010,12 @@ impl App {
                     });
                     if total > 0 {
                         let bw = ui.available_width().min(520.0);
-                        widgets::bar(ui, done as f32 / total as f32, ACCENT, egui::vec2(bw, 8.0));
+                        widgets::bar(
+                            ui,
+                            done as f32 / total as f32,
+                            color_accent(),
+                            egui::vec2(bw, 8.0),
+                        );
                         ui.label(widgets::dim(format!(
                             "{} of {} files",
                             fmt_num(done),
@@ -1021,7 +1035,7 @@ impl App {
         let Some(groups) = &d.groups else {
             ui.add_space(30.0);
             ui.vertical_centered(|ui| {
-                ui.label(widgets::icon(ic::COPY, 40.0, ACCENT));
+                ui.label(widgets::icon(ic::COPY, 40.0, color_accent()));
                 ui.add_space(6.0);
                 ui.label(widgets::strong("Search your user folder, or add other folders and drives", 17.0));
                 ui.label(widgets::dim(
@@ -1046,7 +1060,7 @@ impl App {
             .sum();
 
         if live_groups.is_empty() {
-            widgets::banner(ui, GOOD, ic::CHECK, |ui| {
+            widgets::banner(ui, color_success(), ic::CHECK, |ui| {
                 ui.label("No duplicates found here.");
             });
             return;
@@ -1056,7 +1070,7 @@ impl App {
             ui.label(
                 RichText::new(fmt_bytes(wasted))
                     .font(widgets::light(30.0))
-                    .color(TEXT),
+                    .color(color_ink()),
             );
             ui.label(widgets::dim(format!(
                 "could be freed across {} sets of duplicates",
@@ -1130,7 +1144,7 @@ impl App {
                                     acts.push(DAct::Toggle(gi, f.path.clone(), sel));
                                 }
                                 if f.block.is_some() {
-                                    ui.label(widgets::icon(ic::LOCK, 13.0, TEXT_FAINT));
+                                    ui.label(widgets::icon(ic::LOCK, 13.0, color_secondary()));
                                 }
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     ui.add_space(6.0);
@@ -1142,7 +1156,7 @@ impl App {
                                         Label::new(widgets::faint(fmt_date(f.modified))),
                                     );
                                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                                        let col = if sel { TEXT } else { TEXT_DIM };
+                                        let col = if sel { color_ink() } else { color_muted() };
                                         ui.add(
                                             Label::new(
                                                 RichText::new(f.path.display().to_string())

@@ -591,9 +591,7 @@ impl App {
             match action {
                 UiAction::Refresh => self.refresh_background(&ctx),
                 UiAction::Scheduler => {
-                    let _ = std::process::Command::new("mmc.exe")
-                        .arg("taskschd.msc")
-                        .spawn();
+                    let _ = util::open_system_document("mmc.exe", "taskschd.msc");
                 }
                 UiAction::Browser(browser, page) => {
                     let result = browser_path(browser)
@@ -685,7 +683,7 @@ impl App {
             }
         });
         if let Some(error) = &self.background.error {
-            ui.colored_label(WARN, error);
+            ui.colored_label(color_warning(), error);
         }
         if self.background.skipped > 0 {
             ui.label(widgets::faint(format!(
@@ -694,7 +692,7 @@ impl App {
             )));
         }
         for warning in self.background.warnings.iter().take(2) {
-            ui.colored_label(WARN, warning);
+            ui.colored_label(color_warning(), warning);
         }
         let query = self.background.filter.trim().to_lowercase();
         let visible: Vec<_> = self
@@ -747,7 +745,7 @@ impl App {
                             }
                         )));
                         if selected.protected() {
-                            ui.colored_label(WARN, selected.protection_reason());
+                            ui.colored_label(color_warning(), selected.protection_reason());
                         }
                     });
             });
@@ -818,7 +816,7 @@ impl App {
                             ui.label(
                                 RichText::new(&task.state)
                                     .size(12.0)
-                                    .color(if task.enabled { GOOD } else { TEXT_FAINT }),
+                                    .color(if task.enabled { color_success() } else { color_secondary() }),
                             );
                             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                                 ui.vertical(|ui| {

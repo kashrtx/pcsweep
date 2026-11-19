@@ -1,10 +1,7 @@
-# PCSweep 1.8.0
+# PCSweep 1.9.0
 
-Memory and Background activity now share a live Windows process list. It includes processes with zero or unavailable memory readings, and groups apps by executable path and Windows session.
-
-- **Find what is running.** Browse apps with open windows, windowless processes, or individual PIDs. Sort by RAM, CPU, private commit, growth, name, or PID. Search by app, exact PID, executable path, or window title.
-- **Choose how to close.** Close normally gives apps a chance to prompt you to save. End task works for background processes and apps that stop responding. Both support selecting multiple processes and reviewing the exact PIDs. Windows critical processes and access restrictions are checked for each process.
-- **See the app behind the process.** Native executable icons appear in the list. Process details show individual PIDs, memory readings, and open windows. Switch to a window or open the executable’s location.
-- **Keep working while processes change.** Sampling, icon loading, and waiting for processes to exit run in the background. Results show which processes exited and why others could not be changed. Scheduled tasks and browser controls have their own tabs in Background activity.
-- **Polish across the app.** Installed Apps uses the live process and startup inventories for its badges. Startup reads and changes stay off the UI thread. Closing the window during an active change asks before interrupting it, and settings writes preserve the last saved file if a write fails.
-- **More reliable file review.** Space Analyzer shows the eligible items when part of a selection has changed or disappeared. It checks file identity and folder contents immediately before moving each item. Recycle Bin actions keep files on unsupported drives.
+- **Recover the desktop.** Open Windows Explorer when the taskbar is missing or restart it from Memory, Background activity, or Tools. Recently closed remembers eligible desktop apps closed in PCSweep so you can reopen them during the same session.
+- **Update and restart as administrator.** PCSweep can replace its portable executable and reopen with the same privileges. The updater verifies the Windows x64 file and SHA-256, restricts elevated staging, and retains the prior executable until the new window starts. The Updates page also offers a verified portable download.
+- **Jump anywhere with Ctrl+K.** Find a page, open a running app’s process details, reach desktop recovery, change appearance, or check for updates from one keyboard-friendly search.
+- **Make PCSweep your own.** Choose from nine themes, including Frosted glass, Skyline Aero, Retro desktop, Cobalt desktop, Green terminal, Neon circuit, Sakura, and High contrast. Theme choice is saved with text size and weight. Shared controls, tables, dialogs, and scrollbars use the selected theme.
+- **Safer Windows tool launches.** Administrator restart uses Windows’ native UAC prompt. Built-in tools resolve to their Windows locations, and the desktop uninstall review shows the actual registered executable before it runs.

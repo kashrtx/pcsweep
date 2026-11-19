@@ -335,7 +335,7 @@ impl App {
             "Startup apps",
             "Apps that launch every time you sign in. Fewer of them means a faster boot and more free memory.",
         );
-        widgets::banner(ui, ACCENT, ic::INFO, |ui| {
+        widgets::banner(ui, color_accent(), ic::INFO, |ui| {
             ui.add(Label::new(STARTUP_INFO).wrap());
         });
         ui.add_space(6.0);
@@ -343,7 +343,7 @@ impl App {
             ui.label(
                 RichText::new(format!("{}", s.enabled_count()))
                     .font(widgets::light(30.0))
-                    .color(TEXT),
+                    .color(color_ink()),
             );
             ui.label(widgets::dim(format!(
                 "of {} start automatically",
@@ -360,7 +360,12 @@ impl App {
             if ui
                 .add_enabled(
                     !s.working(),
-                    widgets::small(widgets::icon_text(ic::REFRESH, "Refresh", 13.0, TEXT)),
+                    widgets::small(widgets::icon_text(
+                        ic::REFRESH,
+                        "Refresh",
+                        13.0,
+                        color_ink(),
+                    )),
                 )
                 .clicked()
             {
@@ -372,7 +377,7 @@ impl App {
                         ic::SHIELD,
                         "Restart as admin",
                         13.0,
-                        WARN,
+                        color_warning(),
                     )))
                     .clicked()
                 {
@@ -387,7 +392,7 @@ impl App {
             });
         }
         if let Some(error) = &s.error {
-            ui.add(Label::new(RichText::new(error).color(WARN)).wrap());
+            ui.add(Label::new(RichText::new(error).color(color_warning())).wrap());
         }
         ui.add_space(4.0);
         let filter = s.filter.to_lowercase();
@@ -419,7 +424,7 @@ impl App {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             ui.add_space(6.0);
                             let target = item.file.clone();
-                            let open = ui.add_enabled(target.is_some(), widgets::small(widgets::icon(ic::OPEN, 13.0, TEXT_DIM)));
+                            let open = ui.add_enabled(target.is_some(), widgets::small(widgets::icon(ic::OPEN, 13.0, color_muted())));
                             match target {
                                 Some(t) => {
                                     if open.on_hover_text("Show in Explorer").clicked() {
@@ -431,13 +436,13 @@ impl App {
                                 }
                             }
                             ui.allocate_ui_with_layout(egui::vec2(170.0, 20.0), Layout::right_to_left(Align::Center), |ui| {
-                                widgets::badge(ui, item.loc.label(), TEXT_DIM);
+                                widgets::badge(ui, item.loc.label(), color_muted());
                             });
                             widgets::cell(
                                 ui,
                                 30.0,
                                 true,
-                                if item.enabled { RichText::new("On").color(GOOD) } else { RichText::new("Off").color(TEXT_FAINT) },
+                                if item.enabled { RichText::new("On").color(color_success()) } else { RichText::new("Off").color(color_secondary()) },
                             );
                             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                                 ui.vertical(|ui| {

@@ -27,6 +27,21 @@ pub fn system_directory() -> Result<std::path::PathBuf, String> {
     )))
 }
 
+pub fn windows_directory() -> Result<std::path::PathBuf, String> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetSystemWindowsDirectoryW(buffer: *mut u16, size: u32) -> u32;
+    }
+    use std::os::windows::ffi::OsStringExt;
+    let mut buffer = vec![0u16; 32768];
+    let n =
+        unsafe { GetSystemWindowsDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+    if n == 0 || n >= buffer.len() {
+        return Err("Windows folder is unavailable.".into());
+    }
+    Ok(std::ffi::OsString::from_wide(&buffer[..n]).into())
+}
+
 fn capture<R: Read + Send + 'static>(mut pipe: R) -> mpsc::Receiver<Result<Vec<u8>, String>> {
     let (send, recv) = mpsc::channel();
     std::thread::spawn(move || {

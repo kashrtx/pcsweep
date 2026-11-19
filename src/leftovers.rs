@@ -839,7 +839,7 @@ impl crate::app::App {
             widgets::tight_card(ui,|ui| {
                 ui.label(widgets::strong(format!("After uninstalling {}",target.name),16.0));
                 ui.add(egui::Label::new("Review exact product folders and registry keys after removal. Confidence is evidence, not a guarantee. Preferences and saved data may be included. Nothing is selected automatically.").wrap());
-                if let Some(error)=&state.error {ui.add(egui::Label::new(egui::RichText::new(error).color(WARN)).wrap());}
+                if let Some(error)=&state.error {ui.add(egui::Label::new(egui::RichText::new(error).color(color_warning())).wrap());}
                 if let Some(message)=&state.message {ui.add(egui::Label::new(message).wrap());}
                 let busy=state.busy()||state.scan.running()||state.restore_review.running();
                 ui.horizontal_wrapped(|ui| {

@@ -23,6 +23,8 @@ mod power;
 mod preferences;
 mod privacy;
 mod processes;
+mod quick_search;
+mod recovery;
 mod running;
 mod scan_cache;
 mod security;
@@ -37,10 +39,12 @@ mod tray;
 #[cfg(test)]
 mod ui_preview;
 mod update_control;
+mod update_install;
 mod updates;
 mod util;
 mod widgets;
 mod windows_controls;
+mod winfile;
 
 use eframe::egui;
 
@@ -48,7 +52,7 @@ fn main() -> Result<(), eframe::Error> {
     if let Some(code) = dns::run_helper_mode() {
         std::process::exit(code);
     }
-    if let Some(code) = updates::run_helper_mode() {
+    if let Some(code) = update_install::run_helper_mode() {
         std::process::exit(code);
     }
     instance::wait_for_parent();
@@ -63,6 +67,8 @@ fn main() -> Result<(), eframe::Error> {
     if instance::elevate_on_start() {
         return Ok(());
     }
+    update_install::pin_running_app();
+    recovery::warm_desktop();
     // Deep folder trees are scanned recursively in parallel; give worker threads
     // plenty of stack so nothing can overflow on unusual directory layouts.
     let _ = rayon::ThreadPoolBuilder::new()

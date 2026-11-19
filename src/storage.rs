@@ -420,7 +420,7 @@ impl App {
                 if ui.add(widgets::small("Windows Storage settings")).clicked() { util::open_uri("ms-settings:storagesense"); }
                 if self.storage.load.running() { ui.spinner(); ui.label(widgets::dim("Reading disk reports in the background…")); }
             });
-            if let Some(error) = &self.storage.error { ui.colored_label(WARN, error); }
+            if let Some(error) = &self.storage.error { ui.colored_label(color_warning(), error); }
             if self.storage.busy() { ui.horizontal_wrapped(|ui| { ui.spinner(); ui.label("Windows maintenance is running. You can navigate elsewhere or use Optimize Drives to review native progress."); }); }
             widgets::card(ui, |ui| {
                 ui.label(widgets::strong("Health, capacity and optimization are different", 16.0));
@@ -453,12 +453,12 @@ impl App {
                     widgets::card(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
                             ui.label(widgets::strong(format!("{}:  {}", volume.letter, volume.label), 19.0));
-                            widgets::badge(ui, if volume.warning() { "Needs review" } else { "Windows report" }, if volume.warning() { WARN } else { TEXT_DIM });
+                            widgets::badge(ui, if volume.warning() { "Needs review" } else { "Windows report" }, if volume.warning() { color_warning() } else { color_muted() });
                         });
                         ui.label(widgets::dim(format!("{} free of {} · {} · {}", util::fmt_bytes(volume.free), util::fmt_bytes(volume.capacity), volume.filesystem, volume.drive_type)));
                         if volume.capacity > 0 {
                             let used = 1.0 - (volume.free as f64 / volume.capacity as f64).clamp(0.0, 1.0);
-                            widgets::bar(ui, used as f32, if used > 0.9 { WARN } else { ACCENT }, egui::vec2(ui.available_width(), 7.0));
+                            widgets::bar(ui, used as f32, if used > 0.9 { color_warning() } else { color_accent() }, egui::vec2(ui.available_width(), 7.0));
                         }
                         ui.label(widgets::dim(format!("Volume status: {} · Disk status: {}", unknown(&volume.volume_health), unknown(&volume.disk_health))));
                         ui.add(Label::new(widgets::faint(format!("{} · {} · {}", unknown(&volume.disk_name), unknown(&volume.bus), unknown(&volume.media)))).wrap());
@@ -468,7 +468,7 @@ impl App {
                         let hours = volume.hours.map(|v| format!("{v} h")).unwrap_or_else(|| "Not reported".into());
                         ui.horizontal_wrapped(|ui| { ui.label(widgets::dim(format!("Temperature: {temp}"))); ui.label(widgets::dim(format!("Wear: {wear}"))); ui.label(widgets::dim(format!("Power-on: {hours}"))); });
                         ui.label(widgets::faint(format!("Reported uncorrected errors — read: {} · write: {}", optional_count(volume.read_errors), optional_count(volume.write_errors))));
-                        if volume.warning() { ui.colored_label(WARN, "Review this warning and back up important files before maintenance. Native/vendor diagnostics can provide more detail."); }
+                        if volume.warning() { ui.colored_label(color_warning(), "Review this warning and back up important files before maintenance. Native/vendor diagnostics can provide more detail."); }
                         ui.label(widgets::faint("Last successful per-volume optimization / next due: not verified. Use Windows Optimize Drives for its current status."));
                         ui.horizontal_wrapped(|ui| {
                             for (analyze, label) in [(true, "Analyze volume…"), (false, "Optimize using Windows…")] {

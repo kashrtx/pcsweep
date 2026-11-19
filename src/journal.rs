@@ -774,7 +774,7 @@ impl App {
                     ic::BACK,
                     "Activity log",
                     14.0,
-                    TEXT,
+                    color_ink(),
                 )))
                 .clicked()
             {
@@ -790,7 +790,7 @@ impl App {
             ui.vertical_centered(|ui| ui.label(widgets::dim("Reading the cleanup journal…")));
             return;
         };
-        widgets::banner(ui, ACCENT, ic::INFO, |ui| {
+        widgets::banner(ui, color_accent(), ic::INFO, |ui| {
             ui.vertical(|ui| {
                 let since = history.since.as_deref().map(|s|format!(" from {s}")).unwrap_or_default();
                 ui.label(format!("Retained PCSweep cleanup history{since}. Older records can expire; earlier releases only recorded partial text activity."));
@@ -837,7 +837,7 @@ impl App {
             if ui.add(widgets::small("Open journal folder")).clicked() {
                 acts.push(HAct::OpenFolder);
             }
-            let refresh = widgets::icon_text(ic::REFRESH, "Refresh", 13.0, TEXT);
+            let refresh = widgets::icon_text(ic::REFRESH, "Refresh", 13.0, color_ink());
             if ui
                 .add_enabled(!h.load.running(), widgets::small(refresh))
                 .clicked()
@@ -888,11 +888,11 @@ impl App {
 
 fn render_entry(ui: &mut Ui, entry: &Entry, acts: &mut Vec<HAct>) {
     let (color, icon_char) = match entry.outcome {
-        Some(Outcome::Deleted | Outcome::Removed) => (TEXT_DIM, ic::CLEAN),
-        Some(Outcome::Recycled) => (GOOD, ic::REFRESH),
-        Some(Outcome::Skipped) => (TEXT_FAINT, ic::LOCK),
-        Some(Outcome::Failed) => (BAD, ic::WARN),
-        None => (WARN, ic::WARN),
+        Some(Outcome::Deleted | Outcome::Removed) => (color_muted(), ic::CLEAN),
+        Some(Outcome::Recycled) => (color_success(), ic::REFRESH),
+        Some(Outcome::Skipped) => (color_secondary(), ic::LOCK),
+        Some(Outcome::Failed) => (color_error(), ic::WARN),
+        None => (color_warning(), ic::WARN),
     };
     let label = outcome_label(entry.outcome, entry.action);
     widgets::row(ui, 44.0, |ui| {
@@ -914,7 +914,7 @@ fn render_entry(ui: &mut Ui, entry: &Entry, acts: &mut Vec<HAct>) {
                 let response = ui
                     .vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 1.0;
-                        ui.add(Label::new(RichText::new(name).color(TEXT)).truncate());
+                        ui.add(Label::new(RichText::new(name).color(color_ink())).truncate());
                         ui.add(Label::new(widgets::faint(detail)).truncate());
                     })
                     .response

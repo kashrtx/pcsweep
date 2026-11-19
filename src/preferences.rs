@@ -951,7 +951,7 @@ impl App {
             ));
         });
         if let Some(error) = &self.preferences.error {
-            ui.colored_label(WARN, error);
+            ui.colored_label(color_warning(), error);
         }
         let Some(inventory) = &self.preferences.inventory else {
             ui.label(widgets::dim(if self.preferences.load.running() {
@@ -976,7 +976,7 @@ impl App {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(widgets::strong(s.name, 15.0));
                     if s.machine {
-                        widgets::badge(ui, "System-wide · admin", TEXT_DIM);
+                        widgets::badge(ui, "System-wide · admin", color_muted());
                     }
                 });
                 ui.label(widgets::dim(s.description));
@@ -1022,14 +1022,14 @@ impl App {
                 };
                 ui.label(widgets::faint(status));
                 if let Err(e) = &item.guard {
-                    ui.colored_label(WARN, e);
+                    ui.colored_label(color_warning(), e);
                 }
                 if let Some(e) = journal_error {
-                    ui.colored_label(WARN, e);
+                    ui.colored_label(color_warning(), e);
                 }
                 if !own {
                     ui.colored_label(
-                        WARN,
+                        color_warning(),
                         "Changed outside PCSweep. Your newer choice is preserved.",
                     );
                 }

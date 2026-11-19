@@ -887,24 +887,15 @@ fn save_settings_at(path: &Path, pairs: &[(String, String)]) -> std::io::Result<
 // ---------------------------------------------------------------- shell
 
 fn explorer_command() -> Result<Command, String> {
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn GetSystemWindowsDirectoryW(buffer: *mut u16, size: u32) -> u32;
-    }
-    let mut buffer = vec![0u16; 32768];
-    let length =
-        unsafe { GetSystemWindowsDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
-    if length == 0 || length >= buffer.len() {
-        return Err("Windows Explorer's system folder is unavailable.".into());
-    }
-    use std::os::windows::ffi::OsStringExt;
-    let directory = PathBuf::from(std::ffi::OsString::from_wide(&buffer[..length]));
-    Ok(Command::new(directory.join("explorer.exe")))
+    let directory = crate::platform::windows_directory()?;
+    let mut command = Command::new(directory.join("explorer.exe"));
+    command.current_dir(directory);
+    Ok(command)
 }
 
 /// Resolve an internal Windows tool or document without searching the portable
 /// application's current folder or PATH, including while running elevated.
-fn system_file(name: &str) -> Result<PathBuf, String> {
+pub(crate) fn system_file(name: &str) -> Result<PathBuf, String> {
     if name.is_empty()
         || !name
             .bytes()
@@ -914,7 +905,11 @@ fn system_file(name: &str) -> Result<PathBuf, String> {
     {
         return Err("Invalid Windows system file name.".into());
     }
-    Ok(crate::platform::system_directory()?.join(name))
+    let root = crate::platform::system_directory()?;
+    if name.eq_ignore_ascii_case("powershell.exe") {
+        return Ok(root.join(r"WindowsPowerShell\v1.0\powershell.exe"));
+    }
+    Ok(root.join(name))
 }
 
 pub fn open_system_tool(program: &str) -> Result<(), String> {

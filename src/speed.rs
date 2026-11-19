@@ -739,7 +739,7 @@ impl App {
         let busy = self.speed.busy();
         ScrollArea::vertical().id_salt("internet_speed_page").auto_shrink([false, false]).show(ui, |ui| {
             widgets::page_header(ui, "Internet speed test", "Measure the current internet route with M-Lab NDT7. Adapter link speed and internet throughput are different.");
-            widgets::banner(ui, WARN, widgets::ic::INFO, |ui| { ui.vertical(|ui| {
+            widgets::banner(ui, color_warning(), widgets::ic::INFO, |ui| { ui.vertical(|ui| {
                 ui.label("M-Lab publishes measurement data including your public IP address and test time, and retains it indefinitely.");
                 ui.label(widgets::faint("This is optional. PCSweep sends synthetic test traffic and its app/version identifier, not your files or device inventory. A VPN changes the route and IP measured."));
             }); });
@@ -775,7 +775,7 @@ impl App {
                     ui.label(widgets::faint("Run only when needed. M-Lab allows at most 40 directional tests per day; each run uses two. PCSweep limits this account to 20 runs per UTC day across restarts; other clients on your IP share the provider limit."));
                 }
             });
-            if let Some(e) = &self.speed.error { ui.colored_label(WARN, e); }
+            if let Some(e) = &self.speed.error { ui.colored_label(color_warning(), e); }
             if let Some(row) = &self.speed.result { render_result(ui, row); }
             if !self.speed.history.is_empty() {
                 widgets::section(ui, "This session's history");
@@ -835,10 +835,10 @@ fn render_result(ui: &mut Ui, row: &ResultRow) {
             }
         )));
         if row.download.capped || row.upload.capped {
-            ui.colored_label(WARN, "A data cap shortened the sample. This estimate may not represent sustained throughput, especially on fast connections.");
+            ui.colored_label(color_warning(), "A data cap shortened the sample. This estimate may not represent sustained throughput, especially on fast connections.");
         }
         if let Some(e) = &row.warning {
-            ui.colored_label(WARN, e);
+            ui.colored_label(color_warning(), e);
         }
         for value in [&row.download, &row.upload] {
             if let Some(e) = &value.warning {

@@ -391,7 +391,7 @@ impl App {
             self.file_changes.error = None;
         }
         if let Some(e) = &self.file_changes.error {
-            ui.colored_label(WARN, e);
+            ui.colored_label(color_warning(), e);
             ui.label(widgets::dim("Unavailable records are not proof that no files changed. Auditing must already have been enabled for access evidence."));
         }
         ui.horizontal(|ui| {

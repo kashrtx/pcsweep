@@ -597,7 +597,7 @@ impl App {
             }
         });
         if let Some(error) = &self.security.read_error {
-            ui.colored_label(WARN, error);
+            ui.colored_label(color_warning(), error);
         }
         if let Some(message) = &self.security.result {
             ui.label(widgets::dim(message));
@@ -612,18 +612,18 @@ impl App {
                 ui.label(widgets::strong(if primary { "Microsoft Defender is active" } else if s.available { "Defender is not confirmed as your active antivirus" } else { "Defender status unavailable" }, 19.0));
                 if let Some(mode) = &s.mode { ui.label(widgets::dim(format!("Reported mode: {}", clean_text(mode)))); }
                 if !s.products.is_empty() { ui.label(widgets::dim(format!("Registered antivirus: {}", s.products.iter().map(|s| clean_text(s)).collect::<Vec<_>>().join(", ")))); }
-                if let Some(error) = &s.error { ui.colored_label(WARN, clean_text(error)); }
+                if let Some(error) = &s.error { ui.colored_label(color_warning(), clean_text(error)); }
                 ui.horizontal_wrapped(|ui| {
-                    widgets::badge(ui, &format!("Real-time protection: {}", yes_no(s.realtime)), if s.realtime == Some(true) { GOOD } else { WARN });
-                    widgets::badge(ui, &format!("Tamper protection: {}", yes_no(s.tamper)), TEXT_DIM);
+                    widgets::badge(ui, &format!("Real-time protection: {}", yes_no(s.realtime)), if s.realtime == Some(true) { color_success() } else { color_warning() });
+                    widgets::badge(ui, &format!("Tamper protection: {}", yes_no(s.tamper)), color_muted());
                 });
                 if !primary { ui.label(widgets::dim("Passive mode, another antivirus provider, or unavailable Defender services can limit these actions. Manage your active provider in Windows Security.")); }
-                if s.reboot_required == Some(true) { ui.colored_label(WARN, "Windows reports that a restart is required to finish security changes."); }
+                if s.reboot_required == Some(true) { ui.colored_label(color_warning(), "Windows reports that a restart is required to finish security changes."); }
             });
             widgets::section(ui, "Security intelligence and scans");
             let age = parse_time(s.signature_time.as_deref()).map(|t| Utc::now().signed_duration_since(t).num_hours().max(0));
             let stale = s.signatures_outdated == Some(true) || age.is_some_and(|h| h > 48);
-            ui.label(RichText::new(format!("Signatures: {}{}", show_time(s.signature_time.as_deref()), age.map(|h| format!(" · {h} hours old")).unwrap_or_default())).color(if stale { WARN } else { TEXT }));
+            ui.label(RichText::new(format!("Signatures: {}{}", show_time(s.signature_time.as_deref()), age.map(|h| format!(" · {h} hours old")).unwrap_or_default())).color(if stale { color_warning() } else { color_ink() }));
             if let Some(version) = &s.signature_version { ui.label(widgets::faint(format!("Reported version: {}", clean_text(version)))); }
             if stale { ui.label(widgets::dim("Security intelligence may be out of date. Update it before scanning.")); }
             ui.label(widgets::dim(format!("Last quick scan finished: {}", show_time(s.quick_end.as_deref()))));
@@ -636,7 +636,7 @@ impl App {
                 if watch.command_returned && ui.add(widgets::small("Stop monitoring this scan")).clicked() { stop_monitoring = true; }
             }
             let available = !busy && self.is_admin && s.primary();
-            if !self.is_admin && ui.add(widgets::small(widgets::icon_text(ic::SHIELD, "Restart as admin for security actions", 13.0, WARN))).clicked() { admin = true; }
+            if !self.is_admin && ui.add(widgets::small(widgets::icon_text(ic::SHIELD, "Restart as admin for security actions", 13.0, color_warning()))).clicked() { admin = true; }
             ui.horizontal_wrapped(|ui| {
                 for (label, action) in [("Update signatures", SecurityAction::UpdateSignatures), ("Quick scan", SecurityAction::QuickScan), ("Full scan", SecurityAction::FullScan)] {
                     if ui.add_enabled(available, widgets::small(label)).clicked() { chosen = Some(action); }
@@ -648,16 +648,16 @@ impl App {
             ui.label(widgets::dim(format!("Defender PUA setting: {pua}")));
             ui.label(widgets::faint("Blocks unwanted bundled software using Defender's own policy. No custom blocklists, downloads, or antivirus exclusions."));
             let managed = s.policy_managed;
-            if managed { ui.colored_label(WARN, "PUA changes are managed by policy. Use Windows Security to review the setting."); }
+            if managed { ui.colored_label(color_warning(), "PUA changes are managed by policy. Use Windows Security to review the setting."); }
             else if s.tamper == Some(true) { ui.label(widgets::faint("Tamper protection is on. Windows may refuse a PUA change; PCSweep verifies the setting and never bypasses that refusal.")); }
-            if let Some(error) = &s.backup_error { ui.colored_label(WARN, error); }
+            if let Some(error) = &s.backup_error { ui.colored_label(color_warning(), error); }
             ui.horizontal(|ui| {
                 if ui.add_enabled(available && !managed && matches!(s.pua, Some(0 | 2)) && s.backup.is_none() && s.backup_error.is_none(), widgets::small("Enable blocking")).clicked() { chosen = Some(SecurityAction::EnablePua); }
                 if ui.add_enabled(available && !managed && s.backup.is_some(), widgets::small("Undo PCSweep's PUA change")).clicked() { chosen = Some(SecurityAction::UndoPua); }
             });
             widgets::section(ui, "Recent Defender detections");
             ui.label(widgets::faint("Up to 20 records from Defender's history. These may be old or already resolved; Protection history has the current details."));
-            if let Some(error) = &s.detection_error { ui.colored_label(WARN, format!("Detection history unavailable: {}", clean_text(error))); }
+            if let Some(error) = &s.detection_error { ui.colored_label(color_warning(), format!("Detection history unavailable: {}", clean_text(error))); }
             else if s.detections.is_empty() { ui.label(widgets::dim("Defender returned no recent detection records. This does not establish that the PC is threat-free.")); }
             for detection in &s.detections {
                 widgets::card(ui, |ui| {

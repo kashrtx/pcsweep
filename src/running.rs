@@ -33,7 +33,19 @@ use windows_sys::Win32::{
 };
 
 /// Creation time is the original Windows FILETIME, with 100-ns precision.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct Identity {
     pub pid: u32,
     pub created: u64,
@@ -220,7 +232,7 @@ impl Drop for Handle {
 }
 
 impl Handle {
-    fn open(pid: u32, rights: u32) -> io::Result<Self> {
+    pub(crate) fn open(pid: u32, rights: u32) -> io::Result<Self> {
         let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | rights, 0, pid) };
         if handle == 0 {
             Err(io::Error::last_os_error())
@@ -229,7 +241,7 @@ impl Handle {
         }
     }
 
-    fn times(&self) -> io::Result<(u64, u64)> {
+    pub(crate) fn times(&self) -> io::Result<(u64, u64)> {
         let [mut created, mut exited, mut kernel, mut user]: [FILETIME; 4] = unsafe { zeroed() };
         if unsafe { GetProcessTimes(self.0, &mut created, &mut exited, &mut kernel, &mut user) }
             == 0
@@ -249,7 +261,7 @@ impl Handle {
         Ok(critical != 0)
     }
 
-    fn image(&self, buffer: &mut [u16]) -> Option<PathBuf> {
+    pub(crate) fn image(&self, buffer: &mut [u16]) -> Option<PathBuf> {
         let mut size = buffer.len() as u32;
         let ok = unsafe { QueryFullProcessImageNameW(self.0, 0, buffer.as_mut_ptr(), &mut size) };
         (ok != 0 && size > 0).then(|| PathBuf::from(OsString::from_wide(&buffer[..size as usize])))
@@ -268,7 +280,7 @@ impl Handle {
     }
 }
 
-fn session_id(pid: u32) -> Option<u32> {
+pub(crate) fn session_id(pid: u32) -> Option<u32> {
     let mut id = 0;
     (unsafe { ProcessIdToSessionId(pid, &mut id) } != 0).then_some(id)
 }

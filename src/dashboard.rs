@@ -202,7 +202,7 @@ impl App {
                         }
                     });
                     ui.add(Label::new(RichText::new(self.storage.overview_summary())
-                        .color(if self.storage.has_warning() { WARN } else { TEXT_DIM })).wrap());
+                        .color(if self.storage.has_warning() { color_warning() } else { color_muted() })).wrap());
                     ui.label(widgets::faint("Capacity, physical-disk reports and optimization are separate checks. Missing telemetry stays unknown."));
                 });
                 ui.add_space(8.0);
@@ -213,7 +213,7 @@ impl App {
                     widgets::card(&mut cols[0], |ui| {
                         ui.set_min_height(250.0);
                         ui.horizontal(|ui| {
-                            let col = if score >= 85 { GOOD } else if score >= 65 { WARN } else { BAD };
+                            let col = if score >= 85 { color_success() } else if score >= 65 { color_warning() } else { color_error() };
                             let word = if scanning {
                                 "checking"
                             } else if score >= 85 {
@@ -228,18 +228,18 @@ impl App {
                             ui.vertical(|ui| {
                                 ui.label(widgets::strong("Performance checks", 18.0));
                                 if recs.is_empty() && !scanning {
-                                    ui.label(RichText::new("No issues found in these performance checks.").color(GOOD));
+                                    ui.label(RichText::new("No issues found in these performance checks.").color(color_success()));
                                 }
                                 for r in recs.iter().take(4) {
                                     ui.add_space(2.0);
                                     ui.horizontal_wrapped(|ui| {
                                         let c = match r.sev {
-                                            Sev::High => BAD,
-                                            Sev::Medium => WARN,
-                                            Sev::Low => TEXT_FAINT,
+                                            Sev::High => color_error(),
+                                            Sev::Medium => color_warning(),
+                                            Sev::Low => color_secondary(),
                                         };
                                         widgets::dot(ui, c);
-                                        ui.label(RichText::new(&r.text).color(TEXT_DIM));
+                                        ui.label(RichText::new(&r.text).color(color_muted()));
                                         if let Some(p) = r.go {
                                             if ui.add(widgets::small(r.action)).clicked() {
                                                 acts.push(DAct::Go(p));
@@ -259,7 +259,7 @@ impl App {
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if self.cleaner.scan.running() {
                                     ui.spinner();
-                                } else if ui.add(widgets::small(widgets::icon_text(ic::REFRESH, "Scan again", 13.0, TEXT))).clicked() {
+                                } else if ui.add(widgets::small(widgets::icon_text(ic::REFRESH, "Scan again", 13.0, color_ink()))).clicked() {
                                     acts.push(DAct::Rescan);
                                 }
                             });
@@ -273,16 +273,16 @@ impl App {
                             return;
                         }
                         let junk = self.cleaner.recommended_total();
-                        ui.label(RichText::new(fmt_bytes(junk)).font(widgets::light(46.0)).color(TEXT));
+                        ui.label(RichText::new(fmt_bytes(junk)).font(widgets::light(46.0)).color(color_ink()));
                         ui.label(widgets::dim("safe to remove in the recommended categories"));
                         ui.add_space(8.0);
                         let top = self.cleaner.top(4);
                         let max = top.first().map(|t| t.1).unwrap_or(1).max(1) as f32;
                         for (i, b) in top {
                             ui.horizontal(|ui| {
-                                widgets::cell(ui, 190.0, false, RichText::new(self.cleaner.cats[i].name).color(TEXT_DIM));
+                                widgets::cell(ui, 190.0, false, RichText::new(self.cleaner.cats[i].name).color(color_muted()));
                                 let bw = (ui.available_width() - 90.0).max(20.0);
-                                widgets::bar(ui, b as f32 / max, ACCENT, egui::vec2(bw, 6.0));
+                                widgets::bar(ui, b as f32 / max, color_accent(), egui::vec2(bw, 6.0));
                                 widgets::cell(ui, 80.0, true, widgets::faint(fmt_bytes(b)));
                             });
                         }
@@ -306,7 +306,7 @@ impl App {
                     ui.add_space(4.0);
                     for d in &self.sys.drives {
                         ui.horizontal(|ui| {
-                            ui.label(widgets::icon(ic::DRIVE, 20.0, ACCENT));
+                            ui.label(widgets::icon(ic::DRIVE, 20.0, color_accent()));
                             ui.vertical(|ui| {
                                 ui.set_width(170.0);
                                 ui.spacing_mut().item_spacing.y = 1.0;
@@ -320,7 +320,7 @@ impl App {
                                 }
                                 ui.add_sized([170.0, 20.0], Label::new(widgets::dim(format!("{} free of {}", fmt_bytes(d.free), fmt_bytes(d.total)))));
                                 let f = d.used_frac();
-                                let col = if f > 0.9 { BAD } else if f > 0.8 { WARN } else { ACCENT };
+                                let col = if f > 0.9 { color_error() } else if f > 0.8 { color_warning() } else { color_accent() };
                                 let bw = (ui.available_width() - 10.0).max(40.0);
                                 widgets::bar(ui, f, col, egui::vec2(bw, 10.0));
                             });
@@ -342,7 +342,7 @@ impl App {
                         });
                         let f = self.sys.mem_frac();
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new(format!("{:.0}%", f * 100.0)).font(widgets::light(36.0)).color(TEXT));
+                            ui.label(RichText::new(format!("{:.0}%", f * 100.0)).font(widgets::light(36.0)).color(color_ink()));
                             ui.label(widgets::dim(format!(
                                 "of {} in use, processor at {:.0}%",
                                 fmt_bytes(self.sys.mem_total),
@@ -353,9 +353,9 @@ impl App {
                         let max = groups.first().map(|g| g.memory).unwrap_or(1).max(1) as f32;
                         for g in groups.iter().take(4) {
                             ui.horizontal(|ui| {
-                                widgets::cell(ui, 190.0, false, RichText::new(&g.name).color(TEXT_DIM));
+                                widgets::cell(ui, 190.0, false, RichText::new(&g.name).color(color_muted()));
                                 let bw = (ui.available_width() - 90.0).max(20.0);
-                                widgets::bar(ui, g.memory as f32 / max, ACCENT_STRONG, egui::vec2(bw, 6.0));
+                                widgets::bar(ui, g.memory as f32 / max, color_primary(), egui::vec2(bw, 6.0));
                                 widgets::cell(ui, 80.0, true, widgets::faint(fmt_bytes(g.memory)));
                             });
                         }
@@ -376,16 +376,16 @@ impl App {
                         ];
                         for (icon, title, sub, kind) in items {
                             let resp = widgets::row(ui, 40.0, |ui| {
-                                ui.label(widgets::icon(icon, 18.0, ACCENT));
+                                ui.label(widgets::icon(icon, 18.0, color_accent()));
                                 ui.add_space(4.0);
                                 ui.vertical(|ui| {
                                     ui.spacing_mut().item_spacing.y = 0.0;
-                                    ui.label(RichText::new(title).color(TEXT));
+                                    ui.label(RichText::new(title).color(color_ink()));
                                     ui.label(widgets::faint(sub));
                                 });
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     ui.add_space(6.0);
-                                    ui.add(widgets::small(widgets::icon(ic::CHEVRON, 11.0, TEXT_DIM))).clicked()
+                                    ui.add(widgets::small(widgets::icon(ic::CHEVRON, 11.0, color_muted()))).clicked()
                                 })
                                 .inner
                             });
@@ -400,7 +400,7 @@ impl App {
                 });
                 ui.add_space(8.0);
                 if !self.is_admin {
-                    widgets::banner(ui, WARN, ic::SHIELD, |ui| {
+                    widgets::banner(ui, color_warning(), ic::SHIELD, |ui| {
                         ui.label(
                             "PCSweep is running without administrator rights, so some Windows folders can't be cleaned. Use Restart as admin in the sidebar to unlock everything.",
                         );

@@ -419,7 +419,7 @@ impl App {
             widgets::page_header(ui, "Ads and tracking", "Combine browser blocking with optional DNS filtering. Your choices stay explicit and reversible.");
 
             if let Some(e) = &self.ads.error {
-                ui.colored_label(WARN, e);
+                ui.colored_label(color_warning(), e);
             }
             if let Some(m) = &self.ads.message {
                 ui.label(widgets::dim(m));
@@ -515,7 +515,7 @@ impl App {
                 }
             }
 
-            widgets::banner(ui, ACCENT, ic::INFO, |ui| {
+            widgets::banner(ui, color_accent(), ic::INFO, |ui| {
                 ui.vertical(|ui| {
                     ui.label("DNS blocks many ad/tracker domains across apps. A browser blocker handles page-level filtering.");
                     ui.label(widgets::faint("Neither layer blocks every ad. Same-domain YouTube/Twitch ads, sponsored posts and apps using their own DNS can remain."));
@@ -570,15 +570,15 @@ impl App {
                         match &view.config {
                             Ok(c) => {
                                 ui.label(widgets::dim(config_label(c)));
-                                if c == &dns::adguard() { widgets::badge(ui,"AdGuard DNS configured",GOOD); }
+                                if c == &dns::adguard() { widgets::badge(ui,"AdGuard DNS configured",color_success()); }
                             }
                             Err(e) => {
-                                ui.colored_label(WARN, e);
+                                ui.colored_label(color_warning(), e);
                             }
                         }
 
                         if let Some(g) = &view.guard {
-                            ui.colored_label(WARN, g);
+                            ui.colored_label(color_warning(), g);
                             if let Some(preferred) = preferred_adapter(&inventory.adapters).filter(|v|v.guard.is_none() && v.adapter.guid != view.adapter.guid) {
                                 if ui.add(widgets::small(format!("Use recommended adapter: {}",preferred.adapter.name))).clicked() {
                                     self.ads.selected = Some(preferred.adapter.guid.clone());
@@ -685,7 +685,7 @@ impl App {
                             } else {
                                 "Checking…"
                             },
-                            TEXT_DIM,
+                            color_muted(),
                         );
                     });
 

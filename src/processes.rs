@@ -1,5 +1,6 @@
 use crate::app::{Action, App, Modal, ToastKind};
 use crate::app_icons::{IconCache, IconSource};
+use crate::recovery::{self, RecoveryAction, Reopen};
 use crate::running::{self, Access, Identity, Process, Row, RowId, Snapshot, Window};
 use crate::system::{self, MemoryPressure, PowerPolicy};
 use crate::task::Task;
@@ -7,7 +8,7 @@ use crate::theme::*;
 use crate::util::{self, fmt_bytes, fmt_num};
 use crate::widgets::{self, ic};
 use eframe::egui::{self, Align, Label, Layout, RichText, ScrollArea, Ui};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -174,6 +175,7 @@ struct Target {
     name: String,
     windows: Vec<Window>,
     original: Option<PowerPolicy>,
+    reopenable: bool,
 }
 
 pub struct MemoryAction {
@@ -202,6 +204,7 @@ pub struct MemoryReport {
     before: u64,
     after: u64,
     policies: Vec<(Identity, Option<PowerPolicy>)>,
+    reopen: Vec<(Identity, Reopen)>,
 }
 impl MemoryReport {
     fn summary(&self) -> String {
@@ -255,6 +258,10 @@ pub struct MemState {
     report: Option<MemoryReport>,
     results_open: bool,
     icons: IconCache,
+    recovering: Task<Result<String, String>>,
+    recent: VecDeque<Reopen>,
+    pending_reopen: HashMap<Identity, Reopen>,
+    recent_open: bool,
 }
 
 impl Default for MemState {
@@ -278,13 +285,24 @@ impl Default for MemState {
             report: None,
             results_open: false,
             icons: IconCache::default(),
+            recovering: Task::default(),
+            recent: VecDeque::new(),
+            pending_reopen: HashMap::new(),
+            recent_open: false,
         }
     }
 }
 
 impl MemState {
+    fn remember_closed(&mut self, app: Reopen) {
+        self.recent
+            .retain(|old| !crate::winfile::same_path(&old.path, &app.path));
+        self.recent.push_front(app);
+        self.recent.truncate(12);
+    }
+
     pub fn busy(&self) -> bool {
-        self.job.running()
+        self.job.running() || self.recovering.running()
     }
 }
 
@@ -315,6 +333,7 @@ fn run_operation(action: MemoryAction, stop: &AtomicBool) -> MemoryReport {
         before: 0,
         after: 0,
         policies: Vec::new(),
+        reopen: Vec::new(),
     };
     let mut pending = Vec::new();
     for target in action.targets {
@@ -325,6 +344,14 @@ fn run_operation(action: MemoryAction, stop: &AtomicBool) -> MemoryReport {
             detail: String::new(),
         };
         if operation.closes() {
+            let reopen = if target.reopenable && !stop.load(Ordering::Relaxed) {
+                recovery::remember(target.id, &row.name)
+            } else {
+                None
+            };
+            if row.name.eq_ignore_ascii_case("explorer.exe") && operation == Operation::End {
+                recovery::before_end(target.id);
+            }
             let request = if stop.load(Ordering::Relaxed) {
                 Err("Request stopped before this process was reached.".into())
             } else if operation == Operation::Close {
@@ -332,6 +359,11 @@ fn run_operation(action: MemoryAction, stop: &AtomicBool) -> MemoryReport {
             } else {
                 running::request_end(target.id)
             };
+            if request.is_ok() {
+                if let Some(app) = reopen {
+                    report.reopen.push((target.id, app));
+                }
+            }
             match request {
                 Ok(Some(handle)) => {
                     pending.push((report.rows.len(), handle));
@@ -459,6 +491,16 @@ impl App {
 
     pub fn poll_memory(&mut self, ctx: &egui::Context) {
         self.mem.icons.poll(ctx);
+        if let Some(result) = self.mem.recovering.poll() {
+            match result.and_then(|result| result) {
+                Ok(message) => {
+                    util::log(&message);
+                    self.toast(ToastKind::Info, message);
+                    self.sys.refresh_processes_soon();
+                }
+                Err(error) => self.toast(ToastKind::Error, error),
+            }
+        }
         let pressure = system::memory_pressure(
             self.sys.mem_total,
             self.sys.mem_avail,
@@ -471,10 +513,22 @@ impl App {
         let snapshot = &self.sys.processes;
         if self.mem.last_sample != snapshot.sampled_at {
             self.mem.last_sample = snapshot.sampled_at;
-            if !self.mem.checked.is_empty() || !self.mem.efficiency.is_empty() {
+            if !self.mem.checked.is_empty()
+                || !self.mem.efficiency.is_empty()
+                || !self.mem.pending_reopen.is_empty()
+            {
                 let live: HashSet<_> = snapshot.processes.iter().map(|p| p.identity).collect();
                 self.mem.checked.retain(|id| live.contains(id));
                 self.mem.efficiency.retain(|id, _| live.contains(id));
+                let exited: Vec<_> = self
+                    .mem
+                    .pending_reopen
+                    .extract_if(|id, _| !live.contains(id))
+                    .map(|(_, app)| app)
+                    .collect();
+                for app in exited {
+                    self.mem.remember_closed(app);
+                }
             }
         }
         let Some(result) = self.mem.job.poll() else {
@@ -483,7 +537,20 @@ impl App {
         self.mem.running = None;
         match result {
             Err(error) => self.toast(ToastKind::Error, error),
-            Ok(report) => {
+            Ok(mut report) => {
+                for (id, app) in std::mem::take(&mut report.reopen) {
+                    if report
+                        .rows
+                        .iter()
+                        .any(|row| row.id == id && row.outcome == Outcome::Waiting)
+                    {
+                        if self.mem.pending_reopen.len() < 64 {
+                            self.mem.pending_reopen.insert(id, app);
+                        }
+                    } else {
+                        self.mem.remember_closed(app);
+                    }
+                }
                 for &(id, policy) in &report.policies {
                     if let Some(original) = policy {
                         self.mem.efficiency.entry(id).or_insert(original);
@@ -514,6 +581,117 @@ impl App {
                 self.mem.results_open = !complete;
                 self.sys.refresh_processes_soon();
             }
+        }
+    }
+
+    pub fn execute_recovery(&mut self, action: RecoveryAction, ctx: &egui::Context) {
+        if !self.mutations_running() {
+            self.mem.recovering = Task::spawn(ctx, move || recovery::recover(action));
+        }
+    }
+
+    pub(crate) fn inspect_process(&mut self, id: Identity) {
+        self.page = crate::app::Page::Memory;
+        self.mem.selected = Some(RowId::Process(id));
+        self.mem.inspect_open = true;
+    }
+
+    pub(crate) fn review_explorer_restart(&mut self) {
+        self.mem.recent_open = false;
+        self.modal = Some(Modal {
+            title: "Restart Windows Explorer?".into(),
+            body: "Restart the Windows desktop and taskbar. Open File Explorer windows may close."
+                .into(),
+            details: Vec::new(),
+            note: Some("Wait for file copies and moves to finish before restarting.".into()),
+            confirm: "Restart Explorer".into(),
+            danger: false,
+            action: Action::Recovery(RecoveryAction::Explorer { restart: true }),
+        });
+    }
+
+    pub(crate) fn show_recent_apps(&mut self) {
+        self.mem.recent_open = true;
+    }
+
+    pub(crate) fn recovery_buttons(&mut self, ui: &mut Ui) {
+        let enabled = !self.mutations_running();
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(enabled, widgets::small("Open Explorer"))
+                .clicked()
+            {
+                self.execute_recovery(RecoveryAction::Explorer { restart: false }, ui.ctx());
+            }
+            if ui
+                .add_enabled(enabled, widgets::small("Restart Explorer…"))
+                .clicked()
+            {
+                self.review_explorer_restart();
+            }
+            let recent = self.mem.recent.len();
+            let label = if recent == 0 {
+                "Recently closed".into()
+            } else {
+                format!("Recently closed ({recent})")
+            };
+            if ui.add(widgets::ghost(label)).clicked() {
+                self.show_recent_apps();
+            }
+            if self.mem.recovering.running() {
+                ui.spinner();
+                ui.label(widgets::dim("Opening…"));
+            }
+        });
+    }
+
+    pub(crate) fn recent_apps_ui(&mut self, ctx: &egui::Context) {
+        if !self.mem.recent_open || self.modal.is_some() {
+            return;
+        }
+        let mut open = self.mem.recent_open;
+        let mut reopen = None;
+        let enabled = !self.mutations_running();
+        egui::Window::new("Recently closed apps")
+            .id(egui::Id::new("recently_closed_apps"))
+            .default_width(520.0)
+            .resizable(false)
+            .collapsible(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                if self.mem.recent.is_empty() {
+                    ui.label(widgets::dim("Desktop apps closed with PCSweep will appear here when they can be reopened."));
+                    return;
+                }
+                ui.label(widgets::dim("Reopen a desktop app on this PC. Any session restore is handled by the app."));
+                ScrollArea::vertical()
+                    .id_salt("recent_closed_scroll")
+                    .max_height((ctx.screen_rect().height() - 180.0).clamp(100.0, 320.0))
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for (index, app) in self.mem.recent.iter().enumerate() {
+                            ui.push_id(index, |ui| {
+                                widgets::tight_card(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        if ui.add_enabled(enabled && reopen.is_none(), widgets::small("Reopen")).clicked() {
+                                            reopen = Some(app.clone());
+                                        }
+                                        self.mem.icons.show(ui, &IconSource::Executable(app.path.clone()));
+                                        ui.vertical(|ui| {
+                                            ui.add(egui::Label::new(widgets::strong(&app.name, 14.0)).truncate());
+                                            ui.add(egui::Label::new(widgets::faint(app.path.display().to_string())).truncate())
+                                                .on_hover_text(app.path.display().to_string());
+                                        });
+                                    });
+                                });
+                            });
+                        }
+                    });
+            });
+        self.mem.recent_open = open;
+        self.mem.icons.start_pending(ctx);
+        if let Some(app) = reopen {
+            self.execute_recovery(RecoveryAction::Reopen(app), ctx);
         }
     }
 
@@ -632,6 +810,7 @@ impl App {
                     Vec::new()
                 },
                 original: self.mem.efficiency.get(&process.identity).copied(),
+                reopenable: !process.windows.is_empty() && !process.windows_component,
             })
             .collect();
         self.modal = Some(Modal {
@@ -659,9 +838,9 @@ impl App {
             self.sys.commit_limit,
         );
         let color = match pressure {
-            MemoryPressure::Normal => GOOD,
-            MemoryPressure::Elevated => WARN,
-            MemoryPressure::Critical => BAD,
+            MemoryPressure::Normal => color_success(),
+            MemoryPressure::Elevated => color_warning(),
+            MemoryPressure::Critical => color_error(),
         };
         self.render_memory_summary(ui, color, &mut acts);
         if pressure != MemoryPressure::Normal {
@@ -678,6 +857,7 @@ impl App {
             };
             ui.colored_label(color, message);
         }
+        self.recovery_buttons(ui);
         ui.add_space(8.0);
         self.render_process_table(ui, false, &mut acts);
         self.process_windows(ui.ctx(), &mut acts);
@@ -685,6 +865,7 @@ impl App {
     }
 
     pub fn background_processes(&mut self, ui: &mut Ui) {
+        self.recovery_buttons(ui);
         let mut acts = Vec::new();
         self.render_process_table(ui, true, &mut acts);
         self.process_windows(ui.ctx(), &mut acts);
@@ -749,7 +930,7 @@ impl App {
                     ic::REFRESH,
                     "Refresh",
                     13.0,
-                    TEXT,
+                    color_ink(),
                 )))
                 .clicked()
             {
@@ -794,7 +975,7 @@ impl App {
         let checked = &self.mem.checked;
         let shown_count = indices.len();
         if let Some(error) = &self.sys.process_warning {
-            ui.add(Label::new(RichText::new(error).color(WARN)).wrap());
+            ui.add(Label::new(RichText::new(error).color(color_warning())).wrap());
         }
         if let Some(at) = snapshot.sampled_at {
             let age = at.elapsed().as_secs();
@@ -1255,12 +1436,12 @@ fn process_row(
                 widgets::cell(ui, 90.0, true, widgets::dim(metric(row.private_known, total, fmt_bytes(row.private))))
                     .on_hover_text("Private commit is memory reserved by this process. ~ indicates a partial total.");
                 widgets::cell(ui, 88.0, true, RichText::new(growth_text(row.growth, row.observed_secs))
-                    .color(if row.growth > 0 { WARN } else { TEXT_DIM }))
+                    .color(if row.growth > 0 { color_warning() } else { color_muted() }))
                     .on_hover_text("Change in private commit across the available samples, up to 10 minutes.");
             }
             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                 let label = if scope.individual() { format!("{} · {}", row.name, first.identity.pid) } else { row.title() };
-                let button = ui.add(egui::Button::new(RichText::new(label).color(TEXT)).frame(false).truncate())
+                let button = ui.add(egui::Button::new(RichText::new(label).color(color_ink())).frame(false).truncate())
                     .on_hover_text(format!(
                         "{}\n{}",
                         first.image.as_ref().map_or_else(|| first.name.clone(), |path| path.display().to_string()),
@@ -1551,6 +1732,7 @@ mod tests {
                 name: "Test".into(),
                 windows: Vec::new(),
                 original: None,
+                reopenable: false,
             }],
         };
         let report = run_operation(action, &AtomicBool::new(true));

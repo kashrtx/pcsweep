@@ -2,7 +2,7 @@ use crate::app::{Action, App, Modal, ToastKind};
 use crate::theme::*;
 use crate::util::{self, fmt_bytes};
 use crate::widgets::{self, ic};
-use eframe::egui::{self, Align, Color32, Layout, RichText, ScrollArea, Ui};
+use eframe::egui::{self, Align, Layout, RichText, ScrollArea, Ui};
 use std::fs;
 use std::io::Read;
 use std::process::Stdio;
@@ -46,8 +46,7 @@ pub fn tools() -> Vec<ToolDef> {
                 program: "powershell.exe",
                 args: &[
                     "-NoProfile",
-                    "-ExecutionPolicy",
-                    "Bypass",
+                    "-NonInteractive",
                     "-Command",
                     "Checkpoint-Computer -Description 'PCSweep' -RestorePointType 'MODIFY_SETTINGS' -ErrorAction Stop; 'Restore point created.'",
                 ],
@@ -419,12 +418,19 @@ pub fn spawn(
     let (o, d, x) = (output.clone(), done.clone(), exit.clone());
     std::thread::spawn(move || {
         append(&o, &format!("> {} {}\n\n", program, args.join(" ")));
-        let child = util::hidden_command(program)
-            .args(&args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn();
+        let child = (|| {
+            let executable = util::system_file(program).map_err(std::io::Error::other)?;
+            let mut command = std::process::Command::new(&executable);
+            use std::os::windows::process::CommandExt;
+            command
+                .creation_flags(util::CREATE_NO_WINDOW)
+                .current_dir(executable.parent().expect("Windows system directory"))
+                .args(&args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+        })();
         match child {
             Err(e) => append(&o, &format!("Couldn't start {program}: {e}\n")),
             Ok(mut ch) => {
@@ -612,13 +618,18 @@ impl App {
         }
     }
 
-    fn render_tools(&self, ui: &mut Ui, acts: &mut Vec<TAct>) {
-        let t = &self.tools;
+    fn render_tools(&mut self, ui: &mut Ui, acts: &mut Vec<TAct>) {
         widgets::page_header(
             ui,
             "Tools",
             "Windows' own repair and maintenance tools, one click away, with their output shown live.",
         );
+        widgets::card(ui, |ui| {
+            ui.label(widgets::strong("Desktop recovery", 17.0));
+            self.recovery_buttons(ui);
+        });
+        ui.add_space(12.0);
+        let t = &self.tools;
         let busy = t.run.as_ref().map_or(false, |r| !r.is_done());
 
         if let Some(run) = &t.run {
@@ -627,9 +638,9 @@ impl App {
                     if run.is_done() {
                         let code = run.exit.lock().ok().and_then(|e| *e);
                         if matches!(code, Some(0 | 3010)) {
-                            ui.label(widgets::icon(ic::CHECK, 16.0, GOOD));
+                            ui.label(widgets::icon(ic::CHECK, 16.0, color_success()));
                         } else {
-                            ui.label(widgets::icon(ic::WARN, 16.0, WARN));
+                            ui.label(widgets::icon(ic::WARN, 16.0, color_warning()));
                         }
                     } else {
                         ui.spinner();
@@ -651,7 +662,7 @@ impl App {
                 });
                 let text = run.output.lock().map(|s| s.clone()).unwrap_or_default();
                 egui::Frame::none()
-                    .fill(Color32::from_rgb(13, 15, 21))
+                    .fill(color_input())
                     .rounding(egui::Rounding::same(8.0))
                     .inner_margin(egui::Margin::same(10.0))
                     .show(ui, |ui| {
@@ -662,7 +673,7 @@ impl App {
                             .stick_to_bottom(true)
                             .auto_shrink([false, true])
                             .show(ui, |ui| {
-                                ui.label(RichText::new(text).monospace().color(TEXT_DIM));
+                                ui.label(RichText::new(text).monospace().color(color_muted()));
                             });
                     });
             });
@@ -683,7 +694,7 @@ impl App {
                                 "swapfile.sys" => format!("Swap file {}", fmt_bytes(*size)),
                                 _ => "A previous Windows installation (Windows.old) is present. Remove it with Disk Cleanup".to_string(),
                             };
-                            widgets::badge(ui, &text, TEXT_DIM);
+                            widgets::badge(ui, &text, color_muted());
                         }
                     });
                     ui.label(widgets::faint(
@@ -699,12 +710,12 @@ impl App {
                     widgets::tight_frame().show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
                         ui.horizontal(|ui| {
-                            ui.label(widgets::icon(def.icon, 20.0, ACCENT));
+                            ui.label(widgets::icon(def.icon, 20.0, color_accent()));
                             ui.add_space(4.0);
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 let needs_admin = def.admin && !self.is_admin;
                                 if needs_admin {
-                                    if ui.add(widgets::small(widgets::icon_text(ic::SHIELD, "Restart as admin", 13.0, WARN))).clicked() {
+                                    if ui.add(widgets::small(widgets::icon_text(ic::SHIELD, "Restart as admin", 13.0, color_warning()))).clicked() {
                                         acts.push(TAct::Relaunch);
                                     }
                                 } else {
@@ -720,7 +731,7 @@ impl App {
                                         ui.horizontal(|ui| {
                                             ui.label(widgets::strong(def.name, 14.5));
                                             if def.admin {
-                                                widgets::badge(ui, "Admin", TEXT_DIM);
+                                                widgets::badge(ui, "Admin", color_muted());
                                             }
                                         });
                                         ui.label(widgets::dim(def.desc));

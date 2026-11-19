@@ -10,14 +10,13 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Once};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const API: &str = "https://api.github.com/repos/kashrtx/pcsweep/releases/latest";
 const RELEASES: &str = "https://github.com/kashrtx/pcsweep/releases/latest";
-const MAX_EXE: u64 = 128 * 1024 * 1024;
+pub(crate) const MAX_EXE: u64 = 128 * 1024 * 1024;
 const MAX_JSON: u64 = 1024 * 1024;
 const DAY: u64 = 86_400;
 
@@ -86,6 +85,7 @@ struct DownloadProgress {
     downloaded: AtomicU64,
     total: AtomicU64,
     cancel: AtomicBool,
+    finishing: AtomicBool,
 }
 
 enum DownloadResult {
@@ -186,7 +186,7 @@ fn is_newer(
     Ok(m.revision > current_revision)
 }
 
-fn valid_hex(s: &str, n: usize) -> bool {
+pub(crate) fn valid_hex(s: &str, n: usize) -> bool {
     s.len() == n && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
@@ -387,42 +387,47 @@ fn check_with_fetch(
     }))
 }
 
-fn sha256(path: &Path) -> Result<String, String> {
-    let mut file = File::open(path).map_err(|e| e.to_string())?;
-    let mut hash = Sha256::new();
-    let mut bytes = [0; 64 * 1024];
-    loop {
-        let n = file.read(&mut bytes).map_err(|e| e.to_string())?;
-        if n == 0 {
-            break;
-        }
-        hash.update(&bytes[..n]);
-    }
-    Ok(format!("{:x}", hash.finalize()))
-}
-
-fn verify_executable(path: &Path, size: u64, expected: &str) -> Result<(), String> {
-    let md = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
-    if util::is_reparse(&md)
-        || !md.is_file()
-        || md.len() != size
-        || !sha256(path)?.eq_ignore_ascii_case(expected)
+pub(crate) fn verify_executable(file: &mut File, size: u64, expected: &str) -> Result<(), String> {
+    use std::io::{Seek, SeekFrom};
+    let fail = || "The download is not a complete Windows x64 application.".to_string();
+    if file.metadata().map_err(|e| e.to_string())?.len() != size
+        || !(4096..=MAX_EXE).contains(&size)
     {
-        return Err(
-            "The downloaded file failed size or SHA-256 verification. It will not be installed."
-                .into(),
-        );
+        return Err("The downloaded file does not match the expected size.".into());
     }
-    let mut file = File::open(path).map_err(|e| e.to_string())?;
-    let mut header = [0; 64];
-    file.read_exact(&mut header)
-        .map_err(|_| "The downloaded executable is incomplete.".to_string())?;
-    if &header[..2] != b"MZ" {
-        return Err("The download is not a Windows executable.".into());
+    let mut dos = [0; 64];
+    file.rewind()
+        .and_then(|_| file.read_exact(&mut dos))
+        .map_err(|_| fail())?;
+    let offset = u32::from_le_bytes(dos[60..64].try_into().unwrap()) as u64;
+    let mut pe = [0; 94];
+    if &dos[..2] != b"MZ" || offset < 64 || offset + pe.len() as u64 > size {
+        return Err(fail());
+    }
+    file.seek(SeekFrom::Start(offset))
+        .and_then(|_| file.read_exact(&mut pe))
+        .map_err(|_| fail())?;
+    let field = |at| u16::from_le_bytes([pe[at], pe[at + 1]]);
+    if &pe[..4] != b"PE\0\0"
+        || field(4) != 0x8664
+        || field(6) == 0
+        || field(20) < 70
+        || field(22) & 0x2002 != 2
+        || field(24) != 0x20b
+        || field(92) != 2
+    {
+        return Err(fail());
+    }
+    file.rewind().map_err(|e| e.to_string())?;
+    let mut hash = Sha256::new();
+    std::io::copy(file, &mut hash).map_err(|e| e.to_string())?;
+    if !format!("{:x}", hash.finalize()).eq_ignore_ascii_case(expected) {
+        return Err("The downloaded file failed SHA-256 verification.".into());
     }
     Ok(())
 }
 
+#[cfg(test)]
 fn unique() -> String {
     format!(
         "{}-{}",
@@ -433,46 +438,57 @@ fn unique() -> String {
             .as_nanos()
     )
 }
+
 fn update_dir() -> PathBuf {
     util::log_path().with_file_name("updates")
 }
 
-#[derive(Serialize, Deserialize)]
-struct InstallRequest {
-    target: PathBuf,
-    staged: PathBuf,
-    backup: PathBuf,
-    size: u64,
-    sha256: String,
-    old_sha256: String,
-    parent_pid: u32,
-    parent_created: u64,
-    token: String,
-}
-
-fn creation_time(handle: isize) -> Result<u64, String> {
-    use windows_sys::Win32::Foundation::FILETIME;
-    use windows_sys::Win32::System::Threading::GetProcessTimes;
-    let mut created: FILETIME = unsafe { std::mem::zeroed() };
-    let mut exited = created;
-    let mut kernel = created;
-    let mut user = created;
-    if unsafe { GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) } == 0 {
-        return Err("Could not verify the running app's identity.".into());
-    }
-    Ok((created.dwHighDateTime as u64) << 32 | created.dwLowDateTime as u64)
-}
-
-fn reject_links(path: &Path) -> Result<(), String> {
-    if !path.is_absolute() {
-        return Err("Update paths must be absolute.".into());
-    }
-    for p in path.ancestors() {
-        let md = fs::symlink_metadata(p).map_err(|e| e.to_string())?;
-        if util::is_reparse(&md) {
-            return Err("Updates cannot be installed through links or junctions. Move PCSweep to a regular folder first.".into());
+fn download_to(
+    update: &AvailableUpdate,
+    path: &Path,
+    progress: &DownloadProgress,
+) -> Result<(), String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    let mut input = request(&update.url)?.into_reader();
+    progress
+        .total
+        .store(update.manifest.size, Ordering::Relaxed);
+    let mut size = 0u64;
+    let mut buf = [0; 64 * 1024];
+    let start = Instant::now();
+    loop {
+        if progress.cancel.load(Ordering::Relaxed) {
+            return Err("Download cancelled.".into());
         }
+        if start.elapsed() > Duration::from_secs(180) {
+            return Err("The update download timed out. Try again later.".into());
+        }
+        let n = input
+            .read(&mut buf)
+            .map_err(|_| "The update download was interrupted. Try again.")?;
+        if n == 0 {
+            break;
+        }
+        size += n as u64;
+        if size > update.manifest.size {
+            return Err("The update download exceeded its expected size.".into());
+        }
+        file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+        progress.downloaded.store(size, Ordering::Relaxed);
     }
+    file.sync_all().map_err(|e| e.to_string())?;
+    verify_executable(&mut file, update.manifest.size, &update.manifest.sha256)?;
+    if progress.cancel.load(Ordering::Relaxed) {
+        return Err("Download cancelled.".into());
+    }
+    progress.finishing.store(true, Ordering::Relaxed);
     Ok(())
 }
 
@@ -482,436 +498,37 @@ fn download_update(
     progress: Arc<DownloadProgress>,
 ) -> Result<DownloadResult, String> {
     validate_asset_url(&update.url, &update.tag, "PCSweep.exe")?;
-    let current = std::env::current_exe().map_err(|e| e.to_string())?;
-    let current = fs::canonicalize(&current).map_err(|e| e.to_string())?;
-    let nonce = unique();
-    let job = update_dir().join(format!("job-{nonce}"));
-    fs::create_dir_all(&job)
-        .map_err(|e| format!("Could not create an update download folder: {e}"))?;
-    reject_links(&job)?;
-    let job = fs::canonicalize(&job).map_err(|e| e.to_string())?;
-    let downloaded = job.join("PCSweep.exe");
-    let result = (|| {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&downloaded)
-            .map_err(|e| e.to_string())?;
-        let mut input = request(&update.url)?.into_reader();
-        progress
-            .total
-            .store(update.manifest.size, Ordering::Relaxed);
-        let mut size = 0u64;
-        let mut buf = [0; 64 * 1024];
-        let start = Instant::now();
-        loop {
-            if progress.cancel.load(Ordering::Relaxed) {
-                return Err("Download cancelled. Your installed app is unchanged.".into());
+    if restart {
+        let job = crate::update_install::Job::prepare()?;
+        let result = download_to(&update, &job.download_path(), &progress)
+            .and_then(|()| job.handoff(update.manifest.size, update.manifest.sha256));
+        return match result {
+            Ok(()) => Ok(DownloadResult::Restart),
+            Err(error) => {
+                job.cancel();
+                Err(error)
             }
-            if start.elapsed() > Duration::from_secs(180) {
-                return Err("The update download timed out. Try again later.".into());
-            }
-            let n = input
-                .read(&mut buf)
-                .map_err(|_| "The update download was interrupted. Try again.".to_string())?;
-            if n == 0 {
-                break;
-            }
-            size += n as u64;
-            if size > update.manifest.size {
-                return Err("The update download exceeded its expected size.".into());
-            }
-            file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
-            progress.downloaded.store(size, Ordering::Relaxed);
-        }
-        file.sync_all().map_err(|e| e.to_string())?;
-        drop(file);
-        verify_executable(&downloaded, update.manifest.size, &update.manifest.sha256)?;
-        if progress.cancel.load(Ordering::Relaxed) {
-            return Err("Download cancelled. Your installed app is unchanged.".into());
-        }
-        if !restart {
-            return Ok(DownloadResult::Saved(downloaded.clone()));
-        }
-        reject_links(&current)?;
-        let parent = current
-            .parent()
-            .ok_or("The app's folder could not be located.")?;
-        let staged = parent.join(format!(".pcsweep-update-{nonce}.exe"));
-        let backup = parent.join(format!(".pcsweep-backup-{nonce}.exe"));
-        // A protected/readonly portable location gets a verified download instead
-        // of an elevation request or a partially installed app.
-        let Ok(mut stage) = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&staged)
-        else {
-            return Ok(DownloadResult::Saved(downloaded.clone()));
         };
-        let copy = (|| {
-            let mut input = File::open(&downloaded).map_err(|e| e.to_string())?;
-            std::io::copy(&mut input, &mut stage).map_err(|e| e.to_string())?;
-            stage.sync_all().map_err(|e| e.to_string())?;
-            Ok::<_, String>(())
-        })();
-        drop(stage);
-        if let Err(e) = copy {
-            let _ = fs::remove_file(&staged);
-            return Err(e);
-        }
-        let handed = handoff(&current, &staged, &backup, &job, &update.manifest, nonce);
-        if handed.is_err() {
-            let _ = fs::remove_file(&staged);
-        }
-        handed?;
-        Ok(DownloadResult::Restart)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&downloaded);
     }
-    result
-}
 
-fn handoff(
-    current: &Path,
-    staged: &Path,
-    backup: &Path,
-    job: &Path,
-    manifest: &Manifest,
-    token: String,
-) -> Result<(), String> {
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    let helper = job.join("PCSweep-updater.exe");
-    let bytes = fs::read(current).map_err(|e| e.to_string())?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&helper)
-        .map_err(|e| e.to_string())?;
-    file.write_all(&bytes).map_err(|e| e.to_string())?;
-    file.sync_all().map_err(|e| e.to_string())?;
-    drop(file);
-    let request = InstallRequest {
-        target: current.to_path_buf(),
-        staged: staged.to_path_buf(),
-        backup: backup.to_path_buf(),
-        size: manifest.size,
-        sha256: manifest.sha256.clone(),
-        old_sha256: sha256(current)?,
-        parent_pid: std::process::id(),
-        parent_created: creation_time(unsafe { GetCurrentProcess() })?,
-        token,
-    };
-    let path = job.join("request.json");
-    let data = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&path)
-        .map_err(|e| e.to_string())?;
-    file.write_all(&data).map_err(|e| e.to_string())?;
-    file.sync_all().map_err(|e| e.to_string())?;
-    drop(file);
-    let digest = format!("{:x}", Sha256::digest(&data));
-    let mut child = util::hidden_command(
-        helper
-            .to_str()
-            .ok_or("The updater path could not be encoded.")?,
-    )
-    .arg("--pcsweep-update-helper")
-    .arg(&path)
-    .arg(digest)
-    .spawn()
-    .map_err(|e| format!("Could not start the update helper: {e}"))?;
-    let start = Instant::now();
-    loop {
-        if fs::read_to_string(job.join("ready")).is_ok_and(|s| s == request.token) {
-            return Ok(());
-        }
-        if child.try_wait().map_err(|e| e.to_string())?.is_some() {
-            return Err(
-                "The update helper stopped before it was ready. Your installed app is unchanged."
-                    .into(),
-            );
-        }
-        if start.elapsed() > Duration::from_secs(10) {
-            let _ = child.kill();
-            return Err(
-                "The update helper did not start in time. Your installed app is unchanged.".into(),
-            );
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-fn validate_request_layout(
-    request: &InstallRequest,
-    job: &Path,
-    helper: &Path,
-    root: &Path,
-) -> Result<(), String> {
-    if helper.file_name().and_then(|s| s.to_str()) != Some("PCSweep-updater.exe")
-        || helper.parent() != Some(job)
-        || job.parent() != Some(root)
-        || job.file_name().and_then(|s| s.to_str())
-            != Some(format!("job-{}", request.token).as_str())
-        || request.token.is_empty()
-        || request.token.len() > 80
-        || !request
-            .token
-            .bytes()
-            .all(|b| b.is_ascii_digit() || b == b'-')
-        || !valid_hex(&request.sha256, 64)
-        || !valid_hex(&request.old_sha256, 64)
-        || !(4096..=MAX_EXE).contains(&request.size)
-        || request.parent_pid == 0
-        || request
-            .target
-            .extension()
-            .is_none_or(|s| !s.eq_ignore_ascii_case("exe"))
-        || request.staged.parent() != request.target.parent()
-        || request.backup.parent() != request.target.parent()
-        || request.staged.file_name().and_then(|s| s.to_str())
-            != Some(format!(".pcsweep-update-{}.exe", request.token).as_str())
-        || request.backup.file_name().and_then(|s| s.to_str())
-            != Some(format!(".pcsweep-backup-{}.exe", request.token).as_str())
-        || request.target == request.staged
-        || request.target == request.backup
-    {
-        return Err("The update handoff paths are invalid.".into());
-    }
-    Ok(())
-}
-
-fn validate_request(request: &InstallRequest, job: &Path, helper: &Path) -> Result<(), String> {
-    let root = fs::canonicalize(update_dir()).map_err(|e| e.to_string())?;
-    validate_request_layout(request, job, helper, &root)?;
-    reject_links(job)?;
-    reject_links(&request.target)?;
-    reject_links(&request.staged)?;
-    if request.backup.exists() {
-        return Err("The update backup already exists; no files were changed.".into());
-    }
-    if sha256(&request.target)? != request.old_sha256 || sha256(helper)? != request.old_sha256 {
-        return Err("The app changed during update preparation. Nothing was installed.".into());
-    }
-    verify_executable(&request.staged, request.size, &request.sha256)
-}
-
-fn restart_original_if_verified(
-    request: &InstallRequest,
-    launch: impl FnOnce(&Path) -> Result<(), String>,
-) -> Result<(), String> {
-    reject_links(&request.target)?;
-    if sha256(&request.target)? != request.old_sha256 {
-        return Err("The original app changed; it will not be restarted automatically.".into());
-    }
-    launch(&request.target)
-}
-
-fn replace_with_backup(target: &Path, staged: &Path, backup: &Path) -> Result<(), String> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
-    let wide = |p: &Path| {
-        p.as_os_str()
-            .encode_wide()
-            .chain(Some(0))
-            .collect::<Vec<_>>()
-    };
-    let (target, staged, backup) = (wide(target), wide(staged), wide(backup));
-    if unsafe {
-        ReplaceFileW(
-            target.as_ptr(),
-            staged.as_ptr(),
-            backup.as_ptr(),
-            0,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    } == 0
-    {
-        Err(format!(
-            "Could not replace the portable app: {}",
-            std::io::Error::last_os_error()
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-fn restore_backup(target: &Path, backup: &Path) -> Result<(), String> {
-    if !backup.is_file() {
-        return Err("The update backup was not found.".into());
-    }
-    if target.exists() {
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
-        let wide = |p: &Path| {
-            p.as_os_str()
-                .encode_wide()
-                .chain(Some(0))
-                .collect::<Vec<_>>()
-        };
-        let (target, backup) = (wide(target), wide(backup));
-        if unsafe {
-            ReplaceFileW(
-                target.as_ptr(),
-                backup.as_ptr(),
-                std::ptr::null(),
-                0,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        } == 0
-        {
-            return Err(format!(
-                "Could not restore the app backup: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        Ok(())
-    } else {
-        fs::rename(backup, target).map_err(|e| e.to_string())
-    }
-}
-
-fn run_install(path: &Path, expected_digest: &str) -> Result<(), String> {
-    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
-    use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
-    };
-    if crate::system::is_admin() {
-        return Err("The portable update helper must run without administrator rights.".into());
-    }
-    if path.file_name().and_then(|s| s.to_str()) != Some("request.json")
-        || !valid_hex(expected_digest, 64)
-    {
-        return Err("Invalid update request.".into());
-    }
-    let data = read_limited(File::open(path).map_err(|e| e.to_string())?, 32 * 1024)?;
-    if format!("{:x}", Sha256::digest(&data)) != expected_digest {
-        return Err("The update request changed before installation.".into());
-    }
-    let request: InstallRequest = serde_json::from_slice(&data).map_err(|e| e.to_string())?;
-    let job = path.parent().ok_or("Invalid update folder.")?;
-    let helper = fs::canonicalize(std::env::current_exe().map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
-    validate_request(&request, job, &helper)?;
-    let handle = unsafe {
-        OpenProcess(
-            SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
-            0,
-            request.parent_pid,
-        )
-    };
-    if handle == 0 {
-        return Err("The running app could not be identified.".into());
-    }
-    let identity = creation_time(handle);
-    if identity != Ok(request.parent_created) {
-        unsafe {
-            CloseHandle(handle);
-        }
-        return Err("The running app identity changed.".into());
-    }
-    fs::write(job.join("ready"), &request.token).map_err(|e| e.to_string())?;
-    let waited = unsafe { WaitForSingleObject(handle, 90_000) };
-    unsafe {
-        CloseHandle(handle);
-    }
-    if waited != WAIT_OBJECT_0 {
-        return Err("The app did not close in time. Your installed app is unchanged.".into());
-    }
-    // Revalidate after the wait: preparation can be separated from replacement
-    // by a long-running process shutdown.
-    if let Err(error) = validate_request(&request, job, &helper) {
-        let _ = restart_original_if_verified(&request, |target| {
-            Command::new(target)
-                .arg("--pcsweep-update-failed")
-                .spawn()
-                .map(|_| ())
-                .map_err(|e| e.to_string())
-        });
+    // A download-only copy is never executed by the updater.
+    let settings = update_dir();
+    fs::create_dir_all(&settings).map_err(|e| e.to_string())?;
+    let _dirs = crate::winfile::lock_directories(&settings).map_err(|e| e.to_string())?;
+    let directory = settings.join(format!("download-{}", crate::update_install::nonce()?));
+    fs::create_dir(&directory).map_err(|e| e.to_string())?;
+    let path = directory.join("PCSweep.exe");
+    let guard = crate::winfile::lock_directories(&directory).map_err(|e| e.to_string())?;
+    if let Err(error) = download_to(&update, &path, &progress) {
+        let _ = fs::remove_file(&path);
+        drop(guard);
+        let _ = fs::remove_dir(&directory);
         return Err(error);
     }
-    if let Err(error) = replace_with_backup(&request.target, &request.staged, &request.backup) {
-        if request.backup.is_file() {
-            let _ = restore_backup(&request.target, &request.backup);
-        }
-        let _ = Command::new(&request.target)
-            .arg("--pcsweep-update-failed")
-            .spawn();
-        return Err(error);
-    }
-    let ack = job.join("started");
-    let mut child = match Command::new(&request.target)
-        .arg("--pcsweep-update-ack")
-        .arg(&ack)
-        .arg(&request.token)
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(e) => {
-            restore_backup(&request.target, &request.backup)?;
-            let _ = Command::new(&request.target)
-                .arg("--pcsweep-update-failed")
-                .spawn();
-            return Err(format!(
-                "The new version could not start; the previous version was restored: {e}"
-            ));
-        }
-    };
-    let start = Instant::now();
-    loop {
-        if fs::read_to_string(&ack).is_ok_and(|s| s == request.token) {
-            util::log("PCSweep updated successfully; startup was confirmed.");
-            let _ = fs::remove_file(&request.backup);
-            let _ = fs::remove_file(&ack);
-            let _ = fs::remove_file(job.join("ready"));
-            let _ = fs::remove_file(job.join("PCSweep.exe"));
-            let _ = fs::remove_file(path);
-            return Ok(());
-        }
-        if child.try_wait().map_err(|e| e.to_string())?.is_some()
-            || start.elapsed() > Duration::from_secs(60)
-        {
-            let _ = child.kill();
-            let _ = child.wait();
-            restore_backup(&request.target, &request.backup)?;
-            let _ = Command::new(&request.target)
-                .arg("--pcsweep-update-failed")
-                .spawn();
-            return Err(
-                "The new version did not finish startup. The previous version was restored.".into(),
-            );
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    Ok(DownloadResult::Saved(path))
 }
 
-/// Call before creating the GUI. Helpers never enter eframe or load settings UI.
-pub fn run_helper_mode() -> Option<i32> {
-    let args: Vec<_> = std::env::args_os().collect();
-    if args.get(1).is_none_or(|a| a != "--pcsweep-update-helper") {
-        return None;
-    }
-    let result = if args.len() == 4 {
-        run_install(Path::new(&args[2]), &args[3].to_string_lossy())
-    } else {
-        Err("Invalid updater arguments.".into())
-    };
-    match result {
-        Ok(()) => Some(0),
-        Err(error) => {
-            util::log(format!("App update failed: {error}"));
-            Some(1)
-        }
-    }
-}
-
-/// Acknowledge only after eframe has reached its first UI frame. A downloaded
-/// executable that cannot initialize the window must never remove the backup.
+/// The new app only acknowledges after reaching its first eframe frame.
 pub fn confirm_update_startup() {
     static ACK: Once = Once::new();
     ACK.call_once(|| {
@@ -920,26 +537,49 @@ pub fn confirm_update_startup() {
             return;
         }
         let path = Path::new(&args[2]);
-        let Some(job) = path.parent() else {
-            return;
-        };
-        if path.file_name().is_none_or(|s| s != "started")
-            || job.parent() != fs::canonicalize(update_dir()).ok().as_deref()
-            || reject_links(job).is_err()
-        {
-            return;
-        }
         let token = args[3].to_string_lossy();
-        if token.is_empty()
-            || token.len() > 80
-            || !token.bytes().all(|b| b.is_ascii_digit() || b == b'-')
-        {
-            return;
-        }
-        if let Ok(mut file) = OpenOptions::new().write(true).create_new(true).open(path) {
-            let _ = file.write_all(token.as_bytes());
-        }
+        // Publish the acknowledgement and clean up off the UI thread.
+        let path = path.to_owned();
+        let token = token.into_owned();
+        std::thread::spawn(move || {
+            if crate::update_install::acknowledge(&path, &token) {
+                crate::update_install::clean_confirmed_job(&path);
+                return;
+            }
+            // A 1.8 or earlier normal-user helper is still running when it
+            // installs this version. Complete that existing acknowledgement.
+            if !crate::system::is_admin() {
+                let _ = legacy_acknowledge(&path, &token, &update_dir());
+            }
+        });
     });
+}
+
+fn legacy_acknowledge(path: &Path, token: &str, root: &Path) -> std::io::Result<()> {
+    let job = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("Missing update folder"))?;
+    if path.file_name().is_none_or(|s| s != "started")
+        || !job
+            .parent()
+            .is_some_and(|p| crate::winfile::same_path(p, root))
+        || job
+            .file_name()
+            .is_none_or(|s| s != format!("job-{token}").as_str())
+        || token.is_empty()
+        || token.len() > 80
+        || !token.bytes().all(|b| b.is_ascii_digit() || b == b'-')
+    {
+        return Err(std::io::Error::other(
+            "Invalid legacy update acknowledgement",
+        ));
+    }
+    let _dirs = crate::winfile::lock_directories(job)?;
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?
+        .write_all(token.as_bytes())
 }
 
 impl App {
@@ -1037,7 +677,7 @@ impl App {
             return;
         }
         let (update, restart) = match action {
-            UpdateAction::Install(update) => (update, !self.is_admin),
+            UpdateAction::Install(update) => (update, true),
             UpdateAction::DownloadOnly(update) => (update, false),
         };
         self.updates.error = None;
@@ -1052,13 +692,14 @@ impl App {
         let ctx = ui.ctx().clone();
         let mut check = false;
         let mut install = None;
+        let mut download = None;
         let mut skip = None;
         let mut automatic = self.updates.automatic;
         ScrollArea::vertical().id_salt("updates_page").auto_shrink([false, false]).show(ui, |ui| {
             widgets::page_header(ui, "App updates", "Keep PCSweep current. Checks and downloads run in the background; restart only when you're ready.");
             widgets::card(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(widgets::icon(ic::UPDATE, 25.0, ACCENT));
+                    ui.label(widgets::icon(ic::UPDATE, 25.0, color_accent()));
                     ui.vertical(|ui| {
                         ui.label(widgets::strong(format!("PCSweep {}", env!("CARGO_PKG_VERSION")), 20.0));
                         ui.label(widgets::dim(if revision() == 0 { "Local build".into() } else { format!("Build {} · {}", revision(), &commit()[..commit().len().min(8)]) }));
@@ -1082,7 +723,7 @@ impl App {
             });
             if let Some(error) = &self.updates.error {
                 ui.add_space(8.0);
-                widgets::banner(ui, WARN, ic::INFO, |ui| { ui.label(error); });
+                widgets::banner(ui, color_warning(), ic::INFO, |ui| { ui.label(error); });
             }
             if self.updates.install.running() {
                 ui.add_space(8.0);
@@ -1094,7 +735,7 @@ impl App {
                         ui.add(egui::ProgressBar::new(done as f32 / total as f32).text(format!("{} of {}", fmt_bytes(done), fmt_bytes(total))));
                     }
                     ui.label(widgets::dim("Your current app stays intact until the download has been verified."));
-                    if ui.add(widgets::ghost("Cancel download")).clicked() {
+                    if ui.add_enabled(!self.updates.progress.finishing.load(Ordering::Relaxed), widgets::ghost("Cancel download")).clicked() {
                         self.updates.progress.cancel.store(true, Ordering::Relaxed);
                     }
                 });
@@ -1103,7 +744,7 @@ impl App {
                 ui.add_space(8.0);
                 widgets::card(ui, |ui| {
                     ui.label(widgets::strong("Verified download ready", 17.0));
-                    ui.label(widgets::dim("This session or app location does not support automatic replacement. Close PCSweep, then replace your portable copy with this download."));
+                    ui.label(widgets::dim("Open the download folder to use the verified portable copy."));
                     if ui.add(widgets::primary("Show downloaded app")).clicked() { util::show_in_explorer(path); }
                 });
             }
@@ -1115,13 +756,10 @@ impl App {
                     ui.label(widgets::dim(format!("{} download · Windows x64", fmt_bytes(update.manifest.size))));
                     ui.add_space(6.0);
                     if skipped { ui.label(widgets::faint("You've skipped this build. You can still install it below.")); }
-                    if self.is_admin {
-                        ui.label(widgets::dim("Automatic replacement runs in a normal user session. You can download a verified copy now, or reopen PCSweep normally for Update and restart."));
-                    }
                     let busy = self.updates.running() || self.mutations_running();
                     ui.horizontal_wrapped(|ui| {
-                        let label = if self.is_admin { "Download verified copy" } else { "Update and restart" };
-                        if ui.add_enabled(!busy, widgets::primary(label)).clicked() { install = Some(update.clone()); }
+                        if ui.add_enabled(!busy, widgets::primary("Update and restart")).clicked() { install = Some(update.clone()); }
+                        if ui.add_enabled(!busy, widgets::ghost("Download a copy")).clicked() { download = Some(update.clone()); }
                         if ui.add_enabled(!self.updates.installing(), widgets::ghost(if skipped { "Show notifications for this build" } else { "Skip this build" })).clicked() {
                             skip = Some(if skipped { String::new() } else { update.identity() });
                         }
@@ -1131,7 +769,7 @@ impl App {
                     ui.add_space(6.0);
                     ui.label(widgets::strong("What's new", 15.0));
                     // Plain text deliberately avoids executing HTML/links from release notes.
-                    ui.add(egui::Label::new(RichText::new(&update.notes).color(TEXT_DIM)).wrap());
+                    ui.add(egui::Label::new(RichText::new(&update.notes).color(color_muted())).wrap());
                 });
             }
         });
@@ -1145,15 +783,18 @@ impl App {
         if check {
             self.begin_update_check(&ctx);
         }
+        if let Some(update) = download {
+            self.execute_update(UpdateAction::DownloadOnly(update), &ctx);
+        }
         if let Some(update) = install {
             self.modal = Some(Modal {
-                title: if self.is_admin { "Download this update?".into() } else { "Update and restart PCSweep?".into() },
-                body: format!("Download PCSweep {}, verify the complete file, and {}. Your settings and activity history are preserved.", update.label(), if self.is_admin { "save a portable copy" } else { "restart this app" }),
-                details: vec![format!("Download: {}", fmt_bytes(update.manifest.size)), "Source: official kashrtx/pcsweep GitHub release".into()],
-                note: Some(if self.is_admin { "The installed app will not be replaced in an administrator session.".into() } else { "If this folder is protected, the verified download will be saved for you instead.".into() }),
-                confirm: if self.is_admin { "Download".into() } else { "Update and restart".into() },
+                title: "Update and restart PCSweep?".into(),
+                body: format!("Download PCSweep {}, verify the file and restart. Your settings and activity history are preserved.", update.label()),
+                details: vec![format!("{} download from the official GitHub release", fmt_bytes(update.manifest.size))],
+                note: self.is_admin.then(|| "PCSweep will reopen as administrator.".into()),
+                confirm: "Update and restart".into(),
                 danger: false,
-                action: Action::Update(if self.is_admin { UpdateAction::DownloadOnly(update) } else { UpdateAction::Install(update) }),
+                action: Action::Update(UpdateAction::Install(update)),
             });
         }
     }
@@ -1184,6 +825,26 @@ pub(crate) fn preview_fixture() -> UpdateState {
         skipped: String::new(), status: "A new version is ready.".into(),
         error: None, saved: None,
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_executable(marker: u8) -> Vec<u8> {
+    let mut bytes = vec![0u8; 4096];
+    bytes[..2].copy_from_slice(b"MZ");
+    bytes[60..64].copy_from_slice(&64u32.to_le_bytes());
+    bytes[64..68].copy_from_slice(b"PE\0\0");
+    for (offset, value) in [
+        (4, 0x8664u16),
+        (6, 1),
+        (20, 240),
+        (22, 2),
+        (24, 0x20b),
+        (92, 2),
+    ] {
+        bytes[64 + offset..66 + offset].copy_from_slice(&value.to_le_bytes());
+    }
+    bytes[4095] = marker;
+    bytes
 }
 
 #[cfg(test)]
@@ -1260,13 +921,12 @@ mod tests {
     #[test]
     fn corrupt_download_never_passes_verification() {
         let path = std::env::temp_dir().join(format!("pcsweep-update-test-{}", unique()));
-        let mut bytes = vec![0u8; 4096];
-        bytes[..2].copy_from_slice(b"MZ");
+        let bytes = super::test_executable(0);
         fs::write(&path, &bytes).unwrap();
         let hash = format!("{:x}", Sha256::digest(&bytes));
-        assert!(verify_executable(&path, 4096, &hash).is_ok());
+        assert!(verify_executable(&mut File::open(&path).unwrap(), 4096, &hash).is_ok());
         fs::write(&path, b"corrupt").unwrap();
-        assert!(verify_executable(&path, 4096, &hash).is_err());
+        assert!(verify_executable(&mut File::open(&path).unwrap(), 4096, &hash).is_err());
         let _ = fs::remove_file(path);
     }
 
@@ -1327,79 +987,15 @@ mod tests {
     }
 
     #[test]
-    fn helper_layout_rejects_unrelated_backup_or_staging_locations() {
-        let root = Path::new(r"C:\Users\Me\AppData\Local\PCSweep\updates");
-        let job = root.join("job-1-2");
-        let helper = job.join("PCSweep-updater.exe");
-        let mut request = InstallRequest {
-            target: PathBuf::from(r"C:\Tools\PCSweep.exe"),
-            staged: PathBuf::from(r"C:\Tools\.pcsweep-update-1-2.exe"),
-            backup: PathBuf::from(r"C:\Tools\.pcsweep-backup-1-2.exe"),
-            size: 4096,
-            sha256: "a".repeat(64),
-            old_sha256: "b".repeat(64),
-            parent_pid: 10,
-            parent_created: 20,
-            token: "1-2".into(),
-        };
-        assert!(validate_request_layout(&request, &job, &helper, root).is_ok());
-        request.backup = PathBuf::from(r"C:\Windows\System32\important.exe");
-        assert!(validate_request_layout(&request, &job, &helper, root).is_err());
-        request.backup = PathBuf::from(r"C:\Tools\.pcsweep-backup-1-2.exe");
-        request.staged = PathBuf::from(r"C:\Elsewhere\.pcsweep-update-1-2.exe");
-        assert!(validate_request_layout(&request, &job, &helper, root).is_err());
-    }
-
-    #[test]
-    fn interrupted_handoff_restarts_only_the_unchanged_verified_original() {
-        let folder = std::env::temp_dir().join(format!("pcsweep-recovery-{}", unique()));
-        fs::create_dir(&folder).unwrap();
-        let target = folder.join("PCSweep.exe");
-        fs::write(&target, b"trusted original").unwrap();
-        let request = InstallRequest {
-            target: target.clone(),
-            staged: folder.join("missing-stage.exe"),
-            backup: folder.join("backup.exe"),
-            size: 4096,
-            sha256: "a".repeat(64),
-            old_sha256: sha256(&target).unwrap(),
-            parent_pid: 1,
-            parent_created: 1,
-            token: "1-2".into(),
-        };
-        let mut launched = false;
-        restart_original_if_verified(&request, |path| {
-            launched = true;
-            assert_eq!(path, target);
-            Ok(())
-        })
-        .unwrap();
-        assert!(launched);
-        fs::write(&target, b"changed after handoff").unwrap();
-        assert!(restart_original_if_verified(&request, |_| panic!(
-            "must not launch changed executable"
-        ))
-        .is_err());
-        fs::remove_dir_all(folder).unwrap();
-    }
-
-    #[test]
-    fn temporary_file_replacement_and_rollback_preserve_original_bytes() {
-        let folder = std::env::temp_dir().join(format!("pcsweep-update-files-{}", unique()));
-        fs::create_dir(&folder).unwrap();
-        let target = folder.join("old.exe");
-        let staged = folder.join("staged.exe");
-        let backup = folder.join("backup.exe");
-        fs::write(&target, b"original app").unwrap();
-        fs::write(&staged, b"new app").unwrap();
-        replace_with_backup(&target, &staged, &backup).unwrap();
-        assert_eq!(fs::read(&target).unwrap(), b"new app");
-        assert_eq!(fs::read(&backup).unwrap(), b"original app");
-        restore_backup(&target, &backup).unwrap();
-        assert_eq!(fs::read(&target).unwrap(), b"original app");
-        assert!(!backup.exists());
-        assert!(replace_with_backup(&target, &staged, &backup).is_err());
-        assert_eq!(fs::read(&target).unwrap(), b"original app");
-        fs::remove_dir_all(folder).unwrap();
+    fn previous_normal_user_helper_can_confirm_its_first_frame() {
+        let root = std::env::temp_dir().join(format!("pcsweep-legacy-{}", unique()));
+        let job = root.join("job-123-456");
+        fs::create_dir_all(&job).unwrap();
+        let file = job.join("started");
+        assert!(legacy_acknowledge(&file, "another-token", &root).is_err());
+        legacy_acknowledge(&file, "123-456", &root).unwrap();
+        assert_eq!(fs::read(&file).unwrap(), b"123-456");
+        assert!(legacy_acknowledge(&file, "123-456", &root).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 }

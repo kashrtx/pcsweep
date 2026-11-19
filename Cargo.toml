@@ -1,6 +1,6 @@
 [package]
 name = "pcsweep"
-version = "1.8.0"
+version = "1.9.0"
 edition = "2021"
 description = "Fast, safe disk cleanup and PC health tool for Windows 11"
 repository = "https://github.com/kashrtx/pcsweep"
@@ -21,7 +21,7 @@ sysinfo = "~0.30"
 # Windows registry (startup apps, installed apps, known folders)
 winreg = "0.52"
 # Recycle Bin size/empty + admin check
-windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_Globalization", "Win32_Storage_FileSystem", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging", "Win32_Security", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Power", "Win32_System_Registry", "Win32_System_LibraryLoader", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Services", "Win32_Graphics_Gdi", "Win32_System_Com", "Win32_System_Diagnostics_ToolHelp", "Win32_System_RemoteDesktop", "Win32_Graphics_Dwm"] }
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_Globalization", "Win32_Storage_FileSystem", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_System_Environment", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Power", "Win32_System_Registry", "Win32_System_LibraryLoader", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Services", "Win32_Graphics_Gdi", "Win32_System_Com", "Win32_System_Diagnostics_ToolHelp", "Win32_System_RemoteDesktop", "Win32_Graphics_Dwm"] }
 # Parallel scanning
 rayon = "1.10"
 # Native folder picker

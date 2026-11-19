@@ -732,7 +732,7 @@ impl App {
                             widgets::badge(
                                 ui,
                                 &format!("{p}%{}", if s.charging { " · charging" } else { "" }),
-                                GOOD,
+                                color_success(),
                             );
                         }
                     });
@@ -762,7 +762,7 @@ impl App {
                 });
 
                 if let Some(e) = &self.power.error {
-                    ui.colored_label(WARN, e);
+                    ui.colored_label(color_warning(), e);
                 }
                 if let Some(m) = &self.power.message {
                     ui.label(widgets::dim(m));
@@ -877,7 +877,7 @@ impl App {
                             });
                         }
                         Err(e) => {
-                            ui.colored_label(WARN, e);
+                            ui.colored_label(color_warning(), e);
                         }
                         _ => {}
                     }

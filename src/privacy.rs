@@ -820,7 +820,12 @@ impl App {
             if ui
                 .add_enabled(
                     !busy,
-                    widgets::small(widgets::icon_text(ic::REFRESH, "Refresh", 13.0, TEXT)),
+                    widgets::small(widgets::icon_text(
+                        ic::REFRESH,
+                        "Refresh",
+                        13.0,
+                        color_ink(),
+                    )),
                 )
                 .clicked()
             {
@@ -854,7 +859,7 @@ impl App {
         let mut requested = None;
         ScrollArea::vertical().id_salt("privacy_page").show(ui, |ui| {
             if let Some(error) = &inv.journal_error {
-                widgets::banner(ui, WARN, ic::WARN, |ui| { ui.label(error); });
+                widgets::banner(ui, color_warning(), ic::WARN, |ui| { ui.label(error); });
             }
             ui.label(widgets::faint("Change preferences here. Each change saves an exact Undo point and reads the value back. Existing organization policies and unrecognized values are preserved."));
             widgets::section(ui, "Your account preferences");
@@ -863,11 +868,11 @@ impl App {
                 if !available(p, inv.build) { continue; }
                 widgets::tight_card(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(widgets::icon(ic::SHIELD, 18.0, ACCENT));
+                        ui.label(widgets::icon(ic::SHIELD, 18.0, color_accent()));
                         ui.label(widgets::strong(p.name, 15.0));
                     });
                     ui.label(widgets::dim(p.description));
-                    ui.label(RichText::new(&item.status).color(if item.can_disable { WARN } else { TEXT_DIM }).size(12.5));
+                    ui.label(RichText::new(&item.status).color(if item.can_disable { color_warning() } else { color_muted() }).size(12.5));
                     ui.horizontal_wrapped(|ui| {
                         if ui.add_enabled(!busy && item.can_disable, widgets::small("Turn off")).clicked() {
                             requested = Some((format!("Turn off {}?", p.name), p.description.into(), PrivacyAction::Disable { id: item.id.clone(), expected: item.value.clone() }, false));

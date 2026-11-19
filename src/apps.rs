@@ -10,6 +10,7 @@ use eframe::egui::{self, Align, Label, Layout, RichText, ScrollArea, Ui};
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::os::windows::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
@@ -244,6 +245,27 @@ fn uninstall_command(command: &str) -> std::io::Result<(String, String)> {
         args.replace_range(..2, "/X");
     }
     Ok((program.to_string(), args))
+}
+
+fn uninstall_executable(program: &str) -> Result<PathBuf, String> {
+    let path = Path::new(program);
+    if path.is_absolute()
+        && path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+    {
+        return Ok(path.to_path_buf());
+    }
+    for system in ["msiexec.exe", "rundll32.exe"] {
+        if program.eq_ignore_ascii_case(system)
+            || system
+                .strip_suffix(".exe")
+                .is_some_and(|stem| program.eq_ignore_ascii_case(stem))
+        {
+            return util::system_file(system);
+        }
+    }
+    Err("Windows did not register an absolute uninstaller path. Use the app’s own uninstaller or repair its installation.".into())
 }
 
 #[cfg(test)]
@@ -579,7 +601,13 @@ impl App {
         self.apps.leftovers.launch = Task::spawn(ctx, move || {
             crate::scan_cache::save("last-uninstall.json", crate::scan_cache::now(), &target)?;
             let (program, args) = uninstall_command(&command).map_err(|e| e.to_string())?;
-            let status = Command::new(program)
+            let executable = uninstall_executable(&program)?;
+            let status = Command::new(&executable)
+                .current_dir(
+                    executable
+                        .parent()
+                        .ok_or("The uninstaller folder is unavailable.")?,
+                )
                 .raw_arg(args)
                 .creation_flags(util::CREATE_NO_WINDOW)
                 .status()
@@ -697,9 +725,19 @@ impl App {
                         match &app.kind {
                             AppKind::Store(p) => self.ask_store_remove(vec![p.clone()]),
                             AppKind::Desktop => {
+                                let result = uninstall_command(&app.uninstall)
+                                    .map_err(|error| error.to_string())
+                                    .and_then(|(program, _)| uninstall_executable(&program));
+                                let executable = match result {
+                                    Ok(path) => path,
+                                    Err(error) => {
+                                        self.toast(ToastKind::Error, error);
+                                        continue;
+                                    }
+                                };
                                 self.modal=Some(Modal{
                     title:format!("Uninstall {}?",app.name),body:format!("PCSweep will start {}'s registered uninstaller. Review the app's own removal options and save your work first.",app.name),
-                    details:vec![format!("Version: {} · Publisher: {}",app.version,app.publisher),format!("Account scope: {}",app.scope)],
+                    details:vec![format!("Version: {} · Publisher: {}",app.version,app.publisher),format!("Account scope: {}",app.scope), executable.display().to_string()],
                     note:Some("Removal may delete app settings and data. Reinstalling later does not guarantee they can be recovered.".into()),
                     confirm:"Start uninstaller".into(),danger:true,action:Action::Uninstall(app),
                 });
@@ -719,7 +757,7 @@ impl App {
             ui.label(
                 RichText::new(fmt_num(s.list.len() as u64))
                     .font(widgets::light(30.0))
-                    .color(TEXT),
+                    .color(color_ink()),
             );
             ui.label(widgets::dim(format!(
                 "registered apps · {} reported size",
@@ -771,7 +809,11 @@ impl App {
                         r.name,
                         if r.success { "completed" } else { "failed" }
                     ))
-                    .color(if r.success { GOOD } else { WARN }),
+                    .color(if r.success {
+                        color_success()
+                    } else {
+                        color_warning()
+                    }),
                 );
                 ui.label(widgets::faint(&r.detail));
                 if let Some(uri) = &r.store_uri {
@@ -795,7 +837,8 @@ impl App {
         }
         if let Some(error) = &s.store_error {
             ui.label(
-                RichText::new(format!("Store app inventory unavailable: {error}")).color(WARN),
+                RichText::new(format!("Store app inventory unavailable: {error}"))
+                    .color(color_warning()),
             );
         }
         ui.horizontal_wrapped(|ui| {
@@ -915,7 +958,7 @@ impl App {
         });
         ui.label(widgets::faint("Checks use Microsoft's signed WinGet PowerShell module. Setup is optional and always reviewed first. Only selected apps and reviewed versions are updated."));
         if let Some(error) = &s.updates_error {
-            ui.label(RichText::new(error).color(WARN));
+            ui.label(RichText::new(error).color(color_warning()));
             ui.horizontal_wrapped(|ui| {
                 if ui
                     .add_enabled(!s.busy(), widgets::small("Set up app updates"))

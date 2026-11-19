@@ -1,5 +1,4 @@
 use crate::running::{self, Identity, Snapshot};
-use crate::util;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use sysinfo::{DiskKind, Disks, System};
@@ -394,19 +393,40 @@ pub fn empty_recycle_bin() -> bool {
 
 /// Starts a new elevated copy of PCSweep (UAC prompt). Returns true if it launched.
 pub fn relaunch_as_admin() -> bool {
-    let Ok(exe) = std::env::current_exe() else {
+    use crate::{platform, winfile};
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        UI::{
+            Shell::{
+                ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+            },
+            WindowsAndMessaging::SW_SHOWNORMAL,
+        },
+    };
+    let (Ok(exe), Ok(system)) = (std::env::current_exe(), platform::system_directory()) else {
         return false;
     };
-    let script = format!(
-        "Start-Process -FilePath '{}' -ArgumentList '--wait-for-parent {}' -Verb RunAs",
-        exe.display().to_string().replace('\'', "''"),
-        std::process::id()
-    );
-    util::hidden_command("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    let verb = winfile::wide("runas");
+    let exe = winfile::wide(&exe);
+    let cwd = winfile::wide(&system);
+    let args = winfile::wide(format!("--wait-for-parent {}", std::process::id()));
+    let mut launch = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
+        lpVerb: verb.as_ptr(),
+        lpFile: exe.as_ptr(),
+        lpParameters: args.as_ptr(),
+        lpDirectory: cwd.as_ptr(),
+        nShow: SW_SHOWNORMAL,
+        ..unsafe { std::mem::zeroed() }
+    };
+    let ok = unsafe { ShellExecuteExW(&mut launch) } != 0;
+    if launch.hProcess != 0 {
+        unsafe {
+            CloseHandle(launch.hProcess);
+        }
+    }
+    ok
 }
 
 /// Original Windows policy, retained only for this exact process lifetime.

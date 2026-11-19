@@ -41,7 +41,7 @@ pub enum Page {
     FileChanges,
 }
 
-fn nav_groups() -> [&'static [(Page, char, &'static str)]; 4] {
+pub(crate) fn nav_groups() -> [&'static [(Page, char, &'static str)]; 4] {
     [
         &[(Page::Dashboard, ic::HOME, "Overview")],
         &[
@@ -131,6 +131,7 @@ pub enum Action {
     Background(crate::background::BackgroundAction),
     Update(crate::updates::UpdateAction),
     Memory(crate::processes::MemoryAction),
+    Recovery(crate::recovery::RecoveryAction),
     AppPackage(crate::app_packages::PackageAction),
     Ads(crate::ads::AdsAction),
     Network(crate::network::NetworkAction),
@@ -187,7 +188,8 @@ pub struct App {
     tray: crate::tray::Tray,
     keep_background: bool,
     background_hidden: bool,
-    app_options_open: bool,
+    pub(crate) app_options_open: bool,
+    pub(crate) quick_search: crate::quick_search::QuickSearch,
     start_elevated: bool,
     tray_error: Option<String>,
     pub(crate) force_exit: bool,
@@ -231,6 +233,15 @@ impl App {
     }
 
     fn request_quit(&mut self, ctx: &egui::Context) {
+        if self.updates.installing() {
+            self.show_from_background(ctx);
+            self.page = Page::Updates;
+            self.toast(
+                ToastKind::Info,
+                "Finish or cancel the update before quitting PCSweep.",
+            );
+            return;
+        }
         if self.mutations_running() {
             self.show_from_background(ctx);
             self.modal = Some(Modal {
@@ -257,39 +268,40 @@ impl App {
         let mut automatic = self.updates.automatic_checks();
         let previous_appearance = self.appearance.clone();
         let mut elevated = self.start_elevated;
-        egui::Window::new("PCSweep options").open(&mut open).collapsible(false).resizable(false).default_width(480.0).vscroll(true).show(ctx, |ui| {
-            ui.add(egui::Label::new("Choose how PCSweep stays available. No background cleanup, speed tests or Windows changes run automatically.").wrap());
-            ui.add_space(8.0);
-            ui.add_enabled(self.tray.available(), egui::Checkbox::new(&mut keep, "Keep running in the notification area when I close the window"));
-            ui.add(egui::Label::new("Use the PCSweep notification icon to show the window, check for updates, or Quit. The normal Minimize button also keeps the app running.").wrap());
-            if let Some(reason) = &self.tray_error { ui.colored_label(WARN, format!("Notification icon unavailable: {reason}")); }
-            else if !self.tray.available() { ui.label(widgets::dim("Starting the notification icon…")); }
-            ui.add_space(10.0);
-            ui.separator();
-            egui::CollapsingHeader::new("Readability and text").show(ui,|ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Interface size");
-                    for scale in [100,110,125,150] {
-                        ui.selectable_value(&mut self.appearance.scale,scale,format!("{scale}%"));
-                    }
-                });
-                ui.checkbox(&mut self.appearance.bold,"Use bolder text");
-                ui.add(egui::Label::new("Size and weight are remembered. Larger layouts can scroll sideways when needed. Windows display scaling also applies.").wrap());
+        let screen = ctx.screen_rect();
+        egui::Window::new("PCSweep options").open(&mut open).collapsible(false).resizable(false)
+            .default_width((screen.width() - 40.0).min(520.0))
+            .max_height((screen.height() - 84.0).max(180.0)).vscroll(true).show(ctx, |ui| {
+            self.appearance.theme_picker(ui);
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Interface size");
+                for scale in [100,110,125,150] {
+                    ui.selectable_value(&mut self.appearance.scale,scale,format!("{scale}%"));
+                }
             });
+            ui.checkbox(&mut self.appearance.bold,"Use bolder text");
+            ui.separator();
+            ui.label(widgets::strong("Background and notifications", 17.0));
+            ui.add_enabled(self.tray.available(), egui::Checkbox::new(&mut keep, "Keep running in the notification area when I close the window"));
+            if let Some(reason) = &self.tray_error { ui.colored_label(color_warning(), format!("Notification icon unavailable: {reason}")); }
+            else if !self.tray.available() { ui.label(widgets::dim("Starting the notification icon…")); }
             ui.separator();
             ui.checkbox(&mut automatic, "Check for PCSweep updates automatically once a day");
             ui.add(egui::Label::new("Works while the window is open or PCSweep is running in the background. Checks contact GitHub; updates install only when you choose. PCSweep does not add itself to Windows startup.").wrap());
             if ui.add(widgets::small("Open Updates")).clicked() { self.page = Page::Updates; }
             ui.separator();
             ui.checkbox(&mut elevated,"Ask to start as administrator on future launches");
-            ui.add(egui::Label::new("Windows asks for UAC approval. Canceling opens PCSweep normally. Administrator restart is also available when needed. In an elevated session, app updates can be saved but cannot replace the running executable automatically.").wrap());
+            ui.add(egui::Label::new("Windows asks for UAC approval. Canceling opens PCSweep normally. Administrator restart is also available when needed. App updates preserve the current session’s administrator status.").wrap());
         });
         self.app_options_open = open;
         if self.appearance != previous_appearance {
             self.appearance.save();
             self.appearance.apply(ctx);
-            theme::setup_fonts(ctx);
+            if self.appearance.bold != previous_appearance.bold {
+                theme::setup_fonts(ctx);
+            }
             theme::fit_to_viewport(ctx);
+            ctx.request_repaint();
         }
         if elevated != self.start_elevated {
             crate::appearance::set_start_elevated(elevated);
@@ -311,7 +323,6 @@ impl App {
         let appearance = crate::appearance::Appearance::load();
         appearance.apply(&cc.egui_ctx);
         theme::setup_fonts(&cc.egui_ctx);
-        theme::apply(&cc.egui_ctx);
         theme::read_windows_motion(&cc.egui_ctx);
         let is_admin = system::is_admin();
         let (page, last_window_size) = load_session();
@@ -356,6 +367,7 @@ impl App {
             keep_background,
             background_hidden: false,
             app_options_open: false,
+            quick_search: Default::default(),
             start_elevated: crate::appearance::start_elevated(),
             tray_error: None,
             force_exit: false,
@@ -450,6 +462,7 @@ impl App {
             Action::Background(action) => self.execute_background(action, ctx),
             Action::Update(action) => self.execute_update(action, ctx),
             Action::Memory(action) => self.execute_memory(action, ctx),
+            Action::Recovery(action) => self.execute_recovery(action, ctx),
             Action::AppPackage(action) => self.start_package_action(action, ctx),
             Action::Ads(action) => self.execute_ads(action, ctx),
             Action::Network(action) => self.execute_network(action, ctx),
@@ -565,7 +578,17 @@ impl App {
         ui.vertical_centered(|ui| {
             ui.label(widgets::strong("PC", 21.0))
                 .on_hover_text("PCSweep");
-            ui.add_space(10.0);
+            if ui
+                .add(
+                    widgets::small(widgets::icon(ic::SEARCH, 19.0, color_muted()))
+                        .min_size(vec2(40.0, 34.0)),
+                )
+                .on_hover_text("Quick search (Ctrl+K)")
+                .clicked()
+            {
+                self.open_quick_search();
+            }
+            ui.add_space(8.0);
             ScrollArea::vertical()
                 .id_salt("compact_navigation")
                 .max_height((ui.available_height() - 120.0).max(80.0))
@@ -578,12 +601,16 @@ impl App {
                                     egui::Button::new(widgets::icon(
                                         icon,
                                         20.0,
-                                        if self.page == page { ACCENT } else { TEXT_DIM },
+                                        if self.page == page {
+                                            color_accent()
+                                        } else {
+                                            color_muted()
+                                        },
                                     ))
                                     .fill(if self.page == page {
-                                        ACCENT_SOFT
+                                        color_selected()
                                     } else {
-                                        SIDEBAR
+                                        color_sidebar()
                                     })
                                     .min_size(vec2(40.0, 38.0)),
                                 )
@@ -609,19 +636,23 @@ impl App {
         });
         ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
             if ui
-                .add(widgets::small(widgets::icon(ic::TOOLS, 19.0, TEXT_DIM)))
+                .add(widgets::small(widgets::icon(
+                    ic::TOOLS,
+                    19.0,
+                    color_muted(),
+                )))
                 .on_hover_text("PCSweep options and text size")
                 .clicked()
             {
                 self.app_options_open = true;
             }
             if self.is_admin {
-                ui.label(widgets::icon(ic::SHIELD, 17.0, GOOD))
+                ui.label(widgets::icon(ic::SHIELD, 17.0, color_success()))
                     .on_hover_text("Running as administrator");
             } else if ui
                 .add_enabled(
                     !self.relaunch.running(),
-                    widgets::small(widgets::icon(ic::SHIELD, 19.0, WARN)),
+                    widgets::small(widgets::icon(ic::SHIELD, 19.0, color_warning())),
                 )
                 .on_hover_text("Restart as administrator")
                 .clicked()
@@ -641,7 +672,7 @@ impl App {
         ui.horizontal(|ui| {
             let (rect, _) = ui.allocate_exact_size(vec2(36.0, 36.0), egui::Sense::hover());
             ui.painter()
-                .rect_filled(rect, Rounding::same(10.0), ACCENT_STRONG);
+                .rect_filled(rect, corners(10.0), color_primary());
             ui.painter()
                 .circle_stroke(rect.center(), 9.0, Stroke::new(2.5_f32, Color32::WHITE));
             ui.painter()
@@ -652,16 +683,31 @@ impl App {
                 ui.label(
                     RichText::new("PCSweep")
                         .font(widgets::semibold(19.0))
-                        .color(TEXT),
+                        .color(color_ink()),
                 );
                 ui.label(
                     RichText::new("Keep your PC clean and quick")
                         .size(11.5)
-                        .color(TEXT_FAINT),
+                        .color(color_secondary()),
                 );
             });
         });
-        ui.add_space(22.0);
+        ui.add_space(14.0);
+        if ui
+            .add(
+                widgets::ghost(widgets::icon_text(
+                    ic::SEARCH,
+                    "Quick search   Ctrl+K",
+                    13.0,
+                    color_ink(),
+                ))
+                .min_size(vec2(ui.available_width(), 34.0)),
+            )
+            .clicked()
+        {
+            self.open_quick_search();
+        }
+        ui.add_space(8.0);
 
         let junk_badge = if self.cleaner.scanned_once {
             let b = self.cleaner.recommended_total();
@@ -743,10 +789,10 @@ impl App {
             ui.add_space(4.0);
             if is_admin {
                 ui.horizontal(|ui| {
-                    ui.label(widgets::icon(ic::SHIELD, 13.0, GOOD));
+                    ui.label(widgets::icon(ic::SHIELD, 13.0, color_success()));
                     ui.label(
                         RichText::new("Running as administrator")
-                            .color(GOOD)
+                            .color(color_success())
                             .size(12.5),
                     );
                 });
@@ -757,7 +803,7 @@ impl App {
                     ic::SHIELD,
                     "Restart as admin",
                     13.5,
-                    WARN,
+                    color_warning(),
                 ))
                 .min_size(vec2(w, 34.0));
                 if ui.add_enabled(!busy, btn).clicked() {
@@ -865,6 +911,7 @@ impl App {
             keep_background: false,
             background_hidden: false,
             app_options_open: false,
+            quick_search: Default::default(),
             start_elevated: false,
             tray_error: None,
             force_exit: false,
@@ -894,7 +941,7 @@ impl App {
             if ui.add(widgets::small("Show in Explorer")).clicked() {
                 util::show_in_explorer(&path);
             }
-            let history = widgets::icon_text(ic::HISTORY, "Cleanup history", 13.0, TEXT);
+            let history = widgets::icon_text(ic::HISTORY, "Cleanup history", 13.0, color_ink());
             if ui.add(widgets::small(history)).clicked() {
                 self.history.open = true;
                 self.history.refresh(ui.ctx());
@@ -943,7 +990,7 @@ impl App {
                         }));
                     }
                     for &l in &visible {
-                        ui.label(RichText::new(l).monospace().size(12.5).color(TEXT_DIM));
+                        ui.label(RichText::new(l).monospace().size(12.5).color(color_muted()));
                     }
                 });
         });
@@ -976,9 +1023,9 @@ impl App {
             .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
             .frame(
                 Frame::window(&ctx.style())
-                    .fill(CARD)
-                    .stroke(Stroke::new(1.0_f32, BORDER))
-                    .rounding(Rounding::same(16.0))
+                    .fill(color_surface())
+                    .stroke(Stroke::new(1.0_f32, color_outline()))
+                    .rounding(corners(16.0))
                     .inner_margin(Margin::same(24.0)),
             )
             .show(ctx, |ui| {
@@ -990,22 +1037,22 @@ impl App {
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             let (c, col) = if modal.danger {
-                                (ic::WARN, BAD)
+                                (ic::WARN, color_error())
                             } else {
-                                (ic::INFO, ACCENT)
+                                (ic::INFO, color_accent())
                             };
                             ui.label(widgets::icon(c, 20.0, col));
                             ui.add(Label::new(widgets::strong(&modal.title, 19.0)).wrap());
                         });
                         ui.add_space(4.0);
-                        ui.label(RichText::new(&modal.body).color(TEXT_DIM));
+                        ui.label(RichText::new(&modal.body).color(color_muted()));
                         if !modal.details.is_empty() {
                             ui.add_space(4.0);
                             // One scroll region per dialog: the details grow inside the
                             // content scroll, so its scrollbar sits at the dialog's edge.
                             Frame::none()
-                                .fill(BG)
-                                .rounding(Rounding::same(8.0))
+                                .fill(color_canvas())
+                                .rounding(corners(8.0))
                                 .inner_margin(Margin::same(10.0))
                                 .show(ui, |ui| {
                                     ui.set_min_width(ui.available_width());
@@ -1017,7 +1064,7 @@ impl App {
                         }
                         if let Some(n) = &modal.note {
                             ui.add_space(2.0);
-                            ui.label(RichText::new(n).color(WARN).size(13.0));
+                            ui.label(RichText::new(n).color(color_warning()).size(13.0));
                         }
                     });
                 ui.add_space(12.0);
@@ -1067,19 +1114,21 @@ impl App {
                 ui.set_max_width(380.0);
                 for t in &self.toasts {
                     let (c, col) = match t.kind {
-                        ToastKind::Info => (ic::INFO, ACCENT),
-                        ToastKind::Success => (ic::CHECK, GOOD),
-                        ToastKind::Error => (ic::WARN, BAD),
+                        ToastKind::Info => (ic::INFO, color_accent()),
+                        ToastKind::Success => (ic::CHECK, color_success()),
+                        ToastKind::Error => (ic::WARN, color_error()),
                     };
                     Frame::none()
-                        .fill(CARD_HI)
-                        .stroke(Stroke::new(1.0_f32, mix(CARD_HI, col, 0.5)))
-                        .rounding(Rounding::same(12.0))
+                        .fill(color_raised())
+                        .stroke(Stroke::new(1.0_f32, mix(color_raised(), col, 0.5)))
+                        .rounding(corners(12.0))
                         .inner_margin(Margin::symmetric(14.0, 10.0))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.label(widgets::icon(c, 15.0, col));
-                                ui.add(Label::new(RichText::new(&t.text).color(TEXT)).wrap());
+                                ui.add(
+                                    Label::new(RichText::new(&t.text).color(color_ink())).wrap(),
+                                );
                             });
                         });
                     ui.add_space(6.0);
@@ -1113,43 +1162,48 @@ impl eframe::App for App {
             ctx.request_repaint_after(Duration::from_secs(if self.any_running() { 1 } else { 30 }));
             return;
         }
+        theme::activate(ctx);
         theme::fit_to_viewport(ctx);
         let size = ctx.screen_rect().size() * ctx.zoom_factor();
         if size.x.is_finite() && size.y.is_finite() && size.x >= 900.0 && size.y >= 520.0 {
             self.last_window_size = [size.x, size.y];
         }
         // Re-apply the theme if Windows switches light/dark mode underneath us.
-        if ctx.style().visuals.panel_fill != theme::BG {
+        if ctx.style().visuals.panel_fill != theme::color_canvas() {
             theme::apply(ctx);
         }
-        let want_procs = matches!(self.page, Page::Dashboard | Page::Memory | Page::Apps)
+        self.quick_search_shortcut(ctx);
+        let want_procs = self.quick_search.open
+            || matches!(self.page, Page::Dashboard | Page::Memory | Page::Apps)
             || (self.page == Page::Background && self.background.showing_processes());
         self.sys.tick(want_procs);
         self.poll(ctx);
 
-        let enabled = self.modal.is_none();
+        let enabled = self.modal.is_none() && !self.quick_search.open;
         egui::SidePanel::left("nav")
             .exact_width(self.navigation_width(ctx))
             .resizable(false)
             .show_separator_line(false)
             .frame(
                 Frame::none()
-                    .fill(SIDEBAR)
+                    .fill(color_sidebar())
                     .inner_margin(Margin::symmetric(14.0, 20.0)),
             )
             .show(ctx, |ui| {
+                theme::backdrop(ui, true);
                 ui.add_enabled_ui(enabled, |ui| self.sidebar(ui));
             });
 
         egui::CentralPanel::default()
             .frame(
                 Frame::none()
-                    .fill(BG)
+                    .fill(color_canvas())
                     .inner_margin(Margin::symmetric(30.0, 22.0)),
             )
             .show(ctx, |ui| {
+                theme::backdrop(ui, false);
                 if self.ads.trial_pending() {
-                    widgets::banner(ui, WARN, ic::GLOBE, |ui| {
+                    widgets::banner(ui, color_warning(), ic::GLOBE, |ui| {
                         ui.vertical(|ui| {
                             ui.label("A DNS trial is waiting for your decision. It will restore the previous settings unless you keep it.");
                             if ui.add_enabled(enabled, widgets::small("Review DNS trial")).clicked() {
@@ -1165,6 +1219,8 @@ impl eframe::App for App {
 
         self.modal_ui(ctx);
         self.app_options_ui(ctx);
+        self.recent_apps_ui(ctx);
+        self.quick_search_ui(ctx);
         self.toasts_ui(ctx);
         crate::updates::confirm_update_startup();
 

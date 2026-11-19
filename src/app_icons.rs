@@ -658,7 +658,7 @@ impl IconCache {
                     ui.label(widgets::icon(
                         widgets::ic::APPS,
                         points * 0.75,
-                        crate::theme::TEXT_DIM,
+                        crate::theme::color_muted(),
                     ));
                 },
             );

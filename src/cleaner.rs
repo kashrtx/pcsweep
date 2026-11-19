@@ -1539,7 +1539,7 @@ impl App {
                         ui.label(
                             RichText::new(fmt_bytes(sel_bytes))
                                 .font(widgets::light(44.0))
-                                .color(TEXT),
+                                .color(color_ink()),
                         );
                         ui.label(widgets::dim(format!(
                             "{} files in {} {}",
@@ -1577,7 +1577,7 @@ impl App {
                                 ic::REFRESH,
                                 "Scan again",
                                 14.0,
-                                TEXT,
+                                color_ink(),
                             )),
                         )
                         .clicked()
@@ -1598,9 +1598,9 @@ impl App {
                 widgets::banner(
                     ui,
                     if rep.journal_error.is_some() {
-                        WARN
+                        color_warning()
                     } else {
-                        GOOD
+                        color_success()
                     },
                     if rep.journal_error.is_some() {
                         ic::WARN
@@ -1628,7 +1628,7 @@ impl App {
 
         if !self.is_admin {
             ui.add_space(4.0);
-            widgets::banner(ui, WARN, ic::SHIELD, |ui| {
+            widgets::banner(ui, color_warning(), ic::SHIELD, |ui| {
                 ui.label("Some Windows locations need administrator rights to scan and clean.");
                 if ui.add(widgets::small("Restart as administrator")).clicked() {
                     acts.push(CAct::Relaunch);
@@ -1702,7 +1702,7 @@ impl App {
                 if ui.checkbox(&mut sel, "").changed() {
                     acts.push(CAct::SetSel(i, sel));
                 }
-                ui.label(widgets::icon(cat.icon, 20.0, if sel { ACCENT } else { TEXT_FAINT }));
+                ui.label(widgets::icon(cat.icon, 20.0, if sel { color_accent() } else { color_secondary() }));
                 ui.add_space(4.0);
                 let right_w = 260.0;
                 let text_w = (ui.available_width() - right_w).max(240.0);
@@ -1711,22 +1711,22 @@ impl App {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(widgets::strong(cat.name, 15.0));
                         if cat.admin && !self.is_admin {
-                            widgets::badge(ui, "Needs admin", WARN);
+                            widgets::badge(ui, "Needs admin", color_warning());
                         }
                         if cat.caution.is_some() {
-                            widgets::badge(ui, "Read first", WARN);
+                            widgets::badge(ui, "Read first", color_warning());
                         }
                         if !cat.default_on {
-                            widgets::badge(ui, "Optional", TEXT_DIM);
+                            widgets::badge(ui, "Optional", color_muted());
                         }
                         for p in &c.running[i] {
-                            widgets::badge(ui, &format!("{} is open", p.trim_end_matches(".exe")), WARN)
+                            widgets::badge(ui, &format!("{} is open", p.trim_end_matches(".exe")), color_warning())
                                 .on_hover_text("Close it for the most thorough clean. Files it's using are skipped.");
                         }
                     });
                     ui.label(widgets::dim(cat.desc));
                     if let Some(text) = cat.caution {
-                        ui.label(RichText::new(text).color(WARN).size(12.5));
+                        ui.label(RichText::new(text).color(color_warning()).size(12.5));
                     }
                     if let Some(r) = res {
                         let mut parts = Vec::new();
@@ -1758,7 +1758,7 @@ impl App {
                                 ui.spinner();
                             }
                             Some(r) if r.bytes == 0 && r.count == 0 => {
-                                ui.label(RichText::new("Already clean").color(GOOD));
+                                ui.label(RichText::new("Already clean").color(color_success()));
                             }
                             Some(_) => {
                                 ui.label(widgets::strong(fmt_bytes(bytes), 16.0));
@@ -1797,7 +1797,7 @@ impl App {
                     ic::BACK,
                     "All categories",
                     14.0,
-                    TEXT,
+                    color_ink(),
                 )))
                 .on_hover_text("Back to the category list (Esc). Your choices are kept.")
                 .clicked()
@@ -1889,12 +1889,16 @@ impl App {
                         if ui.checkbox(&mut inc, "").changed() {
                             acts.push(CAct::Toggle(i, f.path.clone(), f.size, inc));
                         }
-                        let icon_color = if inc { ACCENT } else { TEXT_FAINT };
+                        let icon_color = if inc {
+                            color_accent()
+                        } else {
+                            color_secondary()
+                        };
                         ui.label(widgets::icon(ic::FILE, 16.0, icon_color));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             ui.add_space(6.0);
                             if ui
-                                .add(widgets::small(widgets::icon(ic::OPEN, 13.0, TEXT_DIM)))
+                                .add(widgets::small(widgets::icon(ic::OPEN, 13.0, color_muted())))
                                 .on_hover_text("Show in Explorer")
                                 .clicked()
                             {
@@ -1918,9 +1922,11 @@ impl App {
                                     .vertical(|ui| {
                                         ui.spacing_mut().item_spacing.y = 1.0;
                                         let text = if inc {
-                                            RichText::new(&name).color(TEXT)
+                                            RichText::new(&name).color(color_ink())
                                         } else {
-                                            RichText::new(&name).color(TEXT_FAINT).strikethrough()
+                                            RichText::new(&name)
+                                                .color(color_secondary())
+                                                .strikethrough()
                                         };
                                         ui.add(Label::new(text).truncate());
                                         ui.add(Label::new(widgets::faint(folder)).truncate());

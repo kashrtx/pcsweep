@@ -52,7 +52,8 @@ impl CpuPainter {
     }
 
     fn render(&self, size: [u32; 2], primitives: &[ClippedPrimitive]) -> RgbaImage {
-        let mut image = RgbaImage::from_pixel(size[0], size[1], Rgba(theme::BG.to_array()));
+        let mut image =
+            RgbaImage::from_pixel(size[0], size[1], Rgba(theme::color_canvas().to_array()));
         let screen = Rect::from_min_max(Pos2::ZERO, egui::pos2(size[0] as f32, size[1] as f32));
         let mut triangles = 0;
         for primitive in primitives {
@@ -397,14 +398,14 @@ fn render_page(page: Page, size: [u32; 2], path: &Path, pending_dns: bool) {
                 .show_separator_line(false)
                 .frame(
                     Frame::none()
-                        .fill(theme::SIDEBAR)
+                        .fill(theme::color_sidebar())
                         .inner_margin(Margin::symmetric(14.0, 20.0)),
                 )
                 .show(ctx, |ui| app.sidebar(ui));
             egui::CentralPanel::default()
                 .frame(
                     Frame::none()
-                        .fill(theme::BG)
+                        .fill(theme::color_canvas())
                         .inner_margin(Margin::symmetric(30.0, 22.0)),
                 )
                 .show(ctx, |ui| app.render_page(ui));
@@ -480,7 +481,7 @@ fn render_page(page: Page, size: [u32; 2], path: &Path, pending_dns: bool) {
             let mut primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
             scale_primitives(&mut primitives, output.pixels_per_point);
             let image = painter.render(size, &primitives);
-            let background = theme::BG.to_array();
+            let background = theme::color_canvas().to_array();
             let content_pixels = image.pixels().filter(|p| p.0 != background).count();
             assert!(
                 content_pixels > (size[0] * size[1] / 8) as usize,
@@ -722,7 +723,7 @@ fn bulk_memory_actions_stay_reachable_and_clear_only_selection_at_scaled_sizes()
                     egui::CentralPanel::default()
                         .frame(
                             Frame::none()
-                                .fill(theme::BG)
+                                .fill(theme::color_canvas())
                                 .inner_margin(Margin::symmetric(30.0, 22.0)),
                         )
                         .show(ctx, |ui| app.render_page(ui));
@@ -782,7 +783,7 @@ fn bulk_memory_actions_stay_reachable_and_clear_only_selection_at_scaled_sizes()
                 egui::CentralPanel::default()
                     .frame(
                         Frame::none()
-                            .fill(theme::BG)
+                            .fill(theme::color_canvas())
                             .inner_margin(Margin::symmetric(30.0, 22.0)),
                     )
                     .show(ctx, |ui| app.render_page(ui));
@@ -801,7 +802,7 @@ fn bulk_memory_actions_stay_reachable_and_clear_only_selection_at_scaled_sizes()
                 egui::CentralPanel::default()
                     .frame(
                         Frame::none()
-                            .fill(theme::BG)
+                            .fill(theme::color_canvas())
                             .inner_margin(Margin::symmetric(30.0, 22.0)),
                     )
                     .show(ctx, |ui| app.render_page(ui));
@@ -861,7 +862,7 @@ fn long_confirmation_content_keeps_both_actions_visible_at_supported_sizes() {
                 },
                 |ctx| {
                     egui::CentralPanel::default()
-                        .frame(Frame::none().fill(theme::BG))
+                        .frame(Frame::none().fill(theme::color_canvas()))
                         .show(ctx, |ui| {
                             ui.label("PCSweep confirmation preview");
                         });
@@ -954,7 +955,7 @@ fn cleanup_confirmation_details_scroll_at_the_dialog_edge() {
         .shapes
         .iter()
         .filter_map(|clipped| match &clipped.shape {
-            Shape::Rect(rect) if rect.fill == theme::BG => Some(rect.rect),
+            Shape::Rect(rect) if rect.fill == theme::color_canvas() => Some(rect.rect),
             _ => None,
         })
         .max_by(|a, b| a.width().total_cmp(&b.width()))
@@ -1109,7 +1110,7 @@ fn full_page_file_review_fills_the_window_and_filters_without_rebuilding_rows() 
                             ui.label("PCSweep");
                         });
                     egui::CentralPanel::default()
-                        .frame(Frame::none().fill(theme::BG))
+                        .frame(Frame::none().fill(theme::color_canvas()))
                         .show(ctx, |ui| app.render_page(ui));
                 },
             );
@@ -1194,7 +1195,7 @@ fn cleanup_history_page_lists_every_outcome_from_a_fixture() {
             },
             |ctx| {
                 egui::CentralPanel::default()
-                    .frame(Frame::none().fill(theme::BG))
+                    .frame(Frame::none().fill(theme::color_canvas()))
                     .show(ctx, |ui| app.render_page(ui));
             },
         );
@@ -1241,30 +1242,36 @@ fn shipment_frame(
             ..Default::default()
         },
         |ctx| {
+            theme::activate(ctx);
             theme::fit_to_viewport(ctx);
-            let enabled = app.modal.is_none();
+            app.quick_search_shortcut(ctx);
+            let enabled = app.modal.is_none() && !app.quick_search.open;
             egui::SidePanel::left("shipment_navigation")
                 .exact_width(app.navigation_width(ctx))
                 .resizable(false)
                 .frame(
                     Frame::none()
-                        .fill(theme::SIDEBAR)
+                        .fill(theme::color_sidebar())
                         .inner_margin(Margin::symmetric(14.0, 20.0)),
                 )
                 .show(ctx, |ui| {
+                    theme::backdrop(ui, true);
                     ui.add_enabled_ui(enabled, |ui| app.sidebar(ui));
                 });
             egui::CentralPanel::default()
                 .frame(
                     Frame::none()
-                        .fill(theme::BG)
+                        .fill(theme::color_canvas())
                         .inner_margin(Margin::symmetric(30.0, 22.0)),
                 )
                 .show(ctx, |ui| {
+                    theme::backdrop(ui, false);
                     ui.add_enabled_ui(enabled, |ui| app.render_readable_page(ui));
                 });
             app.app_options_ui(ctx);
             app.modal_ui(ctx);
+            app.quick_search_ui(ctx);
+            app.recent_apps_ui(ctx);
         },
     )
 }
@@ -1450,7 +1457,7 @@ fn direct_game_mode_choice_prepares_a_preference_change_inside_the_app() {
                 egui::CentralPanel::default()
                     .frame(
                         Frame::none()
-                            .fill(theme::BG)
+                            .fill(theme::color_canvas())
                             .inner_margin(Margin::same(24.0)),
                     )
                     .show(ctx, |ui| {
@@ -2218,4 +2225,190 @@ fn background_process_end_task_reviews_the_exact_pid_at_compact_size() {
         size,
         "background-end-task-review.png",
     );
+}
+
+fn key_press(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+    egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers,
+    }
+}
+
+#[test]
+fn keyboard_search_can_find_a_page_and_review_explorer_restart() {
+    let ctx = egui::Context::default();
+    let mut app = App::test_fixture();
+    theme::setup_fonts(&ctx);
+    theme::apply(&ctx);
+    let size = [900, 520];
+    let _ = shipment_frame(
+        &ctx,
+        &mut app,
+        size,
+        vec![key_press(egui::Key::K, egui::Modifiers::CTRL)],
+    );
+    assert!(app.quick_search.open);
+    let _ = shipment_frame(
+        &ctx,
+        &mut app,
+        size,
+        vec![egui::Event::Text("ssd trim".into())],
+    );
+    let _ = shipment_frame(
+        &ctx,
+        &mut app,
+        size,
+        vec![key_press(egui::Key::Enter, egui::Modifiers::NONE)],
+    );
+    assert_eq!(app.page, Page::Storage);
+    assert!(!app.quick_search.open);
+    app.open_quick_search();
+    let mut painter = CpuPainter::default();
+    let mut last = None;
+    for _ in 0..6 {
+        let output = shipment_frame(&ctx, &mut app, size, Vec::new());
+        upload_preview_textures(&mut painter, &output);
+        last = Some(output);
+    }
+    let _ = shipment_frame(
+        &ctx,
+        &mut app,
+        size,
+        vec![egui::Event::Text("restart explorer".into())],
+    );
+    let _ = shipment_frame(
+        &ctx,
+        &mut app,
+        size,
+        vec![key_press(egui::Key::Enter, egui::Modifiers::NONE)],
+    );
+    assert!(matches!(
+        app.modal.as_ref().map(|m| &m.action),
+        Some(Action::Recovery(
+            crate::recovery::RecoveryAction::Explorer { restart: true }
+        ))
+    ));
+    assert!(!app.mutations_running());
+    save_shipment_preview(&ctx, &painter, &last.unwrap(), size, "quick-search.png");
+}
+
+#[test]
+fn elevated_and_normal_sessions_offer_the_same_verified_restart() {
+    for elevated in [false, true] {
+        let ctx = egui::Context::default();
+        let mut app = App::test_fixture();
+        app.page = Page::Updates;
+        app.is_admin = elevated;
+        theme::setup_fonts(&ctx);
+        theme::apply(&ctx);
+        let size = [1040, 680];
+        let mut frames = (0..6).map(|_| shipment_frame(&ctx, &mut app, size, Vec::new()));
+        let ready = frames.next_back().unwrap();
+        // Force the final frame to settle the layout before clicking.
+        let ready = (0..5).fold(ready, |_, _| {
+            shipment_frame(&ctx, &mut app, size, Vec::new())
+        });
+        let restart = text_rect(&ready, "Update and restart");
+        let _ = shipment_frame(&ctx, &mut app, size, click_at(restart.center()));
+        assert!(matches!(
+            app.modal.as_ref().map(|m| &m.action),
+            Some(Action::Update(crate::updates::UpdateAction::Install(_)))
+        ));
+        assert!(!app.mutations_running());
+    }
+}
+
+#[test]
+fn every_theme_supports_compact_bold_layouts_and_dialogs() {
+    for skin in theme::Skin::ALL {
+        let ctx = egui::Context::default();
+        let mut app = App::test_fixture();
+        app.appearance.skin = skin;
+        app.appearance.bold = true;
+        app.appearance.scale = 150;
+        app.appearance.apply(&ctx);
+        theme::setup_fonts(&ctx);
+        let size = [900, 520];
+        for group in crate::app::nav_groups() {
+            for &(page, _, _) in group {
+                app.page = page;
+                populate_page_fixture(&mut app, page);
+                let mut frame = shipment_frame(&ctx, &mut app, size, Vec::new());
+                for _ in 0..3 {
+                    frame = shipment_frame(&ctx, &mut app, size, Vec::new());
+                }
+                let heading = match page {
+                    Page::Dashboard => "Health score",
+                    Page::Cleaner => "Junk cleaner",
+                    Page::Analyzer => "Space analyzer",
+                    Page::Storage => "Disk health and maintenance",
+                    Page::Duplicates => "Duplicate files",
+                    Page::Apps => "Installed apps",
+                    Page::Ads => "Ads and tracking",
+                    Page::Privacy => "Privacy and distractions",
+                    Page::Security => "Security check",
+                    Page::Startup => "Startup apps",
+                    Page::Background => "Background activity",
+                    Page::Memory => "Memory and running apps",
+                    Page::Network => "Connection health",
+                    Page::Speed => "Internet speed test",
+                    Page::Power => "Battery and power",
+                    Page::WindowsControls => "Windows controls",
+                    Page::FileChanges => "Windows file changes",
+                    Page::Tools => "Tools",
+                    Page::Updates => "App updates",
+                    Page::Activity => "Activity log",
+                };
+                if page != Page::Dashboard {
+                    assert!(
+                        has_visible_text_containing(&frame, heading),
+                        "{skin:?} {page:?}"
+                    );
+                } else {
+                    assert!(!frame.shapes.is_empty(), "{skin:?} {page:?}");
+                }
+            }
+        }
+        app.page = Page::Memory;
+        let mut painter = CpuPainter::default();
+        // Make a new font atlas available to the CPU preview renderer.
+        theme::setup_fonts(&ctx);
+        let mut frame = shipment_frame(&ctx, &mut app, size, Vec::new());
+        upload_preview_textures(&mut painter, &frame);
+        for _ in 0..5 {
+            frame = shipment_frame(&ctx, &mut app, size, Vec::new());
+            upload_preview_textures(&mut painter, &frame);
+        }
+        text_rect(&frame, "Memory and running apps");
+        let open = text_rect(&frame, "Open Explorer");
+        let restart = text_rect(&frame, "Restart Explorer…");
+        assert!(!open.intersects(restart), "{skin:?}");
+        save_shipment_preview(
+            &ctx,
+            &painter,
+            &frame,
+            size,
+            &format!("skin-{}-memory.png", skin.key()),
+        );
+        let mut frame = shipment_frame(&ctx, &mut app, size, click_at(restart.center()));
+        upload_preview_textures(&mut painter, &frame);
+        for _ in 0..5 {
+            frame = shipment_frame(&ctx, &mut app, size, Vec::new());
+            upload_preview_textures(&mut painter, &frame);
+        }
+        let cancel = text_rect(&frame, "Cancel");
+        let confirm = text_rect(&frame, "Restart Explorer");
+        assert!(!cancel.intersects(confirm), "{skin:?}");
+        assert!(!app.mutations_running(), "review must be read only");
+        save_shipment_preview(
+            &ctx,
+            &painter,
+            &frame,
+            size,
+            &format!("skin-{}-dialog.png", skin.key()),
+        );
+    }
 }

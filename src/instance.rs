@@ -116,7 +116,10 @@ fn acquire_named(name: &str, activate: bool) -> Result<Option<Guard>, String> {
     Ok(None)
 }
 fn is_handoff_arg(arg: &str) -> bool {
-    matches!(arg, "--wait-for-parent" | "--pcsweep-update-ack")
+    matches!(
+        arg,
+        "--wait-for-parent" | "--pcsweep-update-ack" | "--pcsweep-update-failed"
+    )
 }
 /// Elevation is an opt-in preference, always using Windows' normal UAC prompt.
 pub fn elevate_on_start() -> bool {

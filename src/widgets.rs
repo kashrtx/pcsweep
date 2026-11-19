@@ -89,15 +89,19 @@ pub fn icon_text(c: char, text: &str, size: f32, color: Color32) -> LayoutJob {
 }
 
 pub fn dim(text: impl Into<String>) -> RichText {
-    RichText::new(text.into()).color(TEXT_DIM)
+    RichText::new(text.into()).color(color_muted())
 }
 
 pub fn faint(text: impl Into<String>) -> RichText {
-    RichText::new(text.into()).color(TEXT_FAINT).size(12.5)
+    RichText::new(text.into())
+        .color(color_secondary())
+        .size(12.5)
 }
 
 pub fn strong(text: impl Into<String>, size: f32) -> RichText {
-    RichText::new(text.into()).font(semibold(size)).color(TEXT)
+    RichText::new(text.into())
+        .font(semibold(size))
+        .color(color_ink())
 }
 
 fn motion(ui: &Ui, id: egui::Id, target: bool) -> f32 {
@@ -114,30 +118,34 @@ fn motion(ui: &Ui, id: egui::Id, target: bool) -> f32 {
 }
 
 pub fn page_header(ui: &mut Ui, title: &str, subtitle: &str) {
-    ui.label(RichText::new(title).font(semibold(28.0)).color(TEXT));
+    ui.label(RichText::new(title).font(semibold(28.0)).color(color_ink()));
     ui.label(dim(subtitle));
     ui.add_space(14.0);
 }
 
 pub fn section(ui: &mut Ui, text: &str) {
     ui.add_space(10.0);
-    ui.label(RichText::new(text).font(semibold(15.0)).color(TEXT_DIM));
+    ui.label(
+        RichText::new(text)
+            .font(semibold(15.0))
+            .color(color_muted()),
+    );
     ui.add_space(2.0);
 }
 
 pub fn card_frame() -> Frame {
     Frame::none()
-        .fill(CARD)
-        .rounding(Rounding::same(14.0))
-        .stroke(Stroke::new(1.0_f32, BORDER))
+        .fill(color_surface())
+        .rounding(corners(14.0))
+        .stroke(Stroke::new(1.0_f32, color_outline()))
         .inner_margin(Margin::same(18.0))
 }
 
 pub fn tight_frame() -> Frame {
     Frame::none()
-        .fill(CARD)
-        .rounding(Rounding::same(10.0))
-        .stroke(Stroke::new(1.0_f32, BORDER))
+        .fill(color_surface())
+        .rounding(corners(10.0))
+        .stroke(Stroke::new(1.0_f32, color_outline()))
         .inner_margin(Margin::symmetric(14.0, 10.0))
 }
 
@@ -162,44 +170,44 @@ pub fn tight_card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
 pub fn primary(text: impl Into<WidgetText>) -> Button<'static> {
     let t: WidgetText = text.into();
     Button::new(t.color(Color32::WHITE))
-        .fill(ACCENT_STRONG)
-        .rounding(Rounding::same(9.0))
+        .fill(color_primary())
+        .rounding(corners(9.0))
         .min_size(vec2(0.0, 34.0))
 }
 
 pub fn danger(text: impl Into<WidgetText>) -> Button<'static> {
     let t: WidgetText = text.into();
     Button::new(t.color(Color32::WHITE))
-        .fill(DANGER_FILL)
-        .rounding(Rounding::same(9.0))
+        .fill(color_danger())
+        .rounding(corners(9.0))
         .min_size(vec2(0.0, 34.0))
 }
 
 pub fn ghost(text: impl Into<WidgetText>) -> Button<'static> {
     Button::new(text)
-        .fill(CARD_HI)
-        .stroke(Stroke::new(1.0_f32, BORDER))
-        .rounding(Rounding::same(9.0))
+        .fill(color_raised())
+        .stroke(Stroke::new(1.0_f32, color_outline()))
+        .rounding(corners(9.0))
         .min_size(vec2(0.0, 34.0))
 }
 
 pub fn small(text: impl Into<WidgetText>) -> Button<'static> {
     Button::new(text)
-        .fill(CARD_HI)
-        .rounding(Rounding::same(7.0))
+        .fill(color_raised())
+        .rounding(corners(7.0))
         .min_size(vec2(0.0, 26.0))
 }
 
 pub fn chip(text: impl Into<WidgetText>, selected: bool) -> Button<'static> {
     let (fill, stroke) = if selected {
-        (ACCENT_SOFT, Stroke::new(1.0_f32, ACCENT))
+        (color_selected(), Stroke::new(1.0_f32, color_accent()))
     } else {
-        (CARD, Stroke::new(1.0_f32, BORDER))
+        (color_surface(), Stroke::new(1.0_f32, color_outline()))
     };
     Button::new(text)
         .fill(fill)
         .stroke(stroke)
-        .rounding(Rounding::same(17.0))
+        .rounding(corners(17.0))
         .min_size(vec2(0.0, 32.0))
 }
 
@@ -211,7 +219,7 @@ pub fn badge(ui: &mut Ui, text: &str, color: Color32) -> Response {
     let size = galley.size() + vec2(14.0, 6.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
     ui.painter()
-        .rect_filled(rect, Rounding::same(6.0), mix(CARD, color, 0.16));
+        .rect_filled(rect, corners(6.0), mix(color_surface(), color, 0.16));
     ui.painter()
         .galley(rect.center() - galley.size() / 2.0, galley, color);
     resp
@@ -240,7 +248,7 @@ pub fn bar(ui: &mut Ui, frac: f32, color: Color32, size: Vec2) -> Response {
     let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
     let r = size.y / 2.0;
     ui.painter()
-        .rect_filled(rect, Rounding::same(r), Color32::from_rgb(40, 46, 60));
+        .rect_filled(rect, Rounding::same(r), color_raised());
     let f = frac.clamp(0.0, 1.0);
     if f > 0.0 {
         let mut fill = rect;
@@ -264,11 +272,7 @@ pub fn ring(
     let c = rect.center();
     let rad = diameter / 2.0 - thickness / 2.0;
     let painter = ui.painter();
-    painter.circle_stroke(
-        c,
-        rad,
-        Stroke::new(thickness, Color32::from_rgb(40, 46, 60)),
-    );
+    painter.circle_stroke(c, rad, Stroke::new(thickness, color_raised()));
     let f = frac.clamp(0.0, 1.0);
     if f > 0.0 {
         let n = 120usize;
@@ -288,14 +292,14 @@ pub fn ring(
         Align2::CENTER_CENTER,
         big,
         light(diameter * 0.30),
-        TEXT,
+        color_ink(),
     );
     painter.text(
         c + vec2(0.0, diameter * 0.20),
         Align2::CENTER_CENTER,
         small_text,
         FontId::proportional(12.0),
-        TEXT_DIM,
+        color_muted(),
     );
 }
 
@@ -309,10 +313,10 @@ pub fn toggle(ui: &mut Ui, on: bool, enabled: bool) -> Response {
     };
     let (rect, resp) = ui.allocate_exact_size(size, sense);
     let t = motion(ui, resp.id, on);
-    let off_col = Color32::from_rgb(58, 66, 86);
-    let mut track = mix(off_col, ACCENT_STRONG, t);
+    let off_col = color_outline();
+    let mut track = mix(off_col, color_primary(), t);
     if !enabled {
-        track = mix(track, CARD, 0.5);
+        track = mix(track, color_surface(), 0.5);
     }
     let painter = ui.painter();
     painter.rect_filled(rect, Rounding::same(rect.height() / 2.0), track);
@@ -341,27 +345,31 @@ pub fn nav_item(
     if selected_t > 0.0 {
         painter.rect_filled(
             rect,
-            Rounding::same(9.0),
-            mix(SIDEBAR, ACCENT_SOFT, selected_t),
+            corners(9.0),
+            mix(color_sidebar(), color_selected(), selected_t),
         );
         painter.rect_filled(
             Rect::from_min_size(
                 pos2(rect.left(), rect.top() + 10.0),
                 vec2(3.0, (rect.height() - 20.0) * selected_t),
             ),
-            Rounding::same(2.0),
-            mix(SIDEBAR, ACCENT, selected_t),
+            corners(2.0),
+            mix(color_sidebar(), color_accent(), selected_t),
         );
     } else if hover_t > 0.0 {
-        painter.rect_filled(rect, Rounding::same(9.0), mix(SIDEBAR, CARD, hover_t));
+        painter.rect_filled(
+            rect,
+            corners(9.0),
+            mix(color_sidebar(), color_surface(), hover_t),
+        );
     }
-    let fg = mix(TEXT_DIM, TEXT, selected_t.max(hover_t));
+    let fg = mix(color_muted(), color_ink(), selected_t.max(hover_t));
     painter.text(
         pos2(rect.left() + 16.0, rect.center().y),
         Align2::LEFT_CENTER,
         icon_char,
         icon_font(16.0),
-        mix(fg, ACCENT, selected_t),
+        mix(fg, color_accent(), selected_t),
     );
     painter.text(
         pos2(rect.left() + 44.0, rect.center().y),
@@ -376,7 +384,7 @@ pub fn nav_item(
             Align2::RIGHT_CENTER,
             b,
             FontId::proportional(12.0),
-            TEXT_FAINT,
+            color_secondary(),
         );
     }
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -404,7 +412,11 @@ pub fn row<R>(ui: &mut Ui, height: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
     if hover_t > 0.0 {
         ui.painter().set(
             bg,
-            Shape::rect_filled(rect, Rounding::same(8.0), mix(BG, CARD_HI, hover_t)),
+            Shape::rect_filled(
+                rect,
+                corners(8.0),
+                mix(color_canvas(), color_raised(), hover_t),
+            ),
         );
     }
     inner.inner
@@ -418,9 +430,9 @@ pub fn banner<R>(
     add: impl FnOnce(&mut Ui) -> R,
 ) -> R {
     Frame::none()
-        .fill(mix(BG, color, 0.10))
-        .stroke(Stroke::new(1.0_f32, mix(BG, color, 0.35)))
-        .rounding(Rounding::same(10.0))
+        .fill(mix(color_canvas(), color, 0.10))
+        .stroke(Stroke::new(1.0_f32, mix(color_canvas(), color, 0.35)))
+        .rounding(corners(10.0))
         .inner_margin(Margin::symmetric(14.0, 10.0))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
@@ -436,7 +448,7 @@ pub fn banner<R>(
 /// Text field with a search icon.
 pub fn search_box(ui: &mut Ui, text: &mut String, hint: &str, width: f32) -> Response {
     ui.horizontal(|ui| {
-        ui.label(icon(ic::SEARCH, 14.0, TEXT_FAINT));
+        ui.label(icon(ic::SEARCH, 14.0, color_secondary()));
         ui.add(
             egui::TextEdit::singleline(text)
                 .hint_text(hint)
