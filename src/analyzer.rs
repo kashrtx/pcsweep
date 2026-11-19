@@ -582,7 +582,8 @@ fn treemap(ui: &mut Ui, node: &Node, height: f32) -> Option<usize> {
         } else {
             base
         };
-        painter.rect_filled(r, Rounding::same(6.0), fill);
+        painter.rect_filled(r, corners(6.0), fill);
+        let label = chart_text(fill);
         if r.width() > 64.0 && r.height() > 40.0 {
             let p = painter.with_clip_rect(r.shrink(4.0));
             p.text(
@@ -590,14 +591,14 @@ fn treemap(ui: &mut Ui, node: &Node, height: f32) -> Option<usize> {
                 Align2::LEFT_TOP,
                 &child.name,
                 widgets::semibold(13.5),
-                Color32::WHITE,
+                label,
             );
             p.text(
                 r.left_top() + vec2(9.0, 27.0),
                 Align2::LEFT_TOP,
                 fmt_bytes(child.size),
                 FontId::proportional(12.5),
-                mix(Color32::WHITE, base, 0.3),
+                label,
             );
         } else if r.width() > 46.0 && r.height() > 20.0 {
             let p = painter.with_clip_rect(r.shrink(3.0));
@@ -606,7 +607,7 @@ fn treemap(ui: &mut Ui, node: &Node, height: f32) -> Option<usize> {
                 Align2::LEFT_TOP,
                 &child.name,
                 FontId::proportional(11.5),
-                Color32::WHITE,
+                label,
             );
         }
         let enterable = child.kind == NodeKind::Dir && !child.children.is_empty();

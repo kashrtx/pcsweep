@@ -351,6 +351,26 @@ pub fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
     Color32::from_rgb(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()))
 }
 
+fn luminance(color: Color32) -> f32 {
+    let srgb = |value: u8| {
+        let num = f32::from(value) / 255.0;
+        if num <= 0.04045 {
+            num / 12.92
+        } else {
+            ((num + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    srgb(color.r()) * 0.2126 + srgb(color.g()) * 0.7152 + srgb(color.b()) * 0.0722
+}
+
+pub fn chart_text(fill: Color32) -> Color32 {
+    if luminance(fill) > 0.179 {
+        Color32::BLACK
+    } else {
+        Color32::WHITE
+    }
+}
+
 fn fitted_zoom(native_points: egui::Vec2) -> f32 {
     (native_points.x / 1040.0)
         .min(native_points.y / 680.0)
@@ -593,18 +613,7 @@ mod contrast_tests {
     use super::*;
 
     fn contrast(a: Color32, b: Color32) -> f32 {
-        let luma = |color: Color32| {
-            let srgb = |value: u8| {
-                let num = f32::from(value) / 255.0;
-                if num <= 0.04045 {
-                    num / 12.92
-                } else {
-                    ((num + 0.055) / 1.055).powf(2.4)
-                }
-            };
-            srgb(color.r()) * 0.2126 + srgb(color.g()) * 0.7152 + srgb(color.b()) * 0.0722
-        };
-        let [a, b] = [luma(a), luma(b)];
+        let [a, b] = [luminance(a), luminance(b)];
         (a.max(b) + 0.05) / (a.min(b) + 0.05)
     }
 

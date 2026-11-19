@@ -12,8 +12,8 @@ use windows_sys::Win32::Foundation::{GENERIC_READ, HANDLE};
 use windows_sys::Win32::Storage::FileSystem::{
     FileRenameInfo, GetFileInformationByHandle, GetFinalPathNameByHandleW,
     SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_READ,
-    FILE_SHARE_WRITE,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO,
+    FILE_SHARE_READ, FILE_SHARE_WRITE,
 };
 
 pub fn wide(value: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
@@ -77,21 +77,21 @@ pub fn lock_directories(dir: &Path) -> io::Result<Vec<File>> {
         .into_iter()
         .rev()
         .map(|path| {
-            // Attribute-only opens permit ordinary directory activity. Omitting
-            // FILE_SHARE_DELETE pins the directory name through a rename/install.
+            // List access makes the share mode effective. Open every component
+            // without following reparse points, then keep each handle until
+            // the operation is finished. Windows may use valid 8.3 aliases
+            // or spell a volume root differently when it describes a handle.
             let file = open(
                 path,
-                FILE_READ_ATTRIBUTES,
+                FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
             )?;
             let info = file.metadata()?;
-            if !info.is_dir()
-                || crate::util::is_reparse(&info)
-                || !same_path(&final_path(&file)?, path)
-            {
-                return Err(io::Error::other(
-                    "Links, junctions and redirected folders are unsupported.",
-                ));
+            if !info.is_dir() || crate::util::is_reparse(&info) {
+                return Err(io::Error::other(format!(
+                    "An ordinary local folder is required. Cannot use {}.",
+                    path.display()
+                )));
             }
             Ok(file)
         })
@@ -142,11 +142,6 @@ pub fn read_locked(path: &Path, extra_access: u32) -> io::Result<File> {
     }
     let file = open(path, GENERIC_READ | extra_access, FILE_SHARE_READ)?;
     stamp(&file)?;
-    if !same_path(&final_path(&file)?, path) {
-        return Err(io::Error::other(
-            "The executable resolves to a different path.",
-        ));
-    }
     Ok(file)
 }
 
@@ -155,12 +150,16 @@ pub fn rename_locked(file: &File, destination: &Path) -> io::Result<()> {
     // different file inserted at the destination after verification.
     let name: Vec<_> = destination.as_os_str().encode_wide().collect();
     let offset = offset_of!(FILE_RENAME_INFO, FileName);
-    let bytes = (offset + name.len() * size_of::<u16>()).max(size_of::<FILE_RENAME_INFO>());
+    let bytes = (offset + (name.len() + 1) * size_of::<u16>()).max(size_of::<FILE_RENAME_INFO>());
     let mut buffer = vec![0usize; bytes.div_ceil(size_of::<usize>())];
     let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
     unsafe {
         (*info).FileNameLength = (name.len() * size_of::<u16>()) as u32;
-        std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
+            name.len(),
+        );
         if SetFileInformationByHandle(handle(file), FileRenameInfo, info.cast(), bytes as u32) == 0
         {
             return Err(io::Error::last_os_error());

@@ -338,6 +338,14 @@ pub fn nav_item(
     badge_text: Option<&str>,
 ) -> Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::click());
+    resp.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::SelectableLabel,
+            ui.is_enabled(),
+            selected,
+            label,
+        )
+    });
     let hovered = resp.hovered();
     let selected_t = motion(ui, resp.id.with("selection"), selected);
     let hover_t = motion(ui, resp.id.with("hover"), hovered);
@@ -361,6 +369,13 @@ pub fn nav_item(
             rect,
             corners(9.0),
             mix(color_sidebar(), color_surface(), hover_t),
+        );
+    }
+    if resp.has_focus() {
+        painter.rect_stroke(
+            rect.shrink(1.0),
+            corners(9.0),
+            Stroke::new(1.5_f32, color_accent()),
         );
     }
     let fg = mix(color_muted(), color_ink(), selected_t.max(hover_t));

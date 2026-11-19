@@ -2241,32 +2241,35 @@ fn key_press(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
 fn keyboard_search_can_find_a_page_and_review_explorer_restart() {
     let ctx = egui::Context::default();
     let mut app = App::test_fixture();
+    let mut painter = CpuPainter::default();
     theme::setup_fonts(&ctx);
     theme::apply(&ctx);
     let size = [900, 520];
-    let _ = shipment_frame(
+    let output = shipment_frame(
         &ctx,
         &mut app,
         size,
         vec![key_press(egui::Key::K, egui::Modifiers::CTRL)],
     );
+    upload_preview_textures(&mut painter, &output);
     assert!(app.quick_search.open);
-    let _ = shipment_frame(
+    let output = shipment_frame(
         &ctx,
         &mut app,
         size,
         vec![egui::Event::Text("ssd trim".into())],
     );
-    let _ = shipment_frame(
+    upload_preview_textures(&mut painter, &output);
+    let output = shipment_frame(
         &ctx,
         &mut app,
         size,
         vec![key_press(egui::Key::Enter, egui::Modifiers::NONE)],
     );
+    upload_preview_textures(&mut painter, &output);
     assert_eq!(app.page, Page::Storage);
     assert!(!app.quick_search.open);
     app.open_quick_search();
-    let mut painter = CpuPainter::default();
     let mut last = None;
     for _ in 0..6 {
         let output = shipment_frame(&ctx, &mut app, size, Vec::new());
@@ -2332,13 +2335,16 @@ fn every_theme_supports_compact_bold_layouts_and_dialogs() {
         app.appearance.apply(&ctx);
         theme::setup_fonts(&ctx);
         let size = [900, 520];
+        let mut painter = CpuPainter::default();
         for group in crate::app::nav_groups() {
             for &(page, _, _) in group {
                 app.page = page;
                 populate_page_fixture(&mut app, page);
                 let mut frame = shipment_frame(&ctx, &mut app, size, Vec::new());
+                upload_preview_textures(&mut painter, &frame);
                 for _ in 0..3 {
                     frame = shipment_frame(&ctx, &mut app, size, Vec::new());
+                    upload_preview_textures(&mut painter, &frame);
                 }
                 let heading = match page {
                     Page::Dashboard => "Health score",
@@ -2373,9 +2379,6 @@ fn every_theme_supports_compact_bold_layouts_and_dialogs() {
             }
         }
         app.page = Page::Memory;
-        let mut painter = CpuPainter::default();
-        // Make a new font atlas available to the CPU preview renderer.
-        theme::setup_fonts(&ctx);
         let mut frame = shipment_frame(&ctx, &mut app, size, Vec::new());
         upload_preview_textures(&mut painter, &frame);
         for _ in 0..5 {

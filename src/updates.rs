@@ -560,9 +560,6 @@ fn legacy_acknowledge(path: &Path, token: &str, root: &Path) -> std::io::Result<
         .parent()
         .ok_or_else(|| std::io::Error::other("Missing update folder"))?;
     if path.file_name().is_none_or(|s| s != "started")
-        || !job
-            .parent()
-            .is_some_and(|p| crate::winfile::same_path(p, root))
         || job
             .file_name()
             .is_none_or(|s| s != format!("job-{token}").as_str())
@@ -573,6 +570,18 @@ fn legacy_acknowledge(path: &Path, token: &str, root: &Path) -> std::io::Result<
         return Err(std::io::Error::other(
             "Invalid legacy update acknowledgement",
         ));
+    }
+    let parents = crate::winfile::lock_directories(root)?;
+    let root = crate::winfile::final_path(
+        parents
+            .last()
+            .ok_or_else(|| std::io::Error::other("Missing legacy update cache"))?,
+    )?;
+    if !job
+        .parent()
+        .is_some_and(|p| crate::winfile::same_path(p, &root))
+    {
+        return Err(std::io::Error::other("Invalid legacy update folder"));
     }
     let _dirs = crate::winfile::lock_directories(job)?;
     OpenOptions::new()
@@ -991,7 +1000,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("pcsweep-legacy-{}", unique()));
         let job = root.join("job-123-456");
         fs::create_dir_all(&job).unwrap();
-        let file = job.join("started");
+        let file = fs::canonicalize(&job).unwrap().join("started");
         assert!(legacy_acknowledge(&file, "another-token", &root).is_err());
         legacy_acknowledge(&file, "123-456", &root).unwrap();
         assert_eq!(fs::read(&file).unwrap(), b"123-456");
