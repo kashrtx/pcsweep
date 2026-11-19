@@ -292,3 +292,93 @@ pub fn account(session: u32) -> Result<String, String> {
         format!(r"{domain}\{user}")
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The copied test executable leaves a marker only in its disposable test
+    /// directory. This verifies a real Shell/Task Scheduler handoff.
+    #[test]
+    fn launch_probe_child() {
+        let executable = std::env::current_exe().unwrap();
+        let directory = executable.parent().unwrap();
+        if directory
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("pcsweep-desktop-probe-"))
+        {
+            std::fs::write(directory.join("started"), std::process::id().to_string()).unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a signed-in Windows desktop"]
+    fn interactive_launch_smoke() {
+        use std::{
+            thread,
+            time::{Duration, Instant},
+        };
+        let Ok(session_id) = session() else {
+            println!("Desktop launch smoke skipped because this Windows runner has no interactive session.");
+            return;
+        };
+        let Ok(account) = account(session_id) else {
+            println!("Desktop launch smoke skipped because this Windows runner has no signed-in desktop user.");
+            return;
+        };
+        let root = std::env::temp_dir().join(format!(
+            "pcsweep-desktop-probe-{}",
+            crate::update_install::nonce().unwrap()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let _cleanup = TempFolder(root.clone());
+        let path = root.join("PCSweep desktop launch probe.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &path).unwrap();
+        let started = root.join("started");
+        let args = "--exact desktop::tests::launch_probe_child";
+        let verify = || {
+            let deadline = Instant::now() + Duration::from_secs(6);
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&started) {
+                    if let Ok(pid) = pid.parse::<u32>() {
+                        // The marker is written near process exit. Waiting for
+                        // the exact child to finish releases its test image.
+                        if let Ok(child) = running::Handle::open(
+                            pid,
+                            windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE,
+                        ) {
+                            if !child.exited() && Instant::now() < deadline {
+                                thread::sleep(Duration::from_millis(40));
+                                continue;
+                            }
+                        }
+                        return Ok("Launch probe ran.".to_string());
+                    }
+                }
+                if Instant::now() >= deadline {
+                    return Err("The desktop test process did not start.".to_string());
+                }
+                thread::sleep(Duration::from_millis(40));
+            }
+        };
+        if crate::recovery::shell().is_ok_and(|actual| actual.is_some()) {
+            open(path.as_os_str(), args).unwrap();
+            verify().unwrap();
+            std::fs::remove_file(&started).unwrap();
+            println!("Windows Explorer launched the disposable probe.");
+        } else {
+            println!("Explorer automation skipped because this runner has no desktop Shell.");
+        }
+        if system::is_admin() {
+            repair_task(&path, args, &account, session_id, verify).unwrap();
+            println!("The triggerless interactive recovery task launched its probe.");
+        }
+    }
+
+    struct TempFolder(std::path::PathBuf);
+    impl Drop for TempFolder {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+}

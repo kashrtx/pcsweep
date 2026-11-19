@@ -445,7 +445,7 @@ pub fn backdrop(ui: &egui::Ui, sidebar: bool) {
     };
     let [top_left, top_right, bottom] = match current {
         Skin::Frost => [c(0x101b35), c(0x293e73), c(0x131c33)],
-        Skin::Aero => [c(0xd2e8fa), c(0x8ec8ec), c(0xebf4ff)],
+        Skin::Aero => [c(0xd2e8fa), c(0xbce3fa), c(0xebf4ff)],
         Skin::Classic => [c(0xdadada), c(0xc6c6c6), c(0xd1d1d1)],
         Skin::Cobalt => [c(0xe3edff), c(0x84afe8), c(0xf1eee0)],
         Skin::Terminal => [base, c(0x123625), c(0x09150e)],
@@ -471,7 +471,7 @@ pub fn backdrop(ui: &egui::Ui, sidebar: bool) {
                 // Offset bands of reflected light give the glass depth. They
                 // stay at the far edge so the reading surface remains quiet.
                 for (offset, color) in [
-                    (0.12, rgba(0xffffff, if current.light() { 84 } else { 34 })),
+                    (0.12, rgba(0xffffff, if current.light() { 140 } else { 66 })),
                     (
                         0.30,
                         rgba(if current.light() { 0xb6f2ff } else { 0x8eeaff }, 48),
@@ -489,17 +489,23 @@ pub fn backdrop(ui: &egui::Ui, sidebar: bool) {
                     ),
                 ] {
                     let x = rect.right() - rect.width() * offset;
-                    let h = rect.height().min(550.0);
-                    painter.add(Shape::convex_polygon(
-                        vec![
-                            pos2(x, rect.top()),
-                            pos2(x + 110.0, rect.top()),
-                            pos2(rect.right(), rect.top() + h * 0.72),
-                            pos2(rect.right(), rect.top() + h),
-                        ],
-                        color,
-                        Stroke::NONE,
-                    ));
+                    let h = rect.height().min(580.0);
+                    let shift = rect.width() * 0.49;
+                    let half = (rect.width() * 0.15).clamp(72.0, 210.0);
+                    let mut light = egui::Mesh::default();
+                    for (dx, tint) in [
+                        (-half, Color32::TRANSPARENT),
+                        (0.0, color),
+                        (half, Color32::TRANSPARENT),
+                    ] {
+                        light.colored_vertex(pos2(x + dx, rect.top()), tint);
+                        light.colored_vertex(
+                            pos2(x + dx + shift, rect.top() + h),
+                            tint.gamma_multiply(0.08),
+                        );
+                    }
+                    light.indices.extend([0, 2, 1, 1, 2, 3, 2, 4, 3, 3, 4, 5]);
+                    painter.add(Shape::mesh(light));
                 }
             }
             Skin::Sakura => paint_sakura(painter, rect, ui.ctx()),
@@ -868,7 +874,11 @@ pub fn apply(ctx: &egui::Context) {
         Visuals::dark()
     };
     v.panel_fill = color_canvas();
-    v.window_fill = color_surface();
+    v.window_fill = card_fill();
+    if has_header_material() {
+        v.window_shadow = card_shadow();
+        v.popup_shadow = card_shadow();
+    }
     v.window_stroke = Stroke::new(1.0_f32, color_outline());
     v.window_rounding = corners(14.0);
     v.menu_rounding = corners(10.0);

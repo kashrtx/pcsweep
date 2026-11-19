@@ -435,87 +435,114 @@ impl App {
                     "No items match this filter."
                 }));
             } else {
-                let height = (ui.clip_rect().bottom() - ui.cursor().top()).clamp(136.0, 780.0);
-                ScrollArea::vertical()
-                    .id_salt("bin_files")
-                    .max_height(height)
-                    .auto_shrink([false, false])
-                    .show_rows(ui, 48.0, self.bin.visible.len(), |ui, range| {
-                        for i in range {
-                            let index = self.bin.visible[i];
-                            let entry = &inventory.items[index];
-                            ui.push_id(index, |ui| {
-                                widgets::row(ui, 48.0, |ui| {
-                                    let mut checked = self.bin.checked.contains(&index);
-                                    let checkbox = ui
-                                        .add_enabled(
-                                            !busy,
-                                            egui::Checkbox::without_text(&mut checked),
-                                        )
-                                        .on_hover_text("Select this deleted item");
-                                    if checkbox.changed() {
-                                        if checked {
-                                            self.bin.checked.insert(index);
-                                        } else {
-                                            self.bin.checked.remove(&index);
+                widgets::tight_card(ui, |ui| {
+                    let dates = ui.available_width() >= 520.0;
+                    widgets::row(ui, 25.0, |ui| {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if dates {
+                                widgets::cell(ui, 146.0, true, widgets::faint("Deleted"));
+                            }
+                            widgets::cell(ui, 94.0, true, widgets::faint("Size"));
+                            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                ui.label(widgets::faint("File and original folder"));
+                            });
+                        });
+                    });
+                    ui.separator();
+                    let height =
+                        (ui.clip_rect().bottom() - ui.cursor().top() - 12.0).clamp(126.0, 780.0);
+                    ScrollArea::vertical()
+                        .id_salt("bin_files")
+                        .max_height(height)
+                        .auto_shrink([false, true])
+                        .show_rows(ui, 48.0, self.bin.visible.len(), |ui, range| {
+                            for i in range {
+                                let index = self.bin.visible[i];
+                                let entry = &inventory.items[index];
+                                ui.push_id(index, |ui| {
+                                    widgets::row(ui, 48.0, |ui| {
+                                        let mut checked = self.bin.checked.contains(&index);
+                                        let checkbox = ui
+                                            .add_enabled(
+                                                !busy,
+                                                egui::Checkbox::without_text(&mut checked),
+                                            )
+                                            .on_hover_text("Select this deleted item");
+                                        if checkbox.changed() {
+                                            if checked {
+                                                self.bin.checked.insert(index);
+                                            } else {
+                                                self.bin.checked.remove(&index);
+                                            }
                                         }
-                                    }
-                                    ui.label(widgets::icon(ic::FILE, 17.0, color_secondary()));
-                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        if ui.available_width() > 486.0 {
-                                            widgets::cell(
-                                                ui,
-                                                146.0,
-                                                true,
-                                                widgets::faint(
-                                                    entry.deleted_text().unwrap_or_else(|| {
-                                                        "Date unavailable".into()
-                                                    }),
-                                                ),
-                                            );
-                                        }
-                                        widgets::cell(
-                                            ui,
-                                            94.0,
-                                            true,
-                                            widgets::strong(
-                                                entry
-                                                    .size
-                                                    .map(util::fmt_bytes)
-                                                    .unwrap_or_else(|| "Unknown".into()),
-                                                13.0,
-                                            ),
-                                        );
-                                        ui.allocate_ui_with_layout(
-                                            ui.available_size_before_wrap(),
-                                            Layout::top_down(Align::Min),
+                                        ui.label(widgets::icon(ic::FILE, 17.0, color_secondary()));
+                                        ui.with_layout(
+                                            Layout::right_to_left(Align::Center),
                                             |ui| {
-                                                ui.add(
-                                                    egui::Label::new(widgets::strong(
-                                                        &entry.name,
-                                                        14.0,
-                                                    ))
-                                                    .truncate(),
-                                                )
-                                                .on_hover_text(&entry.name);
-                                                ui.add(
-                                                    egui::Label::new(widgets::faint(
-                                                        entry.folder.as_deref().unwrap_or(
-                                                            "Original location unavailable",
+                                                if dates {
+                                                    widgets::cell(
+                                                        ui,
+                                                        146.0,
+                                                        true,
+                                                        widgets::faint(
+                                                            entry.deleted_text().unwrap_or_else(
+                                                                || "Date unavailable".into(),
+                                                            ),
                                                         ),
-                                                    ))
-                                                    .truncate(),
-                                                )
-                                                .on_hover_text(
-                                                    entry.original().display().to_string(),
+                                                    );
+                                                }
+                                                widgets::cell(
+                                                    ui,
+                                                    94.0,
+                                                    true,
+                                                    widgets::strong(
+                                                        entry
+                                                            .size
+                                                            .map(util::fmt_bytes)
+                                                            .unwrap_or_else(|| "Unknown".into()),
+                                                        13.0,
+                                                    ),
+                                                );
+                                                ui.allocate_ui_with_layout(
+                                                    ui.available_size_before_wrap(),
+                                                    Layout::top_down(Align::Min),
+                                                    |ui| {
+                                                        ui.add(
+                                                            egui::Label::new(widgets::strong(
+                                                                &entry.name,
+                                                                14.0,
+                                                            ))
+                                                            .truncate(),
+                                                        )
+                                                        .on_hover_text({
+                                                            let timestamp = entry
+                                                                .deleted_text()
+                                                                .unwrap_or_else(|| {
+                                                                    "Deletion date unavailable"
+                                                                        .into()
+                                                                });
+                                                            format!("{}\n{}", entry.name, timestamp)
+                                                        });
+                                                        ui.add(
+                                                            egui::Label::new(widgets::faint(
+                                                                entry.folder.as_deref().unwrap_or(
+                                                                    "Original location unavailable",
+                                                                ),
+                                                            ))
+                                                            .truncate(),
+                                                        )
+                                                        .on_hover_text(
+                                                            entry.original().display().to_string(),
+                                                        );
+                                                    },
                                                 );
                                             },
                                         );
                                     });
                                 });
-                            });
-                        }
-                    });
+                            }
+                        });
+                });
             }
         }
         if refresh {

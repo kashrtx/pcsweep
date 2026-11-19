@@ -1051,7 +1051,7 @@ impl App {
             .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
             .frame(
                 Frame::window(&ctx.style())
-                    .fill(color_surface())
+                    .fill(card_fill())
                     .stroke(Stroke::new(1.0_f32, color_outline()))
                     .rounding(corners(16.0))
                     .inner_margin(Margin::same(24.0)),

@@ -208,9 +208,9 @@ impl App {
                 ui.add_space(8.0);
                 let (score, recs) = self.health();
                 let scanning = !self.cleaner.scanned_once;
-                ui.columns(2, |cols| {
-                    // Health
-                    widgets::card(&mut cols[0], |ui| {
+                let render_tile = |ui: &mut Ui, acts: &mut Vec<DAct>, health: bool| {
+                    if health {
+                    widgets::card(ui, |ui| {
                         ui.set_min_height(250.0);
                         ui.horizontal(|ui| {
                             let col = if score >= 85 { color_success() } else if score >= 65 { color_warning() } else { color_error() };
@@ -251,8 +251,8 @@ impl App {
                         });
                     });
 
-                    // Junk
-                    widgets::card(&mut cols[1], |ui| {
+                    } else {
+                    widgets::card(ui, |ui| {
                         ui.set_min_height(250.0);
                         ui.horizontal(|ui| {
                             ui.label(widgets::strong("Junk found", 18.0));
@@ -298,7 +298,18 @@ impl App {
                             acts.push(DAct::Go(Page::Cleaner));
                         }
                     });
-                });
+                    }
+                };
+                if ui.available_width() < 800.0 {
+                    render_tile(ui, acts, true);
+                    ui.add_space(8.0);
+                    render_tile(ui, acts, false);
+                } else {
+                    ui.columns(2, |columns| {
+                        render_tile(&mut columns[0], acts, true);
+                        render_tile(&mut columns[1], acts, false);
+                    });
+                }
 
                 ui.add_space(8.0);
                 widgets::card(ui, |ui| {

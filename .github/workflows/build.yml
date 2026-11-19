@@ -50,6 +50,10 @@ jobs:
         continue-on-error: true
         run: cargo test --locked speed::tests::cloudflare_https_smoke -- --ignored --exact
 
+      - name: Smoke test Windows desktop launch
+        timeout-minutes: 1
+        run: cargo test --locked desktop::tests::interactive_launch_smoke -- --ignored --exact --nocapture
+
       - name: Save UI previews
         if: always()
         uses: actions/upload-artifact@v7
