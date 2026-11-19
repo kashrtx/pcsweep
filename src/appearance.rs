@@ -66,17 +66,8 @@ impl Appearance {
                         ui.selectable_value(&mut self.skin, skin, skin.name());
                     }
                 });
-            for color in self.skin.samples() {
-                let (rect, _) =
-                    ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
-                ui.painter().rect(
-                    rect,
-                    theme::corners(5.0),
-                    color,
-                    egui::Stroke::new(1.0_f32, theme::color_outline()),
-                );
-            }
         });
+        theme::preview_material(ui, self.skin);
     }
 }
 pub fn start_elevated() -> bool {

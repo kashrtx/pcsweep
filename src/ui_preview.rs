@@ -1245,7 +1245,8 @@ fn shipment_frame(
             theme::activate(ctx);
             theme::fit_to_viewport(ctx);
             app.quick_search_shortcut(ctx);
-            let enabled = app.modal.is_none() && !app.quick_search.open;
+            app.launcher_shortcut(ctx);
+            let enabled = app.modal.is_none() && !app.quick_search.open && !app.launcher.open;
             egui::SidePanel::left("shipment_navigation")
                 .exact_width(app.navigation_width(ctx))
                 .resizable(false)
@@ -1271,6 +1272,7 @@ fn shipment_frame(
             app.app_options_ui(ctx);
             app.modal_ui(ctx);
             app.quick_search_ui(ctx);
+            app.launcher_ui(ctx);
             app.recent_apps_ui(ctx);
         },
     )
@@ -2414,4 +2416,77 @@ fn every_theme_supports_compact_bold_layouts_and_dialogs() {
             &format!("skin-{}-dialog.png", skin.key()),
         );
     }
+}
+
+#[test]
+fn recycle_bin_preview_filters_files_and_only_confirms_selected_items() {
+    use crate::theme::Skin;
+    let ctx = egui::Context::default();
+    let mut app = App::test_fixture();
+    app.page = Page::Cleaner;
+    app.bin = crate::recycle_bin::preview_fixture();
+    app.appearance.skin = Skin::Aero;
+    app.appearance.apply(&ctx);
+    theme::setup_fonts(&ctx);
+    let mut painter = CpuPainter::default();
+    let size = [1100, 700];
+    let mut current = shipment_frame(&ctx, &mut app, size, Vec::new());
+    upload_preview_textures(&mut painter, &current);
+    for _ in 0..6 {
+        current = shipment_frame(&ctx, &mut app, size, Vec::new());
+        upload_preview_textures(&mut painter, &current);
+    }
+    text_rect(&current, "Recording.webm");
+    text_rect(&current, "Meeting notes.txt");
+    text_rect(&current, "Sketches.zip");
+    save_shipment_preview(&ctx, &painter, &current, size, "recycle-bin-review.png");
+
+    let select = text_rect(&current, "Select shown");
+    let output = shipment_frame(&ctx, &mut app, size, click_at(select.center()));
+    upload_preview_textures(&mut painter, &output);
+    let output = shipment_frame(&ctx, &mut app, size, Vec::new());
+    let delete = text_rect(&output, "Delete selected…");
+    let _ = shipment_frame(&ctx, &mut app, size, click_at(delete.center()));
+    assert!(matches!(app.modal.as_ref().map(|modal| &modal.action),
+        Some(Action::DeleteBin(items)) if items.len() == 3));
+    assert!(
+        !app.mutations_running(),
+        "review must leave every item intact"
+    );
+}
+
+#[test]
+fn run_shortcut_is_available_in_a_small_enlarged_window() {
+    let ctx = egui::Context::default();
+    let mut app = App::test_fixture();
+    app.appearance.skin = theme::Skin::Frost;
+    app.appearance.bold = true;
+    app.appearance.scale = 150;
+    app.appearance.apply(&ctx);
+    theme::setup_fonts(&ctx);
+    let mut painter = CpuPainter::default();
+    let size = [900, 520];
+    let mut frame = shipment_frame(
+        &ctx,
+        &mut app,
+        size,
+        vec![key_press(egui::Key::R, egui::Modifiers::CTRL)],
+    );
+    upload_preview_textures(&mut painter, &frame);
+    assert!(app.launcher.open);
+    for _ in 0..6 {
+        frame = shipment_frame(&ctx, &mut app, size, Vec::new());
+        upload_preview_textures(&mut painter, &frame);
+    }
+    let note = text_rect(&frame, "Open an app, file, folder, or web address.");
+    let browse = text_rect(&frame, "Browse…");
+    assert!(note.bottom() < browse.top());
+    save_shipment_preview(&ctx, &painter, &frame, size, "run-dialog-glass.png");
+    let _ = shipment_frame(
+        &ctx,
+        &mut app,
+        size,
+        vec![key_press(egui::Key::Escape, egui::Modifiers::NONE)],
+    );
+    assert!(!app.launcher.open);
 }

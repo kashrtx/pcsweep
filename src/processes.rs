@@ -349,9 +349,6 @@ fn run_operation(action: MemoryAction, stop: &AtomicBool) -> MemoryReport {
             } else {
                 None
             };
-            if row.name.eq_ignore_ascii_case("explorer.exe") && operation == Operation::End {
-                recovery::before_end(target.id);
-            }
             let request = if stop.load(Ordering::Relaxed) {
                 Err("Request stopped before this process was reached.".into())
             } else if operation == Operation::Close {

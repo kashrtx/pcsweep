@@ -11,11 +11,13 @@ mod apps;
 mod background;
 mod cleaner;
 mod dashboard;
+mod desktop;
 mod dns;
 mod duplicates;
 mod file_changes;
 mod instance;
 mod journal;
+mod launcher;
 mod leftovers;
 mod network;
 mod platform;
@@ -25,6 +27,7 @@ mod privacy;
 mod processes;
 mod quick_search;
 mod recovery;
+mod recycle_bin;
 mod running;
 mod scan_cache;
 mod security;
@@ -55,6 +58,9 @@ fn main() -> Result<(), eframe::Error> {
     if let Some(code) = update_install::run_helper_mode() {
         std::process::exit(code);
     }
+    if let Some(code) = recovery::run_helper_mode() {
+        std::process::exit(code);
+    }
     instance::wait_for_parent();
     let _instance = match instance::acquire() {
         Ok(Some(guard)) => guard,
@@ -68,7 +74,6 @@ fn main() -> Result<(), eframe::Error> {
         return Ok(());
     }
     update_install::pin_running_app();
-    recovery::warm_desktop();
     // Deep folder trees are scanned recursively in parallel; give worker threads
     // plenty of stack so nothing can overflow on unusual directory layouts.
     let _ = rayon::ThreadPoolBuilder::new()

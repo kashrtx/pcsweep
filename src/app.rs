@@ -119,6 +119,7 @@ pub struct Toast {
 pub enum Action {
     QuitApp,
     CleanJunk,
+    DeleteBin(Vec<crate::recycle_bin::Entry>),
     RecycleDuplicates(Vec<(PathBuf, u64)>),
     RunTool(usize),
     Uninstall(crate::apps::InstalledApp),
@@ -156,6 +157,7 @@ pub struct App {
     pub is_admin: bool,
     pub sys: SysMon,
     pub cleaner: CleanerState,
+    pub(crate) bin: crate::recycle_bin::BinState,
     pub analyzer: AnalyzerState,
     pub dups: DupState,
     pub startup: StartupState,
@@ -189,6 +191,7 @@ pub struct App {
     keep_background: bool,
     background_hidden: bool,
     pub(crate) app_options_open: bool,
+    pub(crate) launcher: crate::launcher::Launcher,
     pub(crate) quick_search: crate::quick_search::QuickSearch,
     start_elevated: bool,
     tray_error: Option<String>,
@@ -297,7 +300,9 @@ impl App {
         if self.appearance != previous_appearance {
             self.appearance.save();
             self.appearance.apply(ctx);
-            if self.appearance.bold != previous_appearance.bold {
+            if self.appearance.bold != previous_appearance.bold
+                || self.appearance.skin != previous_appearance.skin
+            {
                 theme::setup_fonts(ctx);
             }
             theme::fit_to_viewport(ctx);
@@ -336,6 +341,7 @@ impl App {
             is_admin,
             sys: SysMon::new(),
             cleaner: CleanerState::new(),
+            bin: Default::default(),
             analyzer: AnalyzerState::default(),
             dups: DupState::default(),
             startup: StartupState::default(),
@@ -367,6 +373,7 @@ impl App {
             keep_background,
             background_hidden: false,
             app_options_open: false,
+            launcher: Default::default(),
             quick_search: Default::default(),
             start_elevated: crate::appearance::start_elevated(),
             tray_error: None,
@@ -433,6 +440,7 @@ impl App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             Action::CleanJunk => self.start_clean(ctx),
+            Action::DeleteBin(entries) => self.delete_bin(entries, ctx),
             Action::RecycleChecked(items) => {
                 self.analyzer.recycle = Task::spawn(ctx, move || util::recycle_checked(items));
             }
@@ -477,6 +485,7 @@ impl App {
         self.poll_history();
         self.poll_scan_caches(ctx);
         self.poll_cleaner(ctx);
+        self.poll_bin(ctx);
         self.poll_analyzer();
         self.poll_duplicates();
         self.poll_startup(ctx);
@@ -495,6 +504,7 @@ impl App {
         self.poll_storage(ctx);
         self.poll_windows_controls(ctx);
         self.poll_speed(ctx);
+        self.poll_launcher();
         self.poll_file_changes();
         if let Some(r) = self.relaunch.poll() {
             match r {
@@ -509,12 +519,13 @@ impl App {
     }
 
     pub fn mutations_running(&self) -> bool {
-        self.cleaner.clean.running()
+        self.bin.deleting()
+            || self.cleaner.clean.running()
             || self.analyzer.recycle.running()
             || self.dups.recycle.running()
             || self.apps.busy()
             || self.startup.busy()
-            || self.mem.job.running()
+            || self.mem.busy()
             || self.privacy.busy()
             || self.preferences.busy()
             || self.security.busy()
@@ -532,8 +543,9 @@ impl App {
 
     fn any_running(&self) -> bool {
         self.mutations_running()
+            || self.launcher.busy()
             || self.updates.running()
-            || self.mem.job.running()
+            || self.mem.busy()
             || self.privacy.busy()
             || self.security.busy()
             || self.background.busy()
@@ -706,6 +718,20 @@ impl App {
             .clicked()
         {
             self.open_quick_search();
+        }
+        if ui
+            .add(
+                widgets::small(widgets::icon_text(
+                    ic::PLAY,
+                    "Run   Ctrl+R",
+                    13.0,
+                    color_ink(),
+                ))
+                .min_size(vec2(ui.available_width(), 28.0)),
+            )
+            .clicked()
+        {
+            self.open_launcher(&ctx);
         }
         ui.add_space(8.0);
 
@@ -880,6 +906,7 @@ impl App {
             is_admin: false,
             sys: crate::system::SysMon::preview_fixture(),
             cleaner: CleanerState::new(),
+            bin: Default::default(),
             analyzer: Default::default(),
             dups: Default::default(),
             startup: Default::default(),
@@ -911,6 +938,7 @@ impl App {
             keep_background: false,
             background_hidden: false,
             app_options_open: false,
+            launcher: Default::default(),
             quick_search: Default::default(),
             start_elevated: false,
             tray_error: None,
@@ -1173,13 +1201,14 @@ impl eframe::App for App {
             theme::apply(ctx);
         }
         self.quick_search_shortcut(ctx);
+        self.launcher_shortcut(ctx);
         let want_procs = self.quick_search.open
             || matches!(self.page, Page::Dashboard | Page::Memory | Page::Apps)
             || (self.page == Page::Background && self.background.showing_processes());
         self.sys.tick(want_procs);
         self.poll(ctx);
 
-        let enabled = self.modal.is_none() && !self.quick_search.open;
+        let enabled = self.modal.is_none() && !self.quick_search.open && !self.launcher.open;
         egui::SidePanel::left("nav")
             .exact_width(self.navigation_width(ctx))
             .resizable(false)
@@ -1221,6 +1250,7 @@ impl eframe::App for App {
         self.app_options_ui(ctx);
         self.recent_apps_ui(ctx);
         self.quick_search_ui(ctx);
+        self.launcher_ui(ctx);
         self.toasts_ui(ctx);
         crate::updates::confirm_update_startup();
 

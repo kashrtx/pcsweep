@@ -45,6 +45,11 @@ jobs:
       - name: Test application
         run: cargo test --locked
 
+      - name: Smoke test the public speed endpoints
+        timeout-minutes: 1
+        continue-on-error: true
+        run: cargo test --locked speed::tests::cloudflare_https_smoke -- --ignored --exact
+
       - name: Save UI previews
         if: always()
         uses: actions/upload-artifact@v7

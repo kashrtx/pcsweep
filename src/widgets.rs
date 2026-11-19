@@ -118,9 +118,33 @@ fn motion(ui: &Ui, id: egui::Id, target: bool) -> f32 {
 }
 
 pub fn page_header(ui: &mut Ui, title: &str, subtitle: &str) {
-    ui.label(RichText::new(title).font(semibold(28.0)).color(color_ink()));
-    ui.label(dim(subtitle));
-    ui.add_space(14.0);
+    if has_header_material() {
+        // Reserve the paint slot before laying out text so the material remains
+        // behind it and follows wrapping at this viewport's real width.
+        let surface = ui.painter().add(Shape::Noop);
+        let mut title_height = 0.0;
+        let header = Frame::none()
+            .inner_margin(Margin::symmetric(14.0, 7.0))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                let title = ui.label(
+                    RichText::new(title)
+                        .font(semibold(28.0))
+                        .color(heading_ink()),
+                );
+                title_height = title.rect.height() + 11.0;
+                ui.label(dim(subtitle));
+            });
+        let rect = header.response.rect;
+        ui.painter()
+            .set(surface, heading_surface(ui, rect, title_height));
+        card_edge(ui, rect, 12.0);
+        ui.add_space(6.0);
+    } else {
+        ui.label(RichText::new(title).font(semibold(28.0)).color(color_ink()));
+        ui.label(dim(subtitle));
+        ui.add_space(14.0);
+    }
 }
 
 pub fn section(ui: &mut Ui, text: &str) {
@@ -135,7 +159,8 @@ pub fn section(ui: &mut Ui, text: &str) {
 
 pub fn card_frame() -> Frame {
     Frame::none()
-        .fill(color_surface())
+        .fill(card_fill())
+        .shadow(card_shadow())
         .rounding(corners(14.0))
         .stroke(Stroke::new(1.0_f32, color_outline()))
         .inner_margin(Margin::same(18.0))
@@ -143,28 +168,28 @@ pub fn card_frame() -> Frame {
 
 pub fn tight_frame() -> Frame {
     Frame::none()
-        .fill(color_surface())
+        .fill(card_fill())
         .rounding(corners(10.0))
         .stroke(Stroke::new(1.0_f32, color_outline()))
         .inner_margin(Margin::symmetric(14.0, 10.0))
 }
 
 pub fn card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
-    card_frame()
-        .show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            add(ui)
-        })
-        .inner
+    let card = card_frame().show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        add(ui)
+    });
+    card_edge(ui, card.response.rect, 14.0);
+    card.inner
 }
 
 pub fn tight_card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
-    tight_frame()
-        .show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            add(ui)
-        })
-        .inner
+    let card = tight_frame().show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        add(ui)
+    });
+    card_edge(ui, card.response.rect, 10.0);
+    card.inner
 }
 
 pub fn primary(text: impl Into<WidgetText>) -> Button<'static> {

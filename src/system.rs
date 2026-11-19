@@ -377,20 +377,6 @@ pub fn recycle_bin_info() -> (u64, u64) {
     }
 }
 
-pub fn empty_recycle_bin() -> bool {
-    use windows_sys::Win32::UI::Shell::{
-        SHEmptyRecycleBinW, SHERB_NOCONFIRMATION, SHERB_NOPROGRESSUI, SHERB_NOSOUND,
-    };
-    unsafe {
-        let hr = SHEmptyRecycleBinW(
-            0,
-            std::ptr::null(),
-            SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND,
-        );
-        hr == 0
-    }
-}
-
 /// Starts a new elevated copy of PCSweep (UAC prompt). Returns true if it launched.
 pub fn relaunch_as_admin() -> bool {
     use crate::{platform, winfile};

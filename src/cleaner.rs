@@ -635,7 +635,6 @@ pub struct CleanJob {
     pub name: &'static str,
     pub files: Vec<JunkFile>,
     pub dirs: Vec<PathBuf>,
-    pub recycle_bin: bool,
 }
 
 #[derive(Default, Clone)]
@@ -657,48 +656,6 @@ pub fn run_clean(jobs: Vec<CleanJob>) -> CleanReport {
         }
     };
     for job in jobs {
-        if job.recycle_bin {
-            let (bytes, count) = system::recycle_bin_info();
-            if bytes == 0 && count == 0 {
-                continue;
-            }
-            let ids = match journal.intend(
-                "Recycle Bin",
-                Act::EmptyRecycleBin,
-                &[(
-                    PathBuf::from(format!("{} items (batch)", fmt_num(count))),
-                    bytes,
-                )],
-            ) {
-                Ok(ids) => ids,
-                Err(e) => {
-                    rep.journal_error = Some(e);
-                    return rep;
-                }
-            };
-            let success = system::empty_recycle_bin();
-            if success {
-                rep.freed += bytes;
-                rep.deleted += count;
-            } else {
-                rep.failed += count.max(1);
-            }
-            let result = if success {
-                Outcome::Deleted
-            } else {
-                Outcome::Failed
-            };
-            if let Err(e) = journal.finish(&[(ids[0], result, None)]) {
-                rep.journal_error = Some(e);
-                return rep;
-            }
-            util::log(if success {
-                format!("Emptied the Recycle Bin ({})", fmt_bytes(bytes))
-            } else {
-                "Could not empty the Recycle Bin".into()
-            });
-            continue;
-        }
         let (mut freed, mut deleted, mut failed) = (0, 0, 0);
         for batch in job.files.chunks(128) {
             let items: Vec<_> = batch.iter().map(|f| (f.path.clone(), f.size)).collect();
@@ -998,7 +955,10 @@ impl CleanerState {
         let mut f = 0;
         let mut n = 0;
         for i in 0..self.cats.len() {
-            if self.selected[i] && self.cat_bytes(i) > 0 {
+            if self.selected[i]
+                && self.cats[i].special != Special::RecycleBin
+                && self.cat_bytes(i) > 0
+            {
                 b += self.cat_bytes(i);
                 f += self.cat_files(i);
                 n += 1;
@@ -1025,7 +985,7 @@ impl CleanerState {
     /// Junk found in optional (off by default) categories.
     pub fn optional_total(&self) -> u64 {
         (0..self.cats.len())
-            .filter(|&i| !self.cats[i].default_on)
+            .filter(|&i| !self.cats[i].default_on && self.cats[i].special != Special::RecycleBin)
             .map(|i| self.cat_bytes(i))
             .sum()
     }
@@ -1059,6 +1019,7 @@ impl CleanerState {
 }
 
 enum CAct {
+    ReviewBin,
     SetSel(usize, bool),
     SelectRecommended,
     SelectAllFound,
@@ -1302,7 +1263,10 @@ impl App {
 
     pub fn ask_clean(&mut self) {
         if self.cleaner.cache.from_disk || self.cleaner.cache.load.running() {
-            self.toast(ToastKind::Info, "Refresh the saved junk scan before cleaning. This prevents older results from deleting newer Recycle Bin contents.");
+            self.toast(
+                ToastKind::Info,
+                "Refresh the saved junk scan and review the current files before cleaning.",
+            );
             return;
         }
         let (bytes, files, n) = self.cleaner.selected_total();
@@ -1311,13 +1275,12 @@ impl App {
             return;
         }
         let mut details = Vec::new();
-        let mut has_bin = false;
         for i in 0..self.cleaner.cats.len() {
-            if self.cleaner.selected[i] && self.cleaner.cat_bytes(i) > 0 {
+            if self.cleaner.selected[i]
+                && self.cleaner.cats[i].special != Special::RecycleBin
+                && self.cleaner.cat_bytes(i) > 0
+            {
                 let c = &self.cleaner.cats[i];
-                if c.special == Special::RecycleBin {
-                    has_bin = true;
-                }
                 details.push(format!(
                     "{}: {} ({} files)",
                     c.name,
@@ -1326,11 +1289,6 @@ impl App {
                 ));
             }
         }
-        let note = if has_bin {
-            Some("This includes emptying the Recycle Bin, which can't be undone.".to_string())
-        } else {
-            None
-        };
         self.modal = Some(Modal {
             title: format!("Clean {}?", fmt_bytes(bytes)),
             body: format!(
@@ -1339,7 +1297,7 @@ impl App {
                 n
             ),
             details,
-            note,
+            note: None,
             confirm: "Delete permanently".into(),
             danger: true,
             action: Action::CleanJunk,
@@ -1374,14 +1332,6 @@ impl App {
                 continue;
             };
             if cat.special == Special::RecycleBin {
-                if res.bytes > 0 || res.count > 0 {
-                    jobs.push(CleanJob {
-                        name: cat.name,
-                        files: Vec::new(),
-                        dirs: Vec::new(),
-                        recycle_bin: true,
-                    });
-                }
                 continue;
             }
             let excl = &self.cleaner.excluded[i];
@@ -1398,7 +1348,6 @@ impl App {
                 name: cat.name,
                 files,
                 dirs: res.dirs.clone(),
-                recycle_bin: false,
             });
         }
         if jobs.is_empty() {
@@ -1409,6 +1358,10 @@ impl App {
     }
 
     pub fn page_cleaner(&mut self, ui: &mut Ui) {
+        if self.bin.open {
+            self.page_bin(ui);
+            return;
+        }
         let ctx = ui.ctx().clone();
         let mut acts = Vec::new();
         if self.cleaner.review.is_some() {
@@ -1445,7 +1398,8 @@ impl App {
                     for i in 0..self.cleaner.cats.len() {
                         let cat = self.cleaner.cats[i];
                         // Prefetch is never bulk-selected; it's a myth that it helps.
-                        let skip = cat.caution.is_some() && cat.name == "Prefetch data";
+                        let skip = cat.special == Special::RecycleBin
+                            || (cat.caution.is_some() && cat.name == "Prefetch data");
                         self.cleaner.selected[i] = !skip && self.cleaner.cat_bytes(i) > 0;
                     }
                     selection_changed = true;
@@ -1482,6 +1436,7 @@ impl App {
                     }
                 }
                 CAct::Show(p) => util::show_in_explorer(&p),
+                CAct::ReviewBin => self.open_bin(&ctx),
                 CAct::Ask => self.ask_clean(),
                 CAct::Rescan => self.start_junk_scan(&ctx),
                 CAct::Relaunch => self.relaunch_admin(&ctx),
@@ -1508,6 +1463,23 @@ impl App {
                 ui.label(widgets::dim("Restoring the last junk scan…"));
             });
         }
+        ui.horizontal_wrapped(|ui| {
+            if ui.add(widgets::small("Review Recycle Bin")).clicked() {
+                acts.push(CAct::ReviewBin);
+            }
+            if let Some(result) = c
+                .cats
+                .iter()
+                .position(|cat| cat.special == Special::RecycleBin)
+                .and_then(|index| c.results[index].as_ref())
+            {
+                ui.label(widgets::dim(format!(
+                    "{} · {} items",
+                    fmt_bytes(result.bytes),
+                    fmt_num(result.count)
+                )));
+            }
+        });
         if let Some(stamp) = c.cache.stamp {
             ui.label(widgets::dim(format!(
                 "Scan from {}. {}",
@@ -1664,9 +1636,9 @@ impl App {
             .show(ui, |ui| {
                 for group in [Group::System, Group::Browsers, Group::Apps, Group::Developer] {
                     let idxs: Vec<usize> = (0..c.cats.len())
-                        .filter(|&i| c.cats[i].group == group)
+                        .filter(|&i| c.cats[i].group == group && c.cats[i].special != Special::RecycleBin)
                         .filter(|&i| match &c.results[i] {
-                            Some(r) => r.roots_found > 0 || c.cats[i].special == Special::RecycleBin,
+                            Some(r) => r.roots_found > 0,
                             None => true,
                         })
                         .collect();

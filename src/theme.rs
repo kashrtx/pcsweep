@@ -1,6 +1,6 @@
 use eframe::egui::{
-    self, vec2, Color32, FontData, FontDefinitions, FontFamily, FontId, Rounding, Stroke,
-    TextStyle, Visuals,
+    self, pos2, vec2, Color32, FontData, FontDefinitions, FontFamily, FontId, Rect, Rounding,
+    Shape, Stroke, TextStyle, Visuals,
 };
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -67,11 +67,6 @@ impl Skin {
 
     fn light(self) -> bool {
         matches!(self, Self::Aero | Self::Classic | Self::Cobalt)
-    }
-
-    pub fn samples(self) -> [Color32; 3] {
-        let palette = self.palette();
-        [palette.surface, palette.raised, palette.primary]
     }
 
     fn palette(self) -> Palette {
@@ -292,42 +287,375 @@ pub fn corners(radius: f32) -> Rounding {
     })
 }
 
-/// A stationary backlight under the content. Colors stay muted behind text.
-pub fn backdrop(ui: &egui::Ui, sidebar: bool) {
-    let skin = ACTIVE.get();
-    let amount = match skin {
-        Skin::Frost => 0.12,
-        Skin::Aero | Skin::Sakura => 0.10,
-        Skin::Cobalt | Skin::Terminal | Skin::Circuit => 0.07,
+fn skin() -> Skin {
+    ACTIVE.get()
+}
+
+fn rgba(rgb: u32, alpha: u8) -> Color32 {
+    let c = c(rgb);
+    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha)
+}
+
+pub fn card_fill() -> Color32 {
+    color_surface().gamma_multiply(match skin() {
+        Skin::Frost => 0.86,
+        Skin::Aero => 0.86,
+        Skin::Sakura => 0.89,
+        _ => 1.0,
+    })
+}
+
+pub fn card_shadow() -> egui::epaint::Shadow {
+    let (offset, blur, color) = match skin() {
+        Skin::Frost => (vec2(0.0, 6.0), 15.0, rgba(0x080d22, 86)),
+        Skin::Aero => (vec2(0.0, 4.0), 10.0, rgba(0x335f88, 42)),
+        Skin::Classic => (vec2(2.0, 2.0), 0.0, c(0x7c7c7c)),
+        Skin::Cobalt => (vec2(0.0, 3.0), 5.0, rgba(0x456394, 54)),
+        Skin::Circuit => (vec2(0.0, 0.0), 10.0, rgba(0x1adfff, 48)),
+        Skin::Sakura => (vec2(0.0, 4.0), 14.0, rgba(0x15091c, 94)),
+        _ => return egui::epaint::Shadow::NONE,
+    };
+    egui::epaint::Shadow {
+        offset,
+        blur,
+        spread: 0.0,
+        color,
+    }
+}
+
+pub fn card_edge(ui: &egui::Ui, rect: Rect, radius: f32) {
+    let top = match skin() {
+        Skin::Classic => Color32::WHITE,
+        Skin::Frost => rgba(0xd8edff, 115),
+        Skin::Aero => rgba(0xffffff, 230),
+        Skin::Cobalt => rgba(0xffffff, 225),
+        Skin::Circuit => rgba(0x78efff, 135),
+        Skin::Sakura => rgba(0xffd5ef, 90),
         _ => return,
     };
+    let rect = rect.shrink(1.6);
+    let inset = if skin() == Skin::Classic {
+        0.0
+    } else {
+        corners(radius).nw * 0.7
+    };
+    if rect.width() > 2.0 * inset && rect.height() > 8.0 {
+        ui.painter().line_segment(
+            [
+                rect.left_top() + vec2(inset, 0.0),
+                rect.right_top() - vec2(inset, 0.0),
+            ],
+            Stroke::new(1.0_f32, top),
+        );
+        if skin() == Skin::Classic {
+            ui.painter().line_segment(
+                [rect.left_top(), rect.left_bottom()],
+                Stroke::new(1.0_f32, top),
+            );
+        }
+    }
+}
+
+fn quad(rect: Rect, colors: [Color32; 4]) -> egui::Mesh {
+    let mut mesh = egui::Mesh::default();
+    for (pos, color) in [
+        rect.left_top(),
+        rect.right_top(),
+        rect.left_bottom(),
+        rect.right_bottom(),
+    ]
+    .into_iter()
+    .zip(colors)
+    {
+        mesh.colored_vertex(pos, color);
+    }
+    mesh.indices.extend([0, 1, 2, 2, 1, 3]);
+    mesh
+}
+
+fn sakura(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    use std::sync::{Arc, OnceLock};
+    static ART: OnceLock<Option<Arc<egui::ColorImage>>> = OnceLock::new();
+    let id = egui::Id::new("pcsweep_sakura_sky");
+    if let Some(texture) = ctx.data(|data| data.get_temp(id)) {
+        return Some(texture);
+    }
+    let art = ART
+        .get_or_init(|| {
+            let image = image::load_from_memory_with_format(
+                include_bytes!("../assets/sakura-sky.png"),
+                image::ImageFormat::Png,
+            )
+            .ok()?
+            .to_rgba8();
+            Some(Arc::new(egui::ColorImage::from_rgba_unmultiplied(
+                [image.width() as usize, image.height() as usize],
+                &image,
+            )))
+        })
+        .as_ref()?
+        .clone();
+    let texture = ctx.load_texture("Sakura landscape", art, egui::TextureOptions::LINEAR);
+    ctx.data_mut(|data| data.insert_temp(id, texture.clone()));
+    Some(texture)
+}
+
+fn paint_sakura(painter: &egui::Painter, rect: Rect, ctx: &egui::Context) {
+    let Some(texture) = sakura(ctx) else {
+        return;
+    };
+    let height = rect.height().min(rect.width() * 0.67);
+    let width = rect.width().min(height * 1.95).max(1.0);
+    let picture = Rect::from_min_max(
+        pos2(rect.right() - width, rect.top()),
+        pos2(rect.right(), rect.top() + height),
+    );
+    let mut mesh = egui::Mesh::with_texture(texture.id());
+    for (pos, uv, alpha) in [
+        (picture.left_top(), pos2(0.0, 0.0), 0),
+        (picture.right_top(), pos2(1.0, 0.0), 222),
+        (picture.left_bottom(), pos2(0.0, 0.82), 0),
+        (
+            pos2(picture.right(), picture.top() + height * 0.58),
+            pos2(1.0, 0.50),
+            172,
+        ),
+        (picture.right_bottom(), pos2(1.0, 0.82), 0),
+    ] {
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos,
+            uv,
+            color: Color32::WHITE.gamma_multiply(alpha as f32 / 255.0),
+        });
+    }
+    mesh.indices.extend([0, 1, 3, 0, 3, 2, 2, 3, 4]);
+    painter.add(Shape::mesh(mesh));
+}
+
+/// Original theme backdrops are painted behind the interface, with stronger
+/// color at the right edge and a quieter region under text and navigation.
+pub fn backdrop(ui: &egui::Ui, sidebar: bool) {
+    let current = skin();
+    let rect = ui.clip_rect();
+    let painter = ui.painter();
     let base = if sidebar {
         color_sidebar()
     } else {
         color_canvas()
     };
-    let lifted = mix(base, color_accent(), amount);
-    let soft = mix(base, color_surface(), 0.45);
-    let rect = ui.clip_rect();
-    let mid = rect.center();
-    let mut mesh = egui::Mesh::default();
-    for (pos, color) in [
-        (rect.left_top(), lifted),
-        (egui::pos2(mid.x, rect.top()), lifted),
-        (rect.right_top(), soft),
-        (egui::pos2(rect.left(), mid.y), soft),
-        (mid, base),
-        (egui::pos2(rect.right(), mid.y), soft),
-        (rect.left_bottom(), base),
-        (egui::pos2(mid.x, rect.bottom()), base),
-        (rect.right_bottom(), base),
-    ] {
-        mesh.colored_vertex(pos, color);
+    let [top_left, top_right, bottom] = match current {
+        Skin::Frost => [c(0x101b35), c(0x293e73), c(0x131c33)],
+        Skin::Aero => [c(0xd2e8fa), c(0x8ec8ec), c(0xebf4ff)],
+        Skin::Classic => [c(0xdadada), c(0xc6c6c6), c(0xd1d1d1)],
+        Skin::Cobalt => [c(0xe3edff), c(0x84afe8), c(0xf1eee0)],
+        Skin::Terminal => [base, c(0x123625), c(0x09150e)],
+        Skin::Circuit => [base, c(0x13334c), c(0x081522)],
+        Skin::Sakura => [base, c(0x46294c), c(0x201527)],
+        _ => return,
+    };
+    let colors = if sidebar {
+        [
+            mix(base, top_left, 0.52),
+            mix(base, top_right, 0.25),
+            base,
+            mix(base, bottom, 0.25),
+        ]
+    } else {
+        [top_left, top_right, bottom, base]
+    };
+    painter.add(Shape::mesh(quad(rect, colors)));
+
+    if !sidebar {
+        match current {
+            Skin::Frost | Skin::Aero | Skin::Cobalt => {
+                // Offset bands of reflected light give the glass depth. They
+                // stay at the far edge so the reading surface remains quiet.
+                for (offset, color) in [
+                    (0.12, rgba(0xffffff, if current.light() { 84 } else { 34 })),
+                    (
+                        0.30,
+                        rgba(if current.light() { 0xb6f2ff } else { 0x8eeaff }, 48),
+                    ),
+                    (
+                        0.47,
+                        rgba(
+                            if current == Skin::Cobalt {
+                                0xa2d55d
+                            } else {
+                                0xcce6ff
+                            },
+                            44,
+                        ),
+                    ),
+                ] {
+                    let x = rect.right() - rect.width() * offset;
+                    let h = rect.height().min(550.0);
+                    painter.add(Shape::convex_polygon(
+                        vec![
+                            pos2(x, rect.top()),
+                            pos2(x + 110.0, rect.top()),
+                            pos2(rect.right(), rect.top() + h * 0.72),
+                            pos2(rect.right(), rect.top() + h),
+                        ],
+                        color,
+                        Stroke::NONE,
+                    ));
+                }
+            }
+            Skin::Sakura => paint_sakura(painter, rect, ui.ctx()),
+            Skin::Circuit => {
+                let grid = Stroke::new(1.0_f32, rgba(0x78defb, 20));
+                for line in 0..24 {
+                    let x = rect.right() - f32::from(line as u16) * 42.0;
+                    if x < rect.left() + rect.width() * 0.45 {
+                        break;
+                    }
+                    painter.line_segment([pos2(x, rect.top()), pos2(x, rect.bottom())], grid);
+                }
+                for line in 0..19 {
+                    let y = rect.top() + f32::from(line as u16) * 42.0;
+                    if y > rect.bottom() {
+                        break;
+                    }
+                    painter.line_segment(
+                        [
+                            pos2(rect.left() + rect.width() * 0.45, y),
+                            pos2(rect.right(), y),
+                        ],
+                        grid,
+                    );
+                }
+            }
+            _ => {}
+        }
     }
-    mesh.indices.extend([
-        0, 1, 4, 0, 4, 3, 1, 2, 5, 1, 5, 4, 3, 4, 7, 3, 7, 6, 4, 5, 8, 4, 8, 7,
-    ]);
-    ui.painter().add(egui::Shape::mesh(mesh));
+}
+
+pub fn has_header_material() -> bool {
+    matches!(
+        skin(),
+        Skin::Frost | Skin::Aero | Skin::Classic | Skin::Cobalt | Skin::Sakura | Skin::Circuit
+    )
+}
+
+pub fn heading_ink() -> Color32 {
+    if matches!(skin(), Skin::Classic | Skin::Cobalt) {
+        Color32::WHITE
+    } else {
+        color_ink()
+    }
+}
+
+fn header_texture(ctx: &egui::Context, current: Skin) -> egui::TextureHandle {
+    let id = egui::Id::new(("pcsweep_header_material", current.key()));
+    if let Some(texture) = ctx.data(|data| data.get_temp(id)) {
+        return texture;
+    }
+    let mut image = egui::ColorImage::new([144, 72], Color32::BLACK);
+    for y in 0..image.size[1] {
+        for x in 0..image.size[0] {
+            let x_norm = x as f32 / 143.0;
+            let y_norm = y as f32 / 71.0;
+            let shine = (1.0 - (x_norm - 0.8 + y_norm * 0.38).abs() * 3.7).max(0.0);
+            let (upper, lower, gleam) = match current {
+                Skin::Frost => (c(0x243c62), c(0x16233c), c(0x606eac)),
+                Skin::Aero => (c(0xf6fdff), c(0xbddcf6), c(0xffffff)),
+                Skin::Classic => (c(0x192e69), c(0x1f3d79), c(0x284a92)),
+                Skin::Cobalt => (c(0x305fb7), c(0x193c86), c(0x4778ca)),
+                Skin::Circuit => (c(0x142e41), c(0x0c202f), c(0x155274)),
+                Skin::Sakura => (c(0x432b4e), c(0x2c1e39), c(0x674965)),
+                _ => (
+                    current.palette().surface,
+                    current.palette().canvas,
+                    current.palette().accent,
+                ),
+            };
+            let vertical = mix(upper, lower, y_norm);
+            // A bright top rim and a soft, oblique reflection differ from a
+            // flat tint and remain legible against the theme's text color.
+            let amount = shine * 0.23 + (1.0 - y_norm * 8.0).max(0.0) * 0.24;
+            image[(x, y)] = mix(vertical, gleam, amount);
+        }
+    }
+    let texture = ctx.load_texture(
+        format!("{} surface", current.name()),
+        image,
+        egui::TextureOptions::LINEAR,
+    );
+    ctx.data_mut(|data| data.insert_temp(id, texture.clone()));
+    texture
+}
+
+pub fn heading_surface(ui: &egui::Ui, rect: Rect, title_height: f32) -> Shape {
+    let current = skin();
+    let rounding = corners(12.0);
+    let full = egui::epaint::RectShape::filled(rect, rounding, card_fill());
+    let top = if matches!(current, Skin::Classic | Skin::Cobalt) {
+        Rect::from_min_max(
+            rect.min,
+            pos2(rect.right(), (rect.top() + title_height).min(rect.bottom())),
+        )
+    } else {
+        rect
+    };
+    let mut glaze = egui::epaint::RectShape::filled(
+        top,
+        Rounding {
+            sw: if top == rect { rounding.sw } else { 0.0 },
+            se: if top == rect { rounding.se } else { 0.0 },
+            ..rounding
+        },
+        Color32::WHITE,
+    );
+    glaze.fill_texture_id = header_texture(ui.ctx(), current).id();
+    glaze.uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+    Shape::Vec(vec![
+        Shape::Rect(card_shadow().as_shape(rect, rounding)),
+        Shape::Rect(full),
+        Shape::Rect(glaze),
+        Shape::rect_stroke(rect, rounding, Stroke::new(1.0_f32, color_outline())),
+    ])
+}
+
+pub fn preview_material(ui: &mut egui::Ui, current: Skin) {
+    let width = ui.available_width().min(420.0);
+    let (rect, _) = ui.allocate_exact_size(vec2(width, 68.0), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    let palette = current.palette();
+    painter.add(Shape::mesh(quad(
+        rect,
+        [
+            palette.surface,
+            mix(palette.surface, palette.accent, 0.27),
+            palette.canvas,
+            palette.sidebar,
+        ],
+    )));
+    if current == Skin::Sakura {
+        paint_sakura(&painter, rect, ui.ctx());
+    }
+    let sample = Rect::from_min_max(
+        rect.min + vec2(12.0, 10.0),
+        pos2(rect.center().x + 10.0, rect.bottom() - 10.0),
+    );
+    let mut panel = egui::epaint::RectShape::filled(
+        sample,
+        Rounding::same(if matches!(current, Skin::Classic | Skin::Contrast) {
+            0.0
+        } else {
+            8.0
+        }),
+        Color32::WHITE,
+    );
+    panel.fill_texture_id = header_texture(ui.ctx(), current).id();
+    panel.uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+    painter.add(Shape::Rect(panel));
+    painter.rect_filled(
+        Rect::from_min_size(sample.left_bottom() + vec2(10.0, -15.0), vec2(46.0, 8.0)),
+        3.0,
+        palette.primary,
+    );
+    painter.rect_stroke(rect.shrink(0.5), 6.0, Stroke::new(1.0_f32, palette.outline));
 }
 
 /// Rich colors used only by the space map and type charts.
@@ -432,7 +760,10 @@ pub fn setup_fonts(ctx: &egui::Context) {
         .unwrap_or_default();
 
     let mut body = defaults.clone();
-    if let Some(bytes) = load("segoeui.ttf") {
+    let retro = matches!(skin(), Skin::Classic | Skin::Cobalt);
+    let normal = if retro { "tahoma.ttf" } else { "segoeui.ttf" };
+    let strong = if retro { "tahomabd.ttf" } else { "seguisb.ttf" };
+    if let Some(bytes) = load(normal).or_else(|| load("segoeui.ttf")) {
         fonts
             .font_data
             .insert("segoe".to_owned(), FontData::from_owned(bytes));
@@ -440,7 +771,7 @@ pub fn setup_fonts(ctx: &egui::Context) {
     }
 
     let mut semi = body.clone();
-    if let Some(bytes) = load("seguisb.ttf") {
+    if let Some(bytes) = load(strong).or_else(|| load("seguisb.ttf")) {
         fonts
             .font_data
             .insert("segoe_sb".to_owned(), FontData::from_owned(bytes));
@@ -458,7 +789,7 @@ pub fn setup_fonts(ctx: &egui::Context) {
         .data(|d| d.get_temp::<bool>(egui::Id::new("pcsweep.bold")))
         .unwrap_or(false)
     {
-        if let Some(bytes) = load("segoeuil.ttf") {
+        if let Some(bytes) = (!retro).then(|| load("segoeuil.ttf")).flatten() {
             fonts
                 .font_data
                 .insert("segoe_light".to_owned(), FontData::from_owned(bytes));

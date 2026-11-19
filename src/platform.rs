@@ -42,6 +42,19 @@ pub fn windows_directory() -> Result<std::path::PathBuf, String> {
     Ok(std::ffi::OsString::from_wide(&buffer[..n]).into())
 }
 
+/// Use the Windows trust store for outbound HTTPS. ureq's native TLS support
+/// requires explicitly installing this connector on each agent.
+pub fn https_agent() -> Result<ureq::AgentBuilder, String> {
+    let tls = ureq::native_tls::TlsConnector::builder()
+        .min_protocol_version(Some(ureq::native_tls::Protocol::Tlsv12))
+        .build()
+        .map_err(|_| "Windows could not initialize a secure HTTPS connection.".to_string())?;
+    Ok(ureq::AgentBuilder::new()
+        .https_only(true)
+        .tls_connector(std::sync::Arc::new(tls))
+        .redirects(0))
+}
+
 fn capture<R: Read + Send + 'static>(mut pipe: R) -> mpsc::Receiver<Result<Vec<u8>, String>> {
     let (send, recv) = mpsc::channel();
     std::thread::spawn(move || {

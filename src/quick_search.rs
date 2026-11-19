@@ -17,6 +17,8 @@ pub struct QuickSearch {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Destination {
     Page(Page),
+    Run,
+    Bin,
     Updates,
     OpenExplorer,
     RestartExplorer,
@@ -66,6 +68,18 @@ fn items<'a>(snapshot: &'a Snapshot, query: &str) -> Vec<ResultItem<'a>> {
         }
     };
     for (title, keywords, icon, destination) in [
+        (
+            "Review Recycle Bin",
+            "trash deleted files size original path recycle",
+            ic::CLEAN,
+            Destination::Bin,
+        ),
+        (
+            "Run an app or command",
+            "launch start open file folder ctrl+r",
+            ic::PLAY,
+            Destination::Run,
+        ),
         (
             "Check for PCSweep updates",
             "version upgrade download release",
@@ -142,6 +156,7 @@ fn items<'a>(snapshot: &'a Snapshot, query: &str) -> Vec<ResultItem<'a>> {
 impl App {
     pub(crate) fn open_quick_search(&mut self) {
         self.app_options_open = false;
+        self.launcher.open = false;
         self.quick_search = QuickSearch {
             open: true,
             focus: true,
@@ -255,6 +270,8 @@ impl App {
         self.quick_search.open = open && choice.is_none();
         match choice {
             Some(Destination::Page(page)) => self.page = page,
+            Some(Destination::Run) => self.open_launcher(ctx),
+            Some(Destination::Bin) => self.open_bin(ctx),
             Some(Destination::Updates) => {
                 self.page = Page::Updates;
                 self.begin_update_check(ctx);

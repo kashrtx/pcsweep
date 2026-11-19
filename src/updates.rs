@@ -247,14 +247,7 @@ fn allowed_redirect(url: &str) -> bool {
 }
 
 fn request(url: &str) -> Result<ureq::Response, String> {
-    let tls = ureq::native_tls::TlsConnector::builder()
-        .min_protocol_version(Some(ureq::native_tls::Protocol::Tlsv12))
-        .build()
-        .map_err(|_| "Windows could not initialize a secure update connection.".to_string())?;
-    let agent = ureq::AgentBuilder::new()
-        .https_only(true)
-        .tls_connector(Arc::new(tls))
-        .redirects(0)
+    let agent = crate::platform::https_agent()?
         .timeout_connect(Duration::from_secs(8))
         .timeout_read(Duration::from_secs(20))
         .timeout_write(Duration::from_secs(20))

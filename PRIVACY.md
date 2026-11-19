@@ -2,17 +2,11 @@
 
 PCSweep stores preferences, activity logs, cleanup history, Undo records and optional diagnostic reports locally. It does not send these records or device inventory to us. Exported history and reports can contain sensitive paths; export/open actions are user initiated.
 
-## M-Lab NDT7 speed test
+## Cloudflare speed test
 
-Speed tests run only after explicit consent and confirmation. PCSweep contacts the official M-Lab locator and selected M-Lab measurement servers. It sends synthetic test payloads and an app/version User-Agent. It does not upload personal files, cleanup history, process lists, hardware identifiers or diagnostic reports.
+When you approve a test, PCSweep sends synthetic payloads and an app/version User-Agent to Cloudflare's speed-test endpoints over HTTPS. Cloudflare receives the IP address of the current connection. Its speed-test disclosure describes IP truncation and sharing of anonymized measurements. [Cloudflare Speed Test](https://speed.cloudflare.com/) · [Privacy Policy](https://www.cloudflare.com/privacypolicy/) · [Published measurement endpoints](https://github.com/cloudflare/speedtest)
 
-M-Lab receives connection information including the public IP address, measurement traffic, results and test time. M-Lab publishes measurement data, including the IP address, for research and retains it indefinitely. A VPN changes the measured route/public IP. PCSweep cannot withdraw measurements already sent. Do not run a test if you do not accept this processing.
-
-- Provider privacy: https://www.measurementlab.net/privacy/
-- Provider acceptable use: https://www.measurementlab.net/aup/
-- NDT documentation: https://www.measurementlab.net/tests/ndt/
-
-Data caps describe application test payload; protocol overhead and an in-flight frame also use data. Cancel stops further work as soon as outstanding connection operations return. Results optionally stay in this open app session and are not uploaded by PCSweep to any additional service. A local per-account UTC-day counter limits attempts across app restarts; provider limits also cover other clients using the same IP.
+Quick and Longer modes cap test payload at 48 MiB and 192 MiB respectively. HTTPS headers and transmission overhead also use data. A VPN changes the route being measured. Optional result history stays in the current PCSweep session.
 
 ## Other network features
 
@@ -32,4 +26,4 @@ Native application artwork is read from local app resources or the Windows Shell
 
 ## Uninstaller leftovers and readability
 
-PCSweep remembers the last desktop product submitted for uninstall, including its name, publisher and location, locally. Reviewed registry cleanup retains the latest 16 typed-value backup generations in the guarded local scan-cache folder. Backups can contain sensitive application settings; they are not uploaded. Folder removals are recorded in local cleanup history and use the Recycle Bin on supported fixed local drives. The theme, interface size, bold text and optional UAC startup preferences are stored per account. Quick search queries and the recently closed apps list stay in memory for the open session. Reopen uses the verified executable under the desktop account and launches it with fresh arguments.
+PCSweep remembers the last desktop product submitted for uninstall, including its name, publisher and location, locally. Reviewed registry cleanup retains the latest 16 typed-value backup generations in the guarded local scan-cache folder. Backups can contain sensitive application settings; they are not uploaded. Folder removals are recorded in local cleanup history and use the Recycle Bin on supported fixed local drives. The theme, interface size, bold text and optional UAC startup preferences are stored per account. Quick search queries, the Run box history, the Recycle Bin preview, and the recently closed apps list stay in memory for the open session. Confirmed bin deletions record the Windows-reported original item details in local cleanup history. Reopen uses the verified executable under the desktop account and launches it with fresh arguments.
