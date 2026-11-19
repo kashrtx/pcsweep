@@ -33,7 +33,8 @@ const STARTED: &str = "started";
 const READY: &str = "ready";
 const PREFIX: &str = ".pcsweep-update-";
 const REQUEST_LIMIT: u64 = 32 * 1024;
-const JOB_PERMISSIONS: &str = "O:color_error():P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+const JOB_OWNER: &str = "O:BAD:P";
+const JOB_ACES: &str = "(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
 const FILE_PERSISTENT_ACLS: u32 = 0x8;
 
 struct RunningApp {
@@ -102,7 +103,7 @@ fn create_job(path: &Path, parent: &File, elevated: bool) -> io::Result<()> {
     }
     // Build the protected directory in one call. An elevated copy is never
     // placed in a user-writable update cache before launch.
-    let acl = winfile::wide(format!("{JOB_PERMISSIONS}S:(ML;;NW;;;HI)"));
+    let acl = winfile::wide(format!("{JOB_OWNER}{JOB_ACES}S:(ML;;NW;;;HI)"));
     let mut descriptor = std::ptr::null_mut();
     if unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -163,10 +164,9 @@ fn lock_job(path: &Path) -> io::Result<Vec<File>> {
         unsafe {
             LocalFree(value.cast());
         }
-        let protected = actual.trim_end_matches('\0').strip_prefix("O:BAD:P");
-        let expected_aces = JOB_PERMISSIONS.split_once("D:P").unwrap().1;
+        let protected = actual.trim_end_matches('\0').strip_prefix(JOB_OWNER);
         if protected.map(|acl| acl.trim_start_matches("AI").trim_start_matches("AR"))
-            != Some(expected_aces)
+            != Some(JOB_ACES)
         {
             return Err(io::Error::other("The update folder permissions changed."));
         }
